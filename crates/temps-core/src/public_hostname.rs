@@ -246,7 +246,15 @@ pub fn environment_label(
         .filter(|t| !t.is_empty())
         .unwrap_or(DEFAULT_ENVIRONMENT_LABEL_TEMPLATE);
     let raw = chosen.replace("{project}", project).replace("{env}", env);
-    let label = sanitize_label(&raw);
+    single_dns_label(&raw)
+}
+
+/// `raw` as one DNS label: ASCII letters and digits with single hyphens
+/// between them (dots and anything non-ASCII become hyphens, so no IDN
+/// look-alike survives), cut to 63 characters with a short hash of the
+/// whole when longer.
+pub fn single_dns_label(raw: &str) -> String {
+    let label = sanitize_label(raw);
     if label.len() <= DNS_LABEL_MAX_LEN {
         return label;
     }
@@ -326,6 +334,18 @@ fn short_hash(seed: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_single_dns_label_is_ascii_one_level_and_capped() {
+        assert_eq!(single_dns_label("Shop.Staging"), "shop-staging");
+        // A Cyrillic `а` is not kept as a look-alike of `a`.
+        assert_eq!(single_dns_label("p\u{0430}y-feature"), "p-y-feature");
+        let long = single_dns_label(&"feature-".repeat(20));
+        assert_eq!(long.len(), DNS_LABEL_MAX_LEN);
+        assert!(!long.contains('.'));
+        assert_ne!(long, single_dns_label(&"feature-".repeat(21)));
+        assert_eq!(single_dns_label("---"), "x");
+    }
 
     #[test]
     fn hashed_label_is_one_stable_label() {

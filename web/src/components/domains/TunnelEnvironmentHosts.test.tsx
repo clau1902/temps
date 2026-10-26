@@ -54,6 +54,7 @@ const off: EnvironmentHostsResponse = {
   enabled_elsewhere: null,
   preview_domain_usable: false,
   warning: 'Branch names become public.',
+  confirm_token: '3f2a9c1e0b7d4a65',
 }
 
 test('turning it on lists every host and the branch warning before anything changes', () => {

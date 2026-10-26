@@ -10338,8 +10338,10 @@ export const getConnectorEnvironmentHostsOptions = (options: Options<GetConnecto
  * Turn a tunnel's environment hosts on or off.
  *
  * On publishes every listed environment as `<label>.<domain>`; off
- * withdraws every host it generated. Both need `confirm: true`, sent after
- * showing the list from the `GET`. At most one tunnel has it on.
+ * withdraws every host it generated. Both need `confirm`: the
+ * `confirm_token` of the list from the `GET` that was shown. Turning it on
+ * is a sensitive action (it widens every environment to public). At most
+ * one tunnel has it on.
  */
 export const setConnectorEnvironmentHostsMutation = (options?: Partial<Options<SetConnectorEnvironmentHostsData>>): UseMutationOptions<SetConnectorEnvironmentHostsResponse, DefaultError, Options<SetConnectorEnvironmentHostsData>> => {
     const mutationOptions: UseMutationOptions<SetConnectorEnvironmentHostsResponse, DefaultError, Options<SetConnectorEnvironmentHostsData>> = {

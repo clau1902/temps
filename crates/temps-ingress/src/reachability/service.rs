@@ -2657,6 +2657,12 @@ impl RunOps for LiveOps {
         let mut active: project_custom_domains::ActiveModel = row.into();
         set_address_audience_on(&mut active, audience);
         active.update(self.deps.db.as_ref()).await.map_err(text)?;
+        if audience.audience != Audience::Public {
+            // ADR 068 D3: a restricted environment loses its public tunnel
+            // host now, not at the next reconcile a minute later.
+            let connectors = self.deps.connectors.clone();
+            tokio::spawn(async move { connectors.reconcile_all().await });
+        }
         Ok(())
     }
 

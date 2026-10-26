@@ -324,7 +324,8 @@ async fn plan_environment_reachability(
         (status = 400, description = "An answer is missing or invalid"),
         (status = 403, description = "A permission the option needs is missing"),
         (status = 404, description = "Project or environment not found"),
-        (status = 409, description = "The plan changed (the body's `plan` is the new one), or a run is in progress")
+        (status = 409, description = "The plan changed (the body's `plan` is the new one), or a run is in progress"),
+        (status = 428, description = "Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification")
     ),
     security(("bearer_auth" = []))
 )]
@@ -350,6 +351,16 @@ async fn apply_environment_reachability(
         .get(super::plan::FIELD_ADDRESS)
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    // Publishing every environment under a tunnel widens all of them to
+    // public at once (ADR 068 D3).
+    if request.option == PlanOptionKind::TunnelEnvironmentHosts {
+        require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::PublishEnvironmentHosts { connector_id: None },
+        )
+        .await?;
+    }
     if let Some(action) = audience_action(
         state
             .service

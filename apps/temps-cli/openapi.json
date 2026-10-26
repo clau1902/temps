@@ -24478,6 +24478,11 @@
       "EnvironmentHostsResponse": {
         "description": "`GET`/`PUT /ingress/connectors/{id}/environment-hosts`.",
         "properties": {
+          "confirm_token": {
+            "description": "Send back as `confirm` to turn it on or off. It names exactly the\nhosts listed here, so a list that changed since it was shown is not\naccepted.",
+            "example": "3f2a9c1e0b7d4a65",
+            "type": "string"
+          },
           "connector_id": {
             "format": "int32",
             "type": "integer"
@@ -24527,7 +24532,8 @@
           "hosts",
           "refused",
           "preview_domain_usable",
-          "warning"
+          "warning",
+          "confirm_token"
         ],
         "type": "object"
       },
@@ -58500,8 +58506,11 @@
         "description": "`PUT /ingress/connectors/{id}/environment-hosts`.",
         "properties": {
           "confirm": {
-            "description": "The list was shown and accepted: turning on publishes every host in\nit, turning off withdraws them.",
-            "type": "boolean"
+            "description": "The `confirm_token` of the list that was shown and accepted: turning\non publishes every host in it, turning off withdraws them.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "enabled": {
             "type": "boolean"
@@ -104181,7 +104190,7 @@
         ]
       },
       "put": {
-        "description": "On publishes every listed environment as `<label>.<domain>`; off\nwithdraws every host it generated. Both need `confirm: true`, sent after\nshowing the list from the `GET`. At most one tunnel has it on.",
+        "description": "On publishes every listed environment as `<label>.<domain>`; off\nwithdraws every host it generated. Both need `confirm`: the\n`confirm_token` of the list from the `GET` that was shown. Turning it on\nis a sensitive action (it widens every environment to public). At most\none tunnel has it on.",
         "operationId": "set_connector_environment_hosts",
         "parameters": [
           {
@@ -104228,7 +104237,10 @@
             "description": "No such tunnel"
           },
           "409": {
-            "description": "Another tunnel publishes environment hosts"
+            "description": "Another tunnel publishes environment hosts, or the list changed since it was shown"
+          },
+          "428": {
+            "description": "Turning it on needs a recent MFA verification"
           },
           "500": {
             "description": "Internal server error"

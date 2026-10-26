@@ -11,6 +11,8 @@
 //!   generated for. Temps only ever renames or removes rows carrying it; a
 //!   row the user added is never touched. Deleting the connector removes the
 //!   rows it generated, after their records were withdrawn.
+//! - Two generated rows never hold one hostname (a unique index on the
+//!   lowercased name), so the route table never has to pick between them.
 //!
 //! Nothing changes for an install that never turns `environment_hosts` on.
 
@@ -34,9 +36,14 @@ ALTER TABLE environment_domains
 CREATE INDEX IF NOT EXISTS environment_domains_generated_by_connector
     ON environment_domains (generated_by_connector_id)
     WHERE generated_by_connector_id IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS environment_domains_generated_domain_unique
+    ON environment_domains (lower(domain))
+    WHERE generated_by_connector_id IS NOT NULL;
 "#;
 
 const DOWN: &str = r#"
+DROP INDEX IF EXISTS environment_domains_generated_domain_unique;
 DROP INDEX IF EXISTS environment_domains_generated_by_connector;
 ALTER TABLE environment_domains DROP COLUMN IF EXISTS generated_by_connector_id;
 DROP INDEX IF EXISTS ingress_connectors_one_environment_hosts;
@@ -124,10 +131,21 @@ mod tests {
 
         db.execute_unprepared(
             "INSERT INTO environment_domains(domain, generated_by_connector_id) \
-             VALUES ('app-production.tunnel.example.com', 1); \
-             DELETE FROM ingress_connectors WHERE id = 1;",
+             VALUES ('app-production.tunnel.example.com', 1);",
         )
         .await?;
+        let duplicate = db
+            .execute_unprepared(
+                "INSERT INTO environment_domains(domain, generated_by_connector_id) \
+                 VALUES ('App-Production.tunnel.example.com', 1)",
+            )
+            .await;
+        assert!(
+            duplicate.is_err(),
+            "two generated rows never hold one hostname"
+        );
+        db.execute_unprepared("DELETE FROM ingress_connectors WHERE id = 1")
+            .await?;
         let row = db
             .query_one(Statement::from_string(
                 DatabaseBackend::Postgres,

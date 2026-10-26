@@ -119,6 +119,8 @@ impl TempsPlugin for IngressPlugin {
             service: addresses,
             environment_hosts,
             audit_service: audit_service.clone(),
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
         });
         let reachability_state = Arc::new(ReachabilityAppState {
             service: reachability,

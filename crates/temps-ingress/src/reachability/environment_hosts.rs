@@ -14,8 +14,11 @@
 //!
 //! - It never touches a row without `generated_by_connector_id`.
 //! - A name taken under the zone by a DNS record Temps does not own (ADR 031),
-//!   or by another address in this install, gets the short-hash name
-//!   `<label>-<hash>.<zone>` instead, and the listing says why.
+//!   by another address in this install (a custom domain, an environment
+//!   domain, a status page, the console), or by another environment's
+//!   generated host, gets the short-hash name `<label>-<hash>.<zone>`
+//!   instead, and the listing says why. One hostname is never generated for
+//!   two environments.
 //! - A rename publishes the new host before the old one is withdrawn: the old
 //!   row stays until the new host is published.
 //! - A deleted environment, or one whose addresses are `private` or
@@ -25,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use temps_core::public_hostname::{environment_label, hashed_label};
+use temps_core::public_hostname::{environment_label, hashed_label, single_dns_label};
 
 /// What [`plan_rows`] needs to know about one environment.
 #[derive(Debug, Clone)]
@@ -75,6 +78,9 @@ pub struct GeneratedRow {
 /// The hostname label an environment publishes under: production follows
 /// the operator's `production_hostname_template` when one is set; every
 /// other environment, and production without a template, uses its own label.
+/// Always one ASCII DNS label of at most 63 characters: a preview label
+/// built from a long or non-ASCII branch name, or an old subdomain with
+/// dots, is sanitised and capped with a short hash.
 pub fn host_label(env: &EnvironmentFacts, production_template: Option<&str>) -> String {
     match production_template.map(str::trim).filter(|t| !t.is_empty()) {
         Some(template) if env.is_production => environment_label(
@@ -83,7 +89,7 @@ pub fn host_label(env: &EnvironmentFacts, production_template: Option<&str>) -> 
             &env.project_slug,
             &env.environment_name,
         ),
-        _ => env.label.clone(),
+        _ => single_dns_label(&env.label),
     }
 }
 
@@ -158,6 +164,21 @@ pub fn plan_rows(
     for row in rows {
         rows_of.entry(row.environment_id).or_default().push(row);
     }
+    // A row holding the name another environment is given goes at once:
+    // one hostname is never served for two environments.
+    let wanted_by: HashMap<String, i32> = desired
+        .iter()
+        .map(|(environment_id, host)| (host.to_ascii_lowercase(), *environment_id))
+        .collect();
+    changes.delete.extend(
+        rows.iter()
+            .filter(|row| {
+                wanted_by
+                    .get(&row.domain.to_ascii_lowercase())
+                    .is_some_and(|holder| *holder != row.environment_id)
+            })
+            .map(|row| row.id),
+    );
 
     for (environment_id, env_rows) in &rows_of {
         let eligible = by_id
@@ -209,6 +230,130 @@ pub fn plan_rows(
     changes.delete.sort_unstable();
     changes.delete.dedup();
     changes
+}
+
+/// Which environment holds each generated name: the oldest row wins when
+/// two hold one name.
+pub fn holders(rows: &[GeneratedRow]) -> HashMap<String, i32> {
+    let mut sorted: Vec<&GeneratedRow> = rows.iter().collect();
+    sorted.sort_by_key(|r| r.id);
+    let mut holder = HashMap::new();
+    for row in sorted {
+        holder
+            .entry(row.domain.to_ascii_lowercase())
+            .or_insert(row.environment_id);
+    }
+    holder
+}
+
+/// The generated row an environment keeps: one of its names for its
+/// current label that no other environment holds.
+fn kept_row<'a>(
+    env: &EnvironmentFacts,
+    label: &str,
+    domain: &str,
+    rows: &'a [GeneratedRow],
+    holder: &HashMap<String, i32>,
+) -> Option<&'a GeneratedRow> {
+    rows.iter().find(|r| {
+        r.environment_id == env.environment_id
+            && is_generated_name(&r.domain, label, domain, env.environment_id)
+            && holder.get(&r.domain.to_ascii_lowercase()) == Some(&env.environment_id)
+    })
+}
+
+/// The environments that get a new name this pass, in order, with their
+/// labels: every eligible one without a row it keeps, at most
+/// [`MAX_NEW_HOSTS_PER_PASS`] of those that have no row at all. One that has
+/// rows (a rename) is never put off, or its current host would be
+/// withdrawn.
+fn needing_names<'a>(
+    envs: &'a [EnvironmentFacts],
+    rows: &[GeneratedRow],
+    production_template: Option<&str>,
+    domain: &str,
+) -> Vec<(&'a EnvironmentFacts, String)> {
+    let holder = holders(rows);
+    let mut fresh = 0usize;
+    let mut out = Vec::new();
+    for env in envs.iter().filter(|e| e.excluded.is_none()) {
+        let label = host_label(env, production_template);
+        if kept_row(env, &label, domain, rows, &holder).is_some() {
+            continue;
+        }
+        if !rows.iter().any(|r| r.environment_id == env.environment_id) {
+            if fresh >= MAX_NEW_HOSTS_PER_PASS {
+                continue;
+            }
+            fresh += 1;
+        }
+        out.push((env, label));
+    }
+    out
+}
+
+/// The natural names whose DNS a pass reads.
+fn names_to_check(
+    envs: &[EnvironmentFacts],
+    rows: &[GeneratedRow],
+    production_template: Option<&str>,
+    domain: &str,
+) -> Vec<String> {
+    needing_names(envs, rows, production_template, domain)
+        .into_iter()
+        .map(|(_, label)| natural_host(&label, domain))
+        .collect()
+}
+
+/// Each eligible environment's host: the generated name it holds when it
+/// still fits its label, else the natural name, else the short-hash
+/// fallback. `taken` says a name is held outside this tunnel's generated
+/// rows (another address, Temps itself, a foreign DNS record).
+///
+/// Every name a generated row holds starts out claimed by its environment,
+/// so a name another environment holds -- a duplicate label, or a renamed
+/// environment's old name kept until the new one is published -- is taken
+/// whatever order the environments come in. `publishable` refuses a host
+/// the tunnel's zone cannot carry.
+pub fn assign_hosts(
+    envs: &[EnvironmentFacts],
+    rows: &[GeneratedRow],
+    production_template: Option<&str>,
+    domain: &str,
+    taken: &dyn Fn(&str) -> bool,
+    publishable: &dyn Fn(&str) -> bool,
+) -> HashMap<i32, String> {
+    let mut claimed = holders(rows);
+    let mut desired = HashMap::new();
+    for env in envs.iter().filter(|e| e.excluded.is_none()) {
+        let label = host_label(env, production_template);
+        if let Some(row) = kept_row(env, &label, domain, rows, &claimed) {
+            desired.insert(env.environment_id, row.domain.to_ascii_lowercase());
+        }
+    }
+    for (env, label) in needing_names(envs, rows, production_template, domain) {
+        let id = env.environment_id;
+        let held = |claimed: &HashMap<String, i32>, host: &str| {
+            taken(host) || claimed.get(host).is_some_and(|holder| *holder != id)
+        };
+        let natural = natural_host(&label, domain);
+        let host = if held(&claimed, &natural) {
+            fallback_host(&label, domain, id)
+        } else {
+            natural
+        };
+        if held(&claimed, &host) {
+            tracing::warn!(environment_id = id, %host, "both names for this environment are taken");
+            continue;
+        }
+        if !publishable(&host) {
+            tracing::warn!(environment_id = id, %host, "not a hostname the tunnel can publish");
+            continue;
+        }
+        claimed.insert(host.clone(), id);
+        desired.insert(id, host);
+    }
+    desired
 }
 
 // ----- the service ----------------------------------------------------
@@ -288,16 +433,35 @@ pub struct EnvironmentHostsResponse {
     /// generated.
     pub preview_domain_usable: bool,
     pub warning: String,
+    /// Send back as `confirm` to turn it on or off. It names exactly the
+    /// hosts listed here, so a list that changed since it was shown is not
+    /// accepted.
+    #[schema(example = "3f2a9c1e0b7d4a65")]
+    pub confirm_token: String,
 }
 
 /// `PUT /ingress/connectors/{id}/environment-hosts`.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetEnvironmentHostsRequest {
     pub enabled: bool,
-    /// The list was shown and accepted: turning on publishes every host in
-    /// it, turning off withdraws them.
+    /// The `confirm_token` of the list that was shown and accepted: turning
+    /// on publishes every host in it, turning off withdraws them.
     #[serde(default)]
-    pub confirm: bool,
+    pub confirm: Option<String>,
+}
+
+/// What a confirmation is bound to: the tunnel, whether it is on, and every
+/// listed environment's host.
+pub fn confirm_token(connector_id: i32, enabled: bool, hosts: &[EnvironmentHostView]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut listed: Vec<String> = hosts
+        .iter()
+        .map(|h| format!("{}={}", h.environment_id, h.hostname.to_ascii_lowercase()))
+        .collect();
+    listed.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{connector_id}|{enabled}|{}", listed.join(",")));
+    hex::encode(hasher.finalize())[..16].to_string()
 }
 
 /// What one pass read.
@@ -308,7 +472,22 @@ struct Snapshot {
     /// Every address in use in the install, lowercased, except this
     /// connector's generated rows: a name in it is taken.
     taken: HashSet<String>,
-    production_template: Option<String>,
+    /// Which environment holds each of this connector's generated names:
+    /// the oldest row wins when two hold one name.
+    holder: HashMap<String, i32>,
+    settings: temps_core::AppSettings,
+}
+
+impl Snapshot {
+    /// Held by another address in the install, or by Temps itself (the
+    /// console, the public ingress, the preview apex).
+    fn is_taken(&self, host: &str) -> bool {
+        self.taken.contains(host) || self.settings.is_reserved_hostname(host)
+    }
+
+    fn production_template(&self) -> Option<&str> {
+        self.settings.production_hostname_template.as_deref()
+    }
 }
 
 pub struct EnvironmentHostService {
@@ -362,7 +541,7 @@ impl EnvironmentHostService {
     ) -> Result<Snapshot, ReachabilityError> {
         let db = self.db();
         let all_rows = environment_domains::Entity::find().all(db).await?;
-        let rows: Vec<GeneratedRow> = all_rows
+        let mut rows: Vec<GeneratedRow> = all_rows
             .iter()
             .filter(|r| r.generated_by_connector_id == Some(connector.id))
             .map(|r| GeneratedRow {
@@ -371,6 +550,8 @@ impl EnvironmentHostService {
                 domain: r.domain.to_ascii_lowercase(),
             })
             .collect();
+        rows.sort_by_key(|r| r.id);
+        let holder = holders(&rows);
         let restricted: HashSet<i32> = all_rows
             .iter()
             .filter(|r| r.generated_by_connector_id.is_none() && r.audience != PUBLIC)
@@ -396,6 +577,14 @@ impl EnvironmentHostService {
                 .iter()
                 .map(|d| d.domain.trim_end_matches('.').to_ascii_lowercase()),
         );
+        taken.extend(
+            temps_entities::status_page_domains::Entity::find()
+                .filter(temps_entities::status_page_domains::Column::StatusPageId.is_not_null())
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|d| d.hostname.trim_end_matches('.').to_ascii_lowercase()),
+        );
 
         let with_rows: HashSet<i32> = rows.iter().map(|r| r.environment_id).collect();
         let environments = environments::Entity::find()
@@ -414,6 +603,8 @@ impl EnvironmentHostService {
             .into_iter()
             .map(|p| (p.id, p))
             .collect();
+        let mut environments = environments;
+        environments.sort_by_key(|e| e.id);
         let envs = environments
             .into_iter()
             .filter_map(|env| {
@@ -437,89 +628,87 @@ impl EnvironmentHostService {
                 })
             })
             .collect();
-        let production_template = self
-            .reachability
-            .settings()
-            .await?
-            .production_hostname_template;
+        let settings = self.reachability.settings().await?;
         Ok(Snapshot {
             connector,
             envs,
             rows,
             taken,
-            production_template,
+            holder,
+            settings,
         })
     }
 
-    /// Whether `host` is held under the zone by a record Temps does not own.
-    async fn foreign_record(&self, connector: &ingress_connectors::Model, host: &str) -> bool {
-        let deps = &self.reachability.deps;
-        let zone = match deps.connectors.zone_of(connector).await {
-            Ok(zone) => zone,
+    /// The zone the tunnel's records live in, when it can be told.
+    async fn zone(&self, connector: &ingress_connectors::Model) -> Option<String> {
+        match self.reachability.deps.connectors.zone_of(connector).await {
+            Ok(zone) => Some(zone),
             Err(error) => {
                 debug!(%error, connector_id = connector.id, "tunnel zone unknown");
-                return false;
-            }
-        };
-        let Ok(label) = record_label(host, &connector.domain, &zone) else {
-            return false;
-        };
-        match deps
-            .records
-            .record_ownership(host, &label, DnsRecordType::CNAME)
-            .await
-        {
-            // Free, or this install's own (another address in this install
-            // is caught by `taken`).
-            Ok(
-                RecordOwnership::NotFound
-                | RecordOwnership::Owned(..)
-                | RecordOwnership::Orphaned(..),
-            ) => false,
-            Ok(_) => true,
-            Err(error) => {
-                // Cannot tell: the natural name is tried, and publication
-                // reports a conflict if there is one.
-                debug!(%error, %host, "could not read DNS ownership");
-                false
+                None
             }
         }
     }
 
-    /// Each eligible environment's host: its current generated name when it
-    /// still fits the label, else the natural name, else the fallback.
+    /// Whether `host` is held under the zone by an A, AAAA or CNAME record
+    /// Temps does not own.
+    async fn foreign_record(&self, zone: Option<&str>, domain: &str, host: &str) -> bool {
+        let Some(zone) = zone else {
+            return false;
+        };
+        let Ok(label) = record_label(host, domain, zone) else {
+            return false;
+        };
+        for record_type in [DnsRecordType::CNAME, DnsRecordType::A, DnsRecordType::AAAA] {
+            match self
+                .reachability
+                .deps
+                .records
+                .record_ownership(host, &label, record_type)
+                .await
+            {
+                // Free, or this install's own (another address in this
+                // install is caught by `taken`).
+                Ok(
+                    RecordOwnership::NotFound
+                    | RecordOwnership::Owned(..)
+                    | RecordOwnership::Orphaned(..),
+                ) => {}
+                Ok(_) => return true,
+                Err(error) => {
+                    // Cannot tell: the name is tried, and publication
+                    // reports a conflict if there is one.
+                    debug!(%error, %host, ?record_type, "could not read DNS ownership");
+                }
+            }
+        }
+        false
+    }
+
+    /// Each eligible environment's host (see [`assign_hosts`]). DNS is read
+    /// here, for the natural names [`assign_hosts`] would try.
     async fn desired(&self, snap: &Snapshot) -> HashMap<i32, String> {
         let domain = snap.connector.domain.as_str();
-        let mut desired = HashMap::new();
-        let mut checked = 0usize;
-        let mut claimed: HashSet<String> = HashSet::new();
-        for env in snap.envs.iter().filter(|e| e.excluded.is_none()) {
-            let label = host_label(env, snap.production_template.as_deref());
-            if let Some(row) = snap.rows.iter().find(|r| {
-                r.environment_id == env.environment_id
-                    && is_generated_name(&r.domain, &label, domain, env.environment_id)
-            }) {
-                claimed.insert(row.domain.clone());
-                desired.insert(env.environment_id, row.domain.clone());
-                continue;
+        let zone = self.zone(&snap.connector).await;
+        let mut foreign = HashSet::new();
+        for natural in names_to_check(&snap.envs, &snap.rows, snap.production_template(), domain) {
+            if !snap.is_taken(&natural)
+                && self.foreign_record(zone.as_deref(), domain, &natural).await
+            {
+                foreign.insert(natural);
             }
-            if checked >= MAX_NEW_HOSTS_PER_PASS {
-                continue;
-            }
-            checked += 1;
-            let natural = natural_host(&label, domain);
-            let taken = snap.taken.contains(&natural)
-                || claimed.contains(&natural)
-                || self.foreign_record(&snap.connector, &natural).await;
-            let host = if taken {
-                fallback_host(&label, domain, env.environment_id)
-            } else {
-                natural
-            };
-            claimed.insert(host.clone());
-            desired.insert(env.environment_id, host);
         }
-        desired
+        assign_hosts(
+            &snap.envs,
+            &snap.rows,
+            snap.production_template(),
+            domain,
+            &|host| snap.is_taken(host) || foreign.contains(host),
+            &|host| {
+                zone.as_deref()
+                    .is_none_or(|zone| record_label(host, domain, zone).is_ok())
+            },
+        )
     }
 
     async fn published(&self, connector_id: i32) -> Result<HashSet<String>, ReachabilityError> {
@@ -564,7 +753,23 @@ impl EnvironmentHostService {
             return Ok(());
         }
         let txn = self.db().begin().await?;
+        let mut skipped = 0usize;
         for (environment_id, host) in &changes.insert {
+            // Under the hostname lock custom domains, environment domains
+            // and status pages claim names under: the name read as free in
+            // the snapshot may have been claimed since.
+            temps_entities::status_page_domains::lock_hostname_claim(&txn, host).await?;
+            if let Some(holder) = hostname_holder(&txn, host).await? {
+                warn!(
+                    connector_id,
+                    environment_id,
+                    %host,
+                    holder,
+                    "not generating a host claimed since the pass began; the next pass picks another"
+                );
+                skipped += 1;
+                continue;
+            }
             environment_domains::ActiveModel {
                 environment_id: Set(*environment_id),
                 domain: Set(host.clone()),
@@ -587,7 +792,7 @@ impl EnvironmentHostService {
         txn.commit().await?;
         info!(
             connector_id,
-            added = changes.insert.len(),
+            added = changes.insert.len() - skipped,
             withdrawn = changes.delete.len(),
             "updated tunnel environment hosts"
         );
@@ -631,7 +836,7 @@ impl EnvironmentHostService {
                 }
                 continue;
             }
-            let label = host_label(env, snap.production_template.as_deref());
+            let label = host_label(env, snap.production_template());
             let natural = natural_host(&label, &domain);
             let rows: Vec<&GeneratedRow> = snap
                 .rows
@@ -643,7 +848,12 @@ impl EnvironmentHostService {
                     environment_id: env.environment_id,
                     project_slug: env.project_slug.clone(),
                     environment_name: env.environment_name.clone(),
-                    note: snap.taken.contains(&natural).then(|| {
+                    note: (snap.is_taken(&natural)
+                        || snap
+                            .holder
+                            .get(&natural)
+                            .is_some_and(|e| *e != env.environment_id))
+                    .then(|| {
                         format!(
                             "{natural} is already in use, so it will get {}",
                             fallback_host(&label, &domain, env.environment_id)
@@ -681,6 +891,7 @@ impl EnvironmentHostService {
             connector_name: snap.connector.name.clone(),
             domain,
             enabled: snap.connector.environment_hosts,
+            confirm_token: confirm_token(connector_id, snap.connector.environment_hosts, &hosts),
             hosts,
             refused,
             enabled_elsewhere,
@@ -690,35 +901,50 @@ impl EnvironmentHostService {
     }
 
     /// Turn environment hosts on or off for `connector_id`. Both directions
-    /// need `confirm`: on publishes every host listed, off withdraws them.
+    /// need `confirm`, the `confirm_token` of the list that was shown: on
+    /// publishes every host listed, off withdraws them.
     pub async fn set(
         &self,
         connector_id: i32,
         request: &SetEnvironmentHostsRequest,
     ) -> Result<EnvironmentHostsResponse, ReachabilityError> {
+        let current = self.list(connector_id).await?;
+        if current.enabled == request.enabled {
+            return Ok(current);
+        }
         let connector = self.connector(connector_id).await?;
-        if connector.environment_hosts == request.enabled {
-            return self.list(connector_id).await;
-        }
-        if !request.confirm {
-            return Err(ReachabilityError::Validation(format!(
-                "Turning environment hosts {} for tunnel {} {}; list them with GET \
-                 /ingress/connectors/{connector_id}/environment-hosts and send confirm: true",
-                if request.enabled { "on" } else { "off" },
-                connector.name,
-                if request.enabled {
-                    "publishes a public name for every environment"
-                } else {
-                    "withdraws every name it published"
-                },
-            )));
-        }
+        check_confirmation(&current, request)?;
         set_environment_hosts(self.db(), &connector, request.enabled).await?;
         // The hosts are generated and published by the reconciler, which
         // runs the pass under its lock: never two passes at once.
         let connectors = self.reachability.deps.connectors.clone();
         tokio::spawn(async move { connectors.reconcile_all().await });
         self.list(connector_id).await
+    }
+}
+
+/// Whether `request` confirms exactly the list in `current`.
+fn check_confirmation(
+    current: &EnvironmentHostsResponse,
+    request: &SetEnvironmentHostsRequest,
+) -> Result<(), ReachabilityError> {
+    let what = if request.enabled {
+        "on publishes a public name for every environment listed"
+    } else {
+        "off withdraws every name it published"
+    };
+    match request.confirm.as_deref() {
+        Some(token) if token == current.confirm_token => Ok(()),
+        None => Err(ReachabilityError::Validation(format!(
+            "Turning environment hosts {what} for tunnel {}; list them with GET \
+             /ingress/connectors/{}/environment-hosts and send its confirm_token as confirm",
+            current.connector_name, current.connector_id
+        ))),
+        Some(_) => Err(ReachabilityError::Conflict(format!(
+            "The environment hosts of tunnel {} changed since they were listed; list them \
+             again with GET /ingress/connectors/{}/environment-hosts and confirm the new list",
+            current.connector_name, current.connector_id
+        ))),
     }
 }
 
@@ -754,13 +980,65 @@ pub async fn set_environment_hosts(
     update.environment_hosts = Set(enabled);
     // D2's cached answer is keyed on it.
     update.updated_at = Set(chrono::Utc::now());
-    update.update(&txn).await?;
+    update
+        .update(&txn)
+        .await
+        .map_err(|error| match error.sql_err() {
+            // Another tunnel turned it on between the check and this write: the
+            // partial unique index keeps it to one.
+            Some(sea_orm::SqlErr::UniqueConstraintViolation(_)) => {
+                ReachabilityError::Conflict(format!(
+                    "Another tunnel turned environment hosts on first; only one tunnel can \
+                 publish them, so tunnel {} was left off",
+                    connector.name
+                ))
+            }
+            _ => ReachabilityError::from(error),
+        })?;
     txn.commit().await?;
     info!(
         connector_id = connector.id,
         enabled, "tunnel environment hosts switched"
     );
     Ok(())
+}
+
+/// What already holds `host`, if anything: a custom domain, an environment
+/// domain (generated or not) or a status page. Compared case-insensitively.
+async fn hostname_holder<C: ConnectionTrait>(
+    conn: &C,
+    host: &str,
+) -> Result<Option<&'static str>, sea_orm::DbErr> {
+    use sea_orm::sea_query::{Expr, Func};
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if project_custom_domains::Entity::find()
+        .filter(
+            Expr::expr(Func::lower(Expr::col(
+                project_custom_domains::Column::Domain,
+            )))
+            .eq(host.as_str()),
+        )
+        .one(conn)
+        .await?
+        .is_some()
+    {
+        return Ok(Some("a custom domain"));
+    }
+    if environment_domains::Entity::find()
+        .filter(
+            Expr::expr(Func::lower(Expr::col(environment_domains::Column::Domain)))
+                .eq(host.as_str()),
+        )
+        .one(conn)
+        .await?
+        .is_some()
+    {
+        return Ok(Some("an environment domain"));
+    }
+    if temps_entities::status_page_domains::attached_hostname_conflict(conn, &host).await? {
+        return Ok(Some("a status page"));
+    }
+    Ok(None)
 }
 
 /// Tell every proxy the route table changed.
@@ -1061,5 +1339,211 @@ mod tests {
         let desired = HashMap::from([(1, "shop-production.t.example.com".to_string())]);
         let changes = plan_rows(&envs, &rows, &desired, &HashSet::new(), true);
         assert_eq!(changes.delete, vec![11]);
+    }
+
+    const ZONE: &str = "t.example.com";
+
+    fn assign(envs: &[EnvironmentFacts], rows: &[GeneratedRow]) -> HashMap<i32, String> {
+        assign_hosts(envs, rows, None, ZONE, &|_| false, &|_| true)
+    }
+
+    /// Two environments with one label never share a host, whichever comes
+    /// first, and the one already holding it keeps it.
+    #[test]
+    fn two_environments_never_get_one_host_in_either_order() {
+        let natural = natural_host("shop-staging", ZONE);
+        for envs in [
+            vec![env(1, "shop-staging"), env(2, "shop-staging")],
+            vec![env(2, "shop-staging"), env(1, "shop-staging")],
+        ] {
+            let desired = assign(&envs, &[]);
+            assert_eq!(desired.len(), 2);
+            assert_ne!(desired[&1], desired[&2]);
+            assert!(desired.values().any(|h| *h == natural));
+
+            // Environment 2 already holds the name: it keeps it.
+            let rows = [row(10, 2, &natural)];
+            let desired = assign(&envs, &rows);
+            assert_eq!(desired[&2], natural);
+            assert_eq!(desired[&1], fallback_host("shop-staging", ZONE, 1));
+        }
+    }
+
+    /// A renamed environment keeps its old name until the new one is live;
+    /// meanwhile nobody else is given it.
+    #[test]
+    fn a_renamed_environments_old_name_is_not_handed_out() {
+        let old = natural_host("shop-staging", ZONE);
+        let rows = [row(10, 2, &old)];
+        let envs = [env(1, "shop-staging"), env(2, "shop-qa")];
+        let desired = assign(&envs, &rows);
+        assert_eq!(desired[&2], natural_host("shop-qa", ZONE));
+        assert_eq!(desired[&1], fallback_host("shop-staging", ZONE, 1));
+        let changes = plan_rows(&envs, &rows, &desired, &HashSet::new(), true);
+        assert!(
+            changes.delete.is_empty(),
+            "the old name stays until shop-qa is live"
+        );
+    }
+
+    /// Two rows that already hold one name: the oldest keeps it, the other
+    /// goes at once and its environment gets the fallback.
+    #[test]
+    fn a_name_held_twice_is_given_to_the_oldest_row_only() {
+        let name = natural_host("shop-staging", ZONE);
+        let envs = [env(2, "shop-staging"), env(1, "shop-staging")];
+        let rows = [row(11, 2, &name), row(10, 1, &name)];
+        let desired = assign(&envs, &rows);
+        assert_eq!(desired[&1], name);
+        assert_eq!(desired[&2], fallback_host("shop-staging", ZONE, 2));
+        let changes = plan_rows(&envs, &rows, &desired, &HashSet::new(), true);
+        assert_eq!(changes.delete, vec![11]);
+        assert_eq!(
+            changes.insert,
+            vec![(2, fallback_host("shop-staging", ZONE, 2))]
+        );
+    }
+
+    /// A name held elsewhere (another address, Temps itself, a foreign
+    /// record) gets the fallback; a host the zone cannot carry gets nothing.
+    #[test]
+    fn a_taken_name_gets_the_fallback_and_an_unpublishable_one_nothing() {
+        let envs = [env(1, "www")];
+        let natural = natural_host("www", ZONE);
+        let desired = assign_hosts(&envs, &[], None, ZONE, &|h| h == natural, &|_| true);
+        assert_eq!(desired[&1], fallback_host("www", ZONE, 1));
+        let desired = assign_hosts(&envs, &[], None, ZONE, &|_| true, &|_| true);
+        assert!(desired.is_empty(), "both names taken");
+        let desired = assign_hosts(&envs, &[], None, ZONE, &|_| false, &|_| false);
+        assert!(desired.is_empty());
+    }
+
+    /// Labels are one ASCII DNS label of at most 63 characters, whatever the
+    /// branch name or an old subdomain held.
+    #[test]
+    fn host_labels_are_one_short_ascii_label() {
+        for raw in [
+            "shop-feature-\u{0430}dd-login",
+            "shop.old.subdomain",
+            &"shop-a-very-long-branch-name".repeat(4),
+        ] {
+            let label = host_label(&env(3, raw), None);
+            assert!(label.len() <= 63, "{label}");
+            assert!(!label.contains('.'), "{label}");
+            assert!(
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "{label}"
+            );
+        }
+    }
+
+    fn listed(enabled: bool, hosts: &[(i32, &str)]) -> EnvironmentHostsResponse {
+        let hosts: Vec<EnvironmentHostView> = hosts
+            .iter()
+            .map(|(id, host)| EnvironmentHostView {
+                environment_id: *id,
+                project_slug: "shop".into(),
+                environment_name: "staging".into(),
+                hostname: (*host).into(),
+                state: "planned".into(),
+                last_error: None,
+                note: None,
+            })
+            .collect();
+        EnvironmentHostsResponse {
+            connector_id: 1,
+            connector_name: "edge".into(),
+            domain: ZONE.into(),
+            enabled,
+            confirm_token: confirm_token(1, enabled, &hosts),
+            hosts,
+            refused: Vec::new(),
+            enabled_elsewhere: None,
+            preview_domain_usable: false,
+            warning: PUBLIC_NAMES_WARNING.into(),
+        }
+    }
+
+    /// The confirmation names the list that was shown: another list, or none,
+    /// is refused.
+    #[test]
+    fn confirming_is_bound_to_the_list_that_was_shown() {
+        let shown = listed(false, &[(1, "shop-staging.t.example.com")]);
+        let request = |confirm: Option<&str>| SetEnvironmentHostsRequest {
+            enabled: true,
+            confirm: confirm.map(str::to_string),
+        };
+        assert!(check_confirmation(&shown, &request(Some(&shown.confirm_token))).is_ok());
+        assert!(matches!(
+            check_confirmation(&shown, &request(None)),
+            Err(ReachabilityError::Validation(_))
+        ));
+        // A new environment appeared since the list was shown.
+        let now = listed(
+            false,
+            &[
+                (1, "shop-staging.t.example.com"),
+                (2, "shop-qa.t.example.com"),
+            ],
+        );
+        assert_ne!(now.confirm_token, shown.confirm_token);
+        assert!(matches!(
+            check_confirmation(&now, &request(Some(&shown.confirm_token))),
+            Err(ReachabilityError::Conflict(_))
+        ));
+        // The order hosts are listed in does not matter; the on/off state does.
+        let reordered = listed(
+            false,
+            &[
+                (2, "shop-qa.t.example.com"),
+                (1, "shop-staging.t.example.com"),
+            ],
+        );
+        assert_eq!(reordered.confirm_token, now.confirm_token);
+        assert_ne!(
+            listed(true, &[(1, "shop-staging.t.example.com")]).confirm_token,
+            shown.confirm_token
+        );
+    }
+
+    /// A name claimed after the snapshot is not generated: the insert path
+    /// re-reads custom domains, environment domains and status pages.
+    #[tokio::test]
+    async fn a_name_claimed_since_the_snapshot_is_held() {
+        let claimed = environment_domains::Model {
+            id: 4,
+            environment_id: 9,
+            domain: "shop-staging.t.example.com".into(),
+            created_at: chrono::Utc::now(),
+            audience: PUBLIC.into(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            generated_by_connector_id: None,
+        };
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<project_custom_domains::Model>::new()])
+            .append_query_results([vec![claimed]])
+            .into_connection();
+        assert_eq!(
+            hostname_holder(&db, "Shop-Staging.t.example.com")
+                .await
+                .unwrap(),
+            Some("an environment domain")
+        );
+        let log = statements(db).join("\n");
+        assert!(log.contains("LOWER"), "{log}");
+
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<project_custom_domains::Model>::new()])
+            .append_query_results([Vec::<environment_domains::Model>::new()])
+            .append_query_results([Vec::<temps_entities::status_page_domains::Model>::new()])
+            .into_connection();
+        assert_eq!(
+            hostname_holder(&db, "free.t.example.com").await.unwrap(),
+            None
+        );
     }
 }

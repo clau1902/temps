@@ -33,6 +33,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button, buttonVariants } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
 
@@ -218,6 +219,8 @@ export function TunnelEnvironmentHosts({
     path: { id: connector.id },
   })
   const query = useQuery({ ...options, refetchInterval: 15_000, retry: false })
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const set = useMutation({
     ...setConnectorEnvironmentHostsMutation(),
     onSuccess: (data) => {
@@ -239,10 +242,17 @@ export function TunnelEnvironmentHosts({
         }),
       ])
     },
-    onError: (error) =>
+    onError: (error, variables) => {
+      // Turning it on asks for a recent verification first.
+      if (handleSensitiveActionError(error, () => set.mutate(variables))) return
+      // The list changed since it was shown: show the new one to confirm.
+      if ((error as { status?: number } | null)?.status === 409) {
+        void queryClient.invalidateQueries({ queryKey: options.queryKey })
+      }
       toast.error('Could not change the environment addresses', {
         description: problemDetail(error, 'Try again in a moment.'),
-      }),
+      })
+    },
   })
   if (query.isPending) {
     return <Skeleton className="h-10 w-full" />
@@ -257,16 +267,21 @@ export function TunnelEnvironmentHosts({
       </p>
     )
   }
+  const data = query.data
   return (
-    <TunnelEnvironmentHostsView
-      data={query.data}
-      pending={set.isPending}
-      onConfirm={(enabled) =>
-        set.mutate({
-          path: { id: connector.id },
-          body: { enabled, confirm: true },
-        })
-      }
-    />
+    <>
+      <TunnelEnvironmentHostsView
+        data={data}
+        pending={set.isPending}
+        onConfirm={(enabled) =>
+          set.mutate({
+            path: { id: connector.id },
+            // Binds the change to the list that was shown.
+            body: { enabled, confirm: data.confirm_token },
+          })
+        }
+      />
+      {verificationDialog}
+    </>
   )
 }

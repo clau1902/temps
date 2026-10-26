@@ -11654,6 +11654,12 @@ export type EnvironmentHostView = {
  * `GET`/`PUT /ingress/connectors/{id}/environment-hosts`.
  */
 export type EnvironmentHostsResponse = {
+    /**
+     * Send back as `confirm` to turn it on or off. It names exactly the
+     * hosts listed here, so a list that changed since it was shown is not
+     * accepted.
+     */
+    confirm_token: string;
     connector_id: number;
     connector_name: string;
     domain: string;
@@ -27705,10 +27711,10 @@ export type SetConnectorNodesRequest = {
  */
 export type SetEnvironmentHostsRequest = {
     /**
-     * The list was shown and accepted: turning on publishes every host in
-     * it, turning off withdraws them.
+     * The `confirm_token` of the list that was shown and accepted: turning
+     * on publishes every host in it, turning off withdraws them.
      */
-    confirm?: boolean;
+    confirm?: string | null;
     enabled: boolean;
 };
 
@@ -53236,9 +53242,13 @@ export type SetConnectorEnvironmentHostsErrors = {
      */
     404: unknown;
     /**
-     * Another tunnel publishes environment hosts
+     * Another tunnel publishes environment hosts, or the list changed since it was shown
      */
     409: unknown;
+    /**
+     * Turning it on needs a recent MFA verification
+     */
+    428: unknown;
     /**
      * Internal server error
      */
@@ -84534,9 +84544,13 @@ export type ApplyEnvironmentReachabilityErrors = {
      */
     404: unknown;
     /**
-     * The option no longer fits, or a run is in progress
+     * The plan changed (the body's `plan` is the new one), or a run is in progress
      */
     409: unknown;
+    /**
+     * Changing who an address is for, or publishing every environment under a tunnel, needs a recent MFA verification
+     */
+    428: unknown;
 };
 
 export type ApplyEnvironmentReachabilityResponses = {

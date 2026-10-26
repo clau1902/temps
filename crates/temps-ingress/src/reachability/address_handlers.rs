@@ -12,13 +12,16 @@ use axum::{
     routing::get,
     Extension, Json, Router,
 };
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::environment_address::{
     AddressKind, PreviewDomainStatus, PrimaryAddress, ReachabilityFix, ReachabilityFixKind,
     ReachabilityWarning,
 };
 use temps_core::problemdetails::Problem;
-use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
+use temps_core::{
+    AuditContext, AuditLogger, AuditOperation, RequestMetadata, SensitiveAction,
+    SensitiveActionAuthorizer,
+};
 use tracing::error;
 use utoipa::OpenApi;
 
@@ -32,6 +35,7 @@ pub struct AddressAppState {
     pub service: Arc<EnvironmentAddressService>,
     pub environment_hosts: Arc<EnvironmentHostService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub sensitive_action_authorizer: Arc<dyn SensitiveActionAuthorizer>,
 }
 
 #[derive(OpenApi)]
@@ -129,8 +133,10 @@ async fn get_connector_environment_hosts(
 /// Turn a tunnel's environment hosts on or off.
 ///
 /// On publishes every listed environment as `<label>.<domain>`; off
-/// withdraws every host it generated. Both need `confirm: true`, sent after
-/// showing the list from the `GET`. At most one tunnel has it on.
+/// withdraws every host it generated. Both need `confirm`: the
+/// `confirm_token` of the list from the `GET` that was shown. Turning it on
+/// is a sensitive action (it widens every environment to public). At most
+/// one tunnel has it on.
 #[utoipa::path(
     tag = "Reachability",
     put,
@@ -144,7 +150,8 @@ async fn get_connector_environment_hosts(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "No such tunnel"),
-        (status = 409, description = "Another tunnel publishes environment hosts"),
+        (status = 409, description = "Another tunnel publishes environment hosts, or the list changed since it was shown"),
+        (status = 428, description = "Turning it on needs a recent MFA verification"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -159,6 +166,16 @@ async fn set_connector_environment_hosts(
     permission_guard!(auth, SettingsWrite);
     // Turning it off withdraws what it listed before: record those.
     let before = state.environment_hosts.list(id).await?;
+    if request.enabled && !before.enabled {
+        require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::PublishEnvironmentHosts {
+                connector_id: Some(id),
+            },
+        )
+        .await?;
+    }
     let view = state.environment_hosts.set(id, &request).await?;
     let listed = if view.enabled { &view } else { &before };
     let audit = EnvironmentHostsAudit {

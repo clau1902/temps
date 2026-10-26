@@ -223,6 +223,15 @@ reachable". It is done when the preview domain is `usable` or a tunnel has
 - D3 never overwrites a DNS record Temps does not own (ADR 031) and never
   touches an `environment_domains` row it did not generate
   (`generated_by_connector_id`).
+- D3 names are predictable and published before anyone asks for them, so
+  no other address may take one over. A custom domain is refused when an
+  environment address of any project holds its name, and a generated name
+  is refused when anything else in the install holds it. One hostname is
+  never generated for two environments. Labels are a single ASCII DNS label,
+  so a branch name cannot produce an IDN look-alike.
+- Turning environment hosts on makes every environment public at once. It
+  needs a recent MFA verification, and the confirmation is bound to the
+  exact list of hosts that was shown.
 - A tunnel environment host is public. Turning it on for an environment whose
   addresses are `private` or `signed_in` (ADR 064, ADR 065) is refused: those
   audiences are set per address, and a generated host must not widen them.
@@ -337,21 +346,48 @@ or the code reads it a particular way, the choice is listed here.
 - **The pass runs inside the ADR 058 reconcile.** Generated rows are brought
   in line with the environments at the start of every reconcile, under its
   lock: every minute, and whenever the peer table changes. The endpoint and
-  the plan/run step only set the flag and ask for a reconcile. Two passes can
-  never run at once, which matters because `environment_domains.domain` has
-  no unique index. Renames and deletions are therefore picked up within a
-  reconcile tick, not synchronously.
+  the plan/run step only set the flag and ask for a reconcile, and so does
+  turning an address `private` or `signed_in`, so a newly restricted
+  environment loses its public host at once. Two passes can never run at
+  once. Other renames and deletions are picked up within a reconcile tick,
+  not synchronously.
+- **One hostname, one environment.** Every name a generated row holds is
+  claimed by its environment before any new name is chosen, so a duplicate
+  label, or a renamed environment's old name kept until the new one is
+  published, gets the other environment the short-hash name whatever order
+  the environments are read in. When two rows already hold one name the
+  oldest keeps it and the other is removed in the same pass. A partial
+  unique index on `lower(domain)` for generated rows backs this up in the
+  database.
+- **No cross-project takeover.** A custom domain is refused when any
+  `environment_domains` row holds its name, in any project, on create and on
+  rename: the route table serves a custom domain in place of an environment
+  address, and D3 names are predictable and published in advance. The other
+  way round, each generated name is re-checked against custom domains,
+  environment domains and status pages under the shared hostname lock right
+  before its row is inserted. A name claimed since the pass began is left
+  for the next pass, which gives it the short-hash name. Adding a tunnel
+  environment host as the environment's own domain is refused too, because
+  opting out would delete it.
+- **Labels are one ASCII DNS label.** The environment's label is sanitised
+  as `environment_label` does it: anything but ASCII letters and digits
+  becomes a hyphen, so dotted legacy subdomains stay one level below the
+  zone and no IDN look-alike is published. Labels over 63 characters are cut
+  with a short hash. The full host is then checked against the tunnel's zone
+  before a row is written.
 - **Publication goes through the ADR 058 plan, not a separate path.** A
   generated row counts as a hostname chosen for its tunnel, and so do its
   Flat service hosts. A choice the operator made for the same hostname wins.
-- **Ownership (ADR 031) is checked on the CNAME the tunnel would write.** A
-  name with no record, with this install's record, or with only this
-  install's orphaned marker is free. Any other answer gets `<label>-<hash>`
-  (an unmanaged record, another install's record or marker, a registry
-  conflict), and so does a name another address in this install uses. If
-  the lookup itself fails, the natural name is tried and publication reports
-  a conflict if there is one. The listing's `note` says why a host has the
-  hashed name.
+- **Ownership (ADR 031) is checked on A, AAAA and CNAME records.** A name
+  with no record, with this install's record, or with only this install's
+  orphaned marker is free. Any other answer for any of the three types gets
+  `<label>-<hash>` (an unmanaged record, another install's record or marker,
+  a registry conflict). So does a name another address in this install
+  uses: a custom domain, an environment domain, a status page, or a name
+  Temps reserves for itself (the console, the public ingress, the preview
+  apex). If a lookup fails, the natural name is tried and publication
+  reports a conflict if there is one. The listing's `note` says why a host
+  has the hashed name.
 - **New hosts are bounded per pass.** A pass resolves at most 50 new names
   (each needs a DNS ownership lookup). Larger installs converge over a few
   ticks; existing hosts are never re-checked.
@@ -364,9 +400,18 @@ or the code reads it a particular way, the choice is listed here.
   gets no generated host. The opt-in lists it under "Not published" with the
   reason, and the D5 warning offers it no tunnel fix. Projects hosted
   elsewhere and deleted environments are refused the same way.
-- **Opt-out and connector deletion.** `PUT …/environment-hosts` needs
-  `confirm: true` in both directions, after the `GET` listing was shown.
-  Opting out deletes the generated rows in the same transaction as the flag.
+- **Confirmation is bound to the list shown.** The `GET` listing carries a
+  `confirm_token`, a hash of the tunnel, its on/off state and every listed
+  environment's host. `PUT …/environment-hosts` needs it back as `confirm`,
+  in both directions. A missing token is a 400. A token for a list that has
+  changed since it was shown is a 409, and the console reloads the list.
+- **Turning it on is a sensitive action** (`publish_environment_hosts`),
+  both on the endpoint and through the `tunnel_environment_hosts` plan
+  option, because it makes every environment public at once. Turning it off
+  is not. When two tunnels race to turn it on, the loser gets a 409 from the
+  partial unique index, not a 500.
+- **Opt-out and connector deletion.** Opting out deletes the generated rows
+  in the same transaction as the flag.
   Deleting a connector removes its rows by foreign-key cascade, and the
   console's delete confirmation lists them first.
 - **The one-click D5 fix is a plan option,** `tunnel_environment_hosts`,

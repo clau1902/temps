@@ -5239,8 +5239,10 @@ export const getConnectorEnvironmentHosts = <ThrowOnError extends boolean = fals
  * Turn a tunnel's environment hosts on or off.
  *
  * On publishes every listed environment as `<label>.<domain>`; off
- * withdraws every host it generated. Both need `confirm: true`, sent after
- * showing the list from the `GET`. At most one tunnel has it on.
+ * withdraws every host it generated. Both need `confirm`: the
+ * `confirm_token` of the list from the `GET` that was shown. Turning it on
+ * is a sensitive action (it widens every environment to public). At most
+ * one tunnel has it on.
  */
 export const setConnectorEnvironmentHosts = <ThrowOnError extends boolean = false>(options: Options<SetConnectorEnvironmentHostsData, ThrowOnError>): RequestResult<SetConnectorEnvironmentHostsResponses, SetConnectorEnvironmentHostsErrors, ThrowOnError> => (options.client ?? client).put<SetConnectorEnvironmentHostsResponses, SetConnectorEnvironmentHostsErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
