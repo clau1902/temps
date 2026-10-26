@@ -83600,7 +83600,21 @@ export type GetAuditLogResponse = GetAuditLogResponses[keyof GetAuditLogResponse
 /**
  * Who an address is for.
  */
-export type Audience = 'public' | 'private' | 'signed_in' | 'unsupported';
+export type Audience = 'public' | 'private' | 'signed_in' | 'tailnet_users' | 'unsupported';
+
+/**
+ * Which kind of tailnet principal an entry names (ADR 065 D6).
+ */
+export type PrincipalKind = 'login' | 'tag';
+
+/**
+ * One entry of a `tailnet_users` address's list: a login or a `tag:`,
+ * ASCII-lower-cased: it is compared that way (D6).
+ */
+export type TailnetPrincipal = {
+    kind: PrincipalKind;
+    value: string;
+};
 
 export type ReachState = 'reachable' | 'not_reachable' | 'checking' | 'unknown';
 
@@ -83654,9 +83668,9 @@ export type AddressReachability = {
     network?: string | null;
 };
 
-export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker';
+export type PlanOptionKind = 'existing_tunnel' | 'direct_managed_dns' | 'new_tunnel' | 'new_tunnel_with_token' | 'direct_manual_dns' | 'private_worker' | 'tailscale_serve' | 'tailscale_service' | 'tailscale_service_with_credential';
 
-export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience';
+export type StepKind = 'check_token' | 'save_dns_provider' | 'manage_domain' | 'create_tunnel' | 'wait_for_tunnel' | 'attach_domain' | 'route_hostname' | 'set_dns_record' | 'show_dns_record' | 'issue_certificate' | 'wait_for_publication' | 'check_reachability' | 'set_audience' | 'configure_tailscale_serve' | 'save_tailscale_credential' | 'define_tailscale_service' | 'wait_for_service_approval';
 
 export type PlanStep = {
     kind: StepKind;
@@ -83720,6 +83734,10 @@ export type ReachabilityPlan = {
     address_error?: string | null;
     audience: Audience;
     /**
+     * For `tailnet_users`: who it admits, as the plan will set it.
+     */
+    principals?: Array<TailnetPrincipal>;
+    /**
      * Set when `options` is empty.
      */
     blocked?: null | PlanBlocked;
@@ -83780,6 +83798,10 @@ export type PlanRequest = {
      */
     address?: string | null;
     audience?: Audience;
+    /**
+     * For `tailnet_users`: who it admits. An empty list is refused.
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 /**
@@ -83888,6 +83910,51 @@ export type RunResource = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    node_id: number;
+    node_name: string;
+    address_id: string;
+    hostname: string;
+    entry_id: number;
+    /**
+     * This run created the entry, rather than finding it.
+     */
+    created: boolean;
+    type: 'tailscale_serve';
+} | {
+    id: number;
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    /**
+     * The tailnet's MagicDNS suffix, for the Service's lock and messages.
+     */
+    tailnet: string;
+    /**
+     * `svc:myapp`.
+     */
+    name: string;
+    /**
+     * This run created it (`created`), rather than finding it.
+     */
+    created: boolean;
+    /**
+     * The run whose marker it carries.
+     */
+    creator_run_id: number;
+    definition: ServiceDefinition;
+    type: 'tailscale_service';
+};
+
+/**
+ * A Tailscale Service as the API has it (ADR 065 D4).
+ */
+export type ServiceDefinition = {
+    name: string;
+    addrs?: Array<string>;
+    comment?: string;
+    ports?: Array<string>;
+    tags?: Array<string>;
 };
 
 /**
@@ -83912,6 +83979,20 @@ export type AddressAudience = {
     network_range?: string | null;
     private_node_id?: number | null;
     private_listener?: string | null;
+    /**
+     * For `private`: how it is served (ADR 065 D1), `tailscale_serve` or
+     * `tailscale_service`. `None` is phase 2's listener, so runs journaled
+     * before this column compare equal to what they set.
+     */
+    private_via?: string | null;
+    /**
+     * For `tailscale_service`: the `svc:` name.
+     */
+    private_service?: string | null;
+    /**
+     * For `tailnet_users`: who it admits (ADR 065 D6).
+     */
+    principals?: Array<TailnetPrincipal>;
 };
 
 /**
@@ -83974,6 +84055,27 @@ export type Intent = {
 } | {
     domain: string;
     type: 'certificate';
+} | {
+    node_id: number;
+    node_name: string;
+    address_id: string;
+    hostname: string;
+    /**
+     * The `svc:` name, for a Service.
+     */
+    service?: string | null;
+    type: 'tailscale_serve';
+} | {
+    name: string;
+    type: 'tailscale_credential';
+} | {
+    tailnet: string;
+    name: string;
+    /**
+     * `temps:<install>:<this run>`.
+     */
+    marker: string;
+    type: 'tailscale_service';
 };
 
 export type JournalState = 'pending' | 'done' | 'absent' | 'conflict';
@@ -84024,6 +84126,11 @@ export type JournalEntry = {
      * A conflict found before the write: Temps wrote nothing.
      */
     unwritten?: boolean;
+    /**
+     * The Tailscale Service as shown to the user when undo asked whether
+     * to delete it (ADR 065 D4).
+     */
+    shown_service?: null | ServiceDefinition;
 };
 
 /**
