@@ -296,6 +296,16 @@ pub async fn extract_pdf_text(name: &str, bytes: Vec<u8>) -> Result<String, Stri
 /// capped at [`MAX_DOCUMENT_BYTES`], but deflate lets a stream that small
 /// inflate to gigabytes.
 const MAX_PDF_STREAM_BYTES: usize = 64 * 1024 * 1024;
+/// Total bytes the content streams and font maps of one PDF may inflate to,
+/// counted each time one is read. Pages and forms may reuse one stream any
+/// number of times, so the per-stream limit alone does not bound the work,
+/// and a read that outlives [`PDF_EXTRACTION_TIMEOUT`] keeps its reader slot.
+const MAX_PDF_INFLATED_BYTES: usize = 256 * 1024 * 1024;
+/// Total bytes of font maps (`/ToUnicode`, embedded `/Encoding` CMaps) one PDF
+/// may resolve. Resolved maps stay in memory for the whole read, so they get
+/// a budget of their own, far below [`MAX_PDF_INFLATED_BYTES`]. Real fonts
+/// need kilobytes; a font past the budget contributes no text.
+const MAX_PDF_FONT_MAP_BYTES: usize = 16 * 1024 * 1024;
 /// Raw text read from one PDF before its remaining pages are skipped. Above
 /// [`MAX_PDF_TEXT_BYTES`] so tidying has whitespace to collapse before the cut.
 const MAX_PDF_RAW_TEXT_BYTES: usize = 4 * MAX_PDF_TEXT_BYTES;
@@ -355,12 +365,18 @@ fn read_pdf_text(bytes: &[u8]) -> Result<String, String> {
     if document.is_encrypted() {
         return Err("it is encrypted and needs a password to open".to_string());
     }
+    read_document_text(&document, MAX_PDF_INFLATED_BYTES)
+}
+
+/// [`read_pdf_text`] for a loaded document, with `inflate_budget` bytes of
+/// decompression to spend on it.
+fn read_document_text(document: &lopdf::Document, inflate_budget: usize) -> Result<String, String> {
     let pages = document.get_pages();
-    let mut reader = PdfTextReader::new(&document);
+    let mut reader = PdfTextReader::new(document, inflate_budget);
     let mut first_error = None;
     let mut pages_read = 0usize;
     for (&number, &page_id) in &pages {
-        if reader.text.len() > MAX_PDF_RAW_TEXT_BYTES {
+        if reader.text.len() > MAX_PDF_RAW_TEXT_BYTES || reader.inflate_budget == 0 {
             reader.text.push_str(&format!(
                 "[Text cut here: pages {number} to {} were not read.]\n",
                 pages.len()
@@ -392,17 +408,51 @@ struct PdfTextReader<'a> {
     /// Device-space origin of the last text shown, and the distance either
     /// way from it that still counts as the same line.
     last_shown: Option<(f32, f32, f32)>,
+    /// Bytes still allowed to be inflated; see [`MAX_PDF_INFLATED_BYTES`].
+    inflate_budget: usize,
+    /// Font-map bytes still allowed; see [`MAX_PDF_FONT_MAP_BYTES`].
+    font_map_budget: usize,
+    /// Encodings of the fonts resolved so far, by the font dictionary's
+    /// address. `None` for a font that could not be resolved.
+    fonts: std::collections::HashMap<usize, Option<std::rc::Rc<lopdf::Encoding<'a>>>>,
 }
 
 impl<'a> PdfTextReader<'a> {
-    fn new(document: &'a lopdf::Document) -> Self {
+    fn new(document: &'a lopdf::Document, inflate_budget: usize) -> Self {
         Self {
             document,
             text: String::new(),
             forms_read: 0,
             forms_open: Vec::new(),
             last_shown: None,
+            inflate_budget,
+            font_map_budget: MAX_PDF_FONT_MAP_BYTES,
+            fonts: std::collections::HashMap::new(),
         }
+    }
+
+    /// The most the next stream may inflate to: the per-stream limit, or what
+    /// is left of the document's budget.
+    fn inflate_limit(&self) -> usize {
+        self.inflate_budget.min(MAX_PDF_STREAM_BYTES)
+    }
+
+    /// Run `inflate` with the current limit and charge what it produced. A
+    /// decompression that fails is charged the whole limit, the most work it
+    /// can have done before failing.
+    fn inflate(
+        &mut self,
+        inflate: impl FnOnce(usize) -> Result<Vec<u8>, lopdf::Error>,
+    ) -> Result<Vec<u8>, lopdf::Error> {
+        let limit = self.inflate_limit();
+        let result = inflate(limit);
+        let spent = match &result {
+            Ok(bytes) => bytes.len(),
+            Err(lopdf::Error::Decompress(_)) => limit,
+            Err(_) => 0,
+        };
+        self.inflate_budget = self.inflate_budget.saturating_sub(spent);
+        result
     }
 
     fn read_page(&mut self, page_id: lopdf::ObjectId) -> Result<(), lopdf::Error> {
@@ -413,44 +463,61 @@ impl<'a> PdfTextReader<'a> {
                 .iter()
                 .filter_map(|id| self.document.get_dictionary(*id).ok()),
         );
-        let content = self
-            .document
-            .get_page_content_with_limit(page_id, MAX_PDF_STREAM_BYTES)?;
+        let document = self.document;
+        let content = self.inflate(|limit| document.get_page_content_with_limit(page_id, limit))?;
         self.last_shown = None;
         self.read_content(&resources, &content, PDF_IDENTITY, 0)
     }
 
-    /// Font encodings by resource name. The first scope naming a font wins,
-    /// as in lopdf's own page font lookup.
-    fn encodings(
-        &self,
+    /// The encoding of the font `name`, from the first resource scope that
+    /// names it. Resolved once per font dictionary and charged to both
+    /// budgets; `None` when the font cannot be resolved within them.
+    fn font_encoding(
+        &mut self,
         resources: &[&'a lopdf::Dictionary],
-    ) -> std::collections::BTreeMap<Vec<u8>, lopdf::Encoding<'a>> {
+        name: &[u8],
+    ) -> Option<std::rc::Rc<lopdf::Encoding<'a>>> {
         let document = self.document;
-        let mut encodings = std::collections::BTreeMap::new();
-        for scope in resources {
-            let Ok(fonts) = scope
+        let font = resources.iter().find_map(|scope| {
+            let font = scope
                 .get_deref(b"Font", document)
                 .and_then(lopdf::Object::as_dict)
-            else {
-                continue;
-            };
-            for (name, font) in fonts.iter() {
-                if encodings.contains_key(name) {
-                    continue;
-                }
-                let encoding = document
-                    .dereference(font)
-                    .and_then(|(_, font)| font.as_dict())
-                    .and_then(|font| {
-                        font.get_font_encoding_with_limit(document, MAX_PDF_STREAM_BYTES)
-                    });
-                if let Ok(encoding) = encoding {
-                    encodings.insert(name.clone(), encoding);
-                }
+                .and_then(|fonts| fonts.get(name))
+                .ok()?;
+            document
+                .dereference(font)
+                .and_then(|(_, font)| font.as_dict())
+                .ok()
+        })?;
+        // Font dictionaries live in `document`, which outlives the reader, so
+        // an address names one whether it is an object of its own or inline.
+        let key = std::ptr::from_ref(font) as usize;
+        if let Some(encoding) = self.fonts.get(&key) {
+            return encoding.clone();
+        }
+        // lopdf does not say how much it inflated to build the map, so the
+        // streams it reads are measured here first: each costs the budget
+        // twice, once for this measure and once for lopdf's own read.
+        let limit = self.inflate_limit().min(self.font_map_budget);
+        let mut spent = 0usize;
+        for entry in [b"ToUnicode".as_slice(), b"Encoding"] {
+            if let Ok(map) = font
+                .get_deref(entry, document)
+                .and_then(lopdf::Object::as_stream)
+            {
+                spent += map
+                    .decompressed_content_with_limit(limit)
+                    .map_or(limit, |bytes| bytes.len());
             }
         }
-        encodings
+        self.inflate_budget = self.inflate_budget.saturating_sub(2 * spent);
+        self.font_map_budget = self.font_map_budget.saturating_sub(spent);
+        let encoding = font
+            .get_font_encoding_with_limit(document, limit)
+            .ok()
+            .map(std::rc::Rc::new);
+        self.fonts.insert(key, encoding.clone());
+        encoding
     }
 
     /// The form XObject `name` refers to, if it is one.
@@ -487,15 +554,16 @@ impl<'a> PdfTextReader<'a> {
         ctm: PdfMatrix,
         depth: usize,
     ) -> Result<(), lopdf::Error> {
-        let content = lopdf::content::Content::decode(content)?;
-        let encodings = self.encodings(resources);
         let mut ctm = ctm;
         let mut saved: Vec<PdfMatrix> = Vec::new();
         let mut line = PDF_IDENTITY;
         let mut leading = 0.0f32;
         let mut font_size = 0.0f32;
         let mut encoding = None;
-        for operation in &content.operations {
+        // Operations are decoded one at a time: a content stream of many tiny
+        // operations would take several times its own size as one list.
+        for operation in lopdf::content::Content::decode_iter(content) {
+            let operation = operation?;
             if self.text.len() > MAX_PDF_RAW_TEXT_BYTES {
                 break;
             }
@@ -523,7 +591,7 @@ impl<'a> PdfTextReader<'a> {
                     encoding = operands
                         .first()
                         .and_then(|name| name.as_name().ok())
-                        .and_then(|name| encodings.get(name));
+                        .and_then(|name| self.font_encoding(resources, name));
                     font_size = pdf_number(operands.get(1));
                 }
                 "Tj" | "'" | "\"" | "TJ" => {
@@ -539,12 +607,15 @@ impl<'a> PdfTextReader<'a> {
                             .unwrap_or_default(),
                         _ => operands.get(..1).unwrap_or_default(),
                     };
-                    if let Some(encoding) = encoding {
+                    if let Some(encoding) = &encoding {
                         self.place(&pdf_multiply(&line, &ctm), font_size);
                         self.show(encoding, shown);
                     }
                 }
-                "Do" if depth < MAX_PDF_FORM_DEPTH && self.forms_read < MAX_PDF_FORMS => {
+                "Do" if depth < MAX_PDF_FORM_DEPTH
+                    && self.forms_read < MAX_PDF_FORMS
+                    && self.inflate_budget > 0 =>
+                {
                     let Some((id, form)) = operands
                         .first()
                         .and_then(|name| name.as_name().ok())
@@ -557,7 +628,7 @@ impl<'a> PdfTextReader<'a> {
                     }
                     self.forms_read += 1;
                     let Ok(form_content) =
-                        form.decompressed_content_with_limit(MAX_PDF_STREAM_BYTES)
+                        self.inflate(|limit| form.decompressed_content_with_limit(limit))
                     else {
                         continue;
                     };
@@ -1209,6 +1280,7 @@ impl AssistantAttachmentService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lopdf::dictionary;
     use sea_orm::{DatabaseBackend, MockDatabase};
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-image";
@@ -1496,6 +1568,116 @@ mod tests {
             pdf_with_page_streams(&[stream_object("/Filter /FlateDecode", &bomb)], [b"", b""]);
         let error = extract_pdf_text("bomb.pdf", pdf).await.unwrap_err();
         assert!(error.contains("bomb.pdf"), "{error}");
+    }
+
+    /// A document of `page_count` pages that all draw the one content stream
+    /// `content` and share one resource dictionary, built by `resources`.
+    fn document_sharing_one_content_stream(
+        page_count: usize,
+        content: &[u8],
+        resources: impl FnOnce(&mut lopdf::Document) -> lopdf::Dictionary,
+    ) -> lopdf::Document {
+        use lopdf::{Object, Stream};
+        let mut document = lopdf::Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let resources = resources(&mut document);
+        let resources_id = document.add_object(resources);
+        let content_id = document.add_object(Stream::new(dictionary! {}, content.to_vec()));
+        let kids: Vec<Object> = (0..page_count)
+            .map(|_| {
+                document
+                    .add_object(dictionary! {
+                        "Type" => "Page",
+                        "Parent" => pages_id,
+                        "Contents" => content_id,
+                        "Resources" => resources_id,
+                    })
+                    .into()
+            })
+            .collect();
+        document.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => page_count as i64,
+            }),
+        );
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        document
+    }
+
+    fn helvetica() -> lopdf::Dictionary {
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        }
+    }
+
+    #[test]
+    fn pages_sharing_one_content_stream_spend_one_budget() {
+        let content = b"BT /F1 12 Tf 72 720 Td (Shared) Tj ET";
+        let document = document_sharing_one_content_stream(10, content, |document| {
+            let font = document.add_object(helvetica());
+            dictionary! { "Font" => dictionary! { "F1" => font } }
+        });
+        // lopdf ends each page's content with a newline.
+        let per_page = content.len() + 1;
+        let text = read_document_text(&document, 3 * per_page).unwrap();
+        assert_eq!(text.matches("Shared").count(), 3, "{text:?}");
+        assert!(text.contains("pages 4 to 10 were not read"), "{text:?}");
+    }
+
+    #[test]
+    fn a_form_drawn_over_and_over_stops_at_the_budget() {
+        let form_size = 1_000;
+        let page = b"/Fm0 Do ".repeat(MAX_PDF_FORMS);
+        let document = document_sharing_one_content_stream(1, &page, |document| {
+            let form = document.add_object(lopdf::Stream::new(
+                dictionary! { "Type" => "XObject", "Subtype" => "Form" },
+                vec![b' '; form_size],
+            ));
+            dictionary! { "XObject" => dictionary! { "Fm0" => form } }
+        });
+        let page_id = document.get_pages()[&1];
+        let mut reader = PdfTextReader::new(&document, page.len() + 1 + 5 * form_size);
+        reader.read_page(page_id).unwrap();
+        assert_eq!(reader.forms_read, 5);
+        assert_eq!(reader.inflate_budget, 0);
+    }
+
+    #[test]
+    fn fonts_sharing_one_font_map_spend_the_budget() {
+        let map_size = 1_000;
+        let content: String = (0..10)
+            .map(|i| format!("BT /F{i} 12 Tf (x) Tj ET "))
+            .collect();
+        let document = document_sharing_one_content_stream(1, content.as_bytes(), |document| {
+            let map = document.add_object(lopdf::Stream::new(dictionary! {}, vec![b' '; map_size]));
+            let mut fonts = lopdf::Dictionary::new();
+            for i in 0..10 {
+                let mut font = helvetica();
+                font.set("ToUnicode", map);
+                fonts.set(format!("F{i}"), document.add_object(font));
+            }
+            dictionary! { "Font" => fonts }
+        });
+        let page_id = document.get_pages()[&1];
+        // Each font's map is read twice: measured, then parsed by lopdf.
+        let budget = content.len() + 1 + 3 * 2 * map_size;
+        let mut reader = PdfTextReader::new(&document, budget);
+        reader.read_page(page_id).unwrap();
+        assert_eq!(reader.fonts.len(), 10);
+        assert_eq!(
+            reader.fonts.values().filter(|font| font.is_some()).count(),
+            3
+        );
+        assert_eq!(reader.inflate_budget, 0);
     }
 
     #[test]
