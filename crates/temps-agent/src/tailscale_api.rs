@@ -313,15 +313,15 @@ fn port_key() -> String {
     SERVE_HTTPS_PORT.to_string()
 }
 
-/// Where the entry lives in the config: the machine's own maps, or its
-/// Service's.
-fn maps<'a>(
-    config: &'a ServeConfig,
-    service: Option<&str>,
-) -> Option<(
+/// One owner's port handlers and web handlers in a Serve config.
+type ServeMaps<'a> = (
     &'a BTreeMap<String, TcpPortHandler>,
     &'a BTreeMap<String, WebServerConfig>,
-)> {
+);
+
+/// Where the entry lives in the config: the machine's own maps, or its
+/// Service's.
+fn maps<'a>(config: &'a ServeConfig, service: Option<&str>) -> Option<ServeMaps<'a>> {
     match service {
         None => Some((&config.tcp, &config.web)),
         Some(name) => config.services.get(name).map(|s| (&s.tcp, &s.web)),

@@ -5413,6 +5413,8 @@ mod tests {
                             private_range: None,
                             private_node_id: None,
                             private_listener: None,
+                            private_via: None,
+                            private_service: None,
                         }]])
                         .append_query_results([vec![environment.clone()]])
                         .append_query_results([vec![deployment.clone()]])
