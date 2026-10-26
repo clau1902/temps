@@ -33,10 +33,11 @@ pub struct Model {
     /// D7), `[{address_id, hostname, outcome, message, ...}]`.
     #[serde(default)]
     pub private_checks: Option<Json>,
-    /// What the agent reports it enforces, e.g. `["gate.v1"]` (ADR 065).
-    /// Signed-in routes go only to agents that report `gate.v1`.
+    /// The worker's Tailscale facts as it last reported them (ADR 065 D2):
+    /// version, backend state, tags, MagicDNS and HTTPS, machine name, who
+    /// holds its port 443 in Serve, consent and root, and its Serve checks.
     #[serde(default)]
-    pub capabilities: Option<Json>,
+    pub tailscale: Option<Json>,
     pub checked_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

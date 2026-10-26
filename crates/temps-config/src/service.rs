@@ -6670,6 +6670,8 @@ mod tests {
                 gate_access_provider_id: None,
                 gate_access_app_id: None,
                 gate_access_aud: None,
+                private_via: None,
+                private_service: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6697,6 +6699,8 @@ mod tests {
                 gate_access_provider_id: None,
                 gate_access_app_id: None,
                 gate_access_aud: None,
+                private_via: None,
+                private_service: None,
             }]])
             .into_connection();
         let svc = ConfigService::new(test_config(), Arc::new(db));
@@ -6737,6 +6741,8 @@ mod tests {
                     gate_access_provider_id: None,
                     gate_access_app_id: None,
                     gate_access_aud: None,
+                    private_via: None,
+                    private_service: None,
                 }]])
                 .into_connection(),
         );

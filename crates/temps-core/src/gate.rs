@@ -59,11 +59,9 @@ pub const AUTHORIZE_PATH: &str = "/_temps/gate/authorize";
 /// does not declare it never receives a signed-in route.
 pub const GATE_CAPABILITY: &str = "gate.v1";
 /// The header an agent names its capabilities in on every request it makes
-/// to the control plane, comma-separated (the same header ADR 065 D6's
-/// `tailnet_identity.v1` travels in). What a snapshot may carry is decided
-/// from this request alone, never from an earlier report: a worker rolled
-/// back to an older binary stops sending it on its next request.
-pub const AGENT_CAPABILITIES_HEADER: &str = "x-temps-agent-capabilities";
+/// to the control plane, comma-separated; shared with ADR 065 D6's
+/// `tailnet_identity.v1`.
+pub use crate::tailnet::AGENT_CAPABILITIES_HEADER;
 
 /// Whether any of a request's [`AGENT_CAPABILITIES_HEADER`] values names
 /// `capability` exactly. Every value is read, so one header per capability

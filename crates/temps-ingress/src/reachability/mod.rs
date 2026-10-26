@@ -22,7 +22,9 @@ pub mod gate_handlers;
 pub mod handlers;
 pub mod model;
 pub mod plan;
+pub mod principals;
 pub mod run;
+pub mod serve_entries;
 pub mod service;
 pub mod token_check;
 

@@ -62,6 +62,14 @@ pub struct Model {
     /// against.
     #[serde(default)]
     pub gate_access_aud: Option<String>,
+    /// How a `private` address is served (ADR 065 D1): `listener`,
+    /// `tailscale_serve` or `tailscale_service` ([`crate::audience::via`]).
+    /// Set exactly when the audience is private; a check enforces it.
+    #[serde(default)]
+    pub private_via: Option<String>,
+    /// For `tailscale_service`: the Service's `svc:` name.
+    #[serde(default)]
+    pub private_service: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

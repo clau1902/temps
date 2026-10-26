@@ -663,12 +663,40 @@ async fn decide_reachability_conflict(
                 .await?;
         }
     }
+    // ADR 065 D4: deleting a Tailscale Service is confirmed with step-up,
+    // and journaled with the definition the user was shown.
+    let shown = state
+        .service
+        .service_to_delete(project_id, environment_id, run_id, &request)
+        .await?;
+    if let Some((tailnet, name, _)) = &shown {
+        require_sensitive_action(
+            state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::DeleteTailscaleService {
+                tailnet: tailnet.clone(),
+                name: name.clone(),
+            },
+        )
+        .await?;
+    }
     let key = request.key.clone();
     let decision = request.decision;
     let run = state
         .service
         .decide(project_id, environment_id, run_id, request)
         .await?;
+    if let Some((tailnet, name, definition)) = shown {
+        audit(
+            &state,
+            "TAILSCALE_SERVICE_DELETE_CONFIRMED",
+            &auth,
+            &metadata,
+            &run,
+            serde_json::json!({ "tailnet": tailnet, "service": name, "shown": definition }),
+        )
+        .await;
+    }
     audit(
         &state,
         "REACHABILITY_CONFLICT_DECIDED",
@@ -687,7 +715,14 @@ fn audience_action(
     change: Option<(String, AddressAudience, AddressAudience)>,
 ) -> Option<SensitiveAction> {
     let (hostname, before, after) = change?;
-    (before.who() != after.who()).then(|| SensitiveAction::ChangeAddressAudience {
+    if before.who() == after.who() {
+        return None;
+    }
+    // ADR 065 D6: editing who a `tailnet_users` address admits.
+    if before.audience == Audience::TailnetUsers && after.audience == Audience::TailnetUsers {
+        return Some(SensitiveAction::ChangeTailnetPrincipals { hostname });
+    }
+    Some(SensitiveAction::ChangeAddressAudience {
         hostname,
         from: before.who_label(),
         to: after.who_label(),
@@ -704,6 +739,8 @@ fn undo_audience_action(pending: &[RunResource]) -> Option<SensitiveAction> {
             before,
             after,
         } if before.who() != after.who()
+            && !(before.audience == Audience::TailnetUsers
+                && after.audience == Audience::TailnetUsers)
             && !pending.iter().any(
                 |r| matches!(r, RunResource::CustomDomain { domain, .. } if domain == hostname),
             ) =>
@@ -712,6 +749,19 @@ fn undo_audience_action(pending: &[RunResource]) -> Option<SensitiveAction> {
                 hostname: hostname.clone(),
                 from: after.who_label(),
                 to: before.who_label(),
+            })
+        }
+        // ADR 065 D6: undo puts an earlier list back.
+        RunResource::AddressAudience {
+            hostname,
+            before,
+            after,
+        } if before.audience == Audience::TailnetUsers
+            && after.audience == Audience::TailnetUsers
+            && before.who() != after.who() =>
+        {
+            Some(SensitiveAction::ChangeTailnetPrincipals {
+                hostname: hostname.clone(),
             })
         }
         _ => None,
@@ -731,9 +781,11 @@ fn undo_permissions(pending: &[RunResource]) -> Vec<Permission> {
             RunResource::Connector { .. } | RunResource::HostnameChoice { .. } => {
                 Permission::SettingsWrite
             }
-            RunResource::CustomDomain { .. } | RunResource::AddressAudience { .. } => {
-                Permission::ProjectsWrite
-            }
+            RunResource::CustomDomain { .. }
+            | RunResource::AddressAudience { .. }
+            | RunResource::TailscaleServe { .. }
+            | RunResource::TailscaleService { .. } => Permission::ProjectsWrite,
+            RunResource::TailscaleCredential { .. } => Permission::SettingsWrite,
             RunResource::Certificate { .. } => Permission::DomainsDelete,
             RunResource::AccessApp { .. } => Permission::DnsProvidersWrite,
         };
@@ -864,5 +916,79 @@ mod tests {
             domain: "app.example.com".into(),
         };
         assert!(undo_audience_action(&[attached, gate]).is_none());
+    }
+    use temps_core::tailnet::TailnetPrincipal;
+
+    fn users(values: &[&str]) -> AddressAudience {
+        AddressAudience {
+            audience: Audience::TailnetUsers,
+            private_via: Some("tailscale_serve".into()),
+            principals: values
+                .iter()
+                .map(|v| TailnetPrincipal::parse(v).unwrap())
+                .collect(),
+            ..AddressAudience::default()
+        }
+    }
+
+    #[test]
+    fn editing_who_a_tailnet_users_address_admits_needs_step_up() {
+        let host = "homelab.example.ts.net".to_string();
+        let before = users(&["alice@example.com"]);
+        let wider = users(&["alice@example.com", "bob@example.com"]);
+        assert_eq!(
+            audience_action(Some((host.clone(), before.clone(), wider.clone()))),
+            Some(SensitiveAction::ChangeTailnetPrincipals {
+                hostname: host.clone()
+            })
+        );
+        // The same list again changes nothing.
+        assert_eq!(
+            audience_action(Some((host.clone(), before.clone(), before.clone()))),
+            None
+        );
+        // The same people in another order is no change either.
+        assert_eq!(
+            audience_action(Some((
+                host.clone(),
+                users(&["bob@example.com", "alice@example.com"]),
+                wider.clone()
+            ))),
+            None
+        );
+        // Another audience is the audience change it always was.
+        assert!(matches!(
+            audience_action(Some((
+                host,
+                before,
+                AddressAudience {
+                    audience: Audience::Private,
+                    ..AddressAudience::default()
+                }
+            ))),
+            Some(SensitiveAction::ChangeAddressAudience { ref from, ref to, .. })
+                if from == "tailnet_users" && to == "private"
+        ));
+    }
+
+    #[test]
+    fn undo_putting_an_earlier_list_back_needs_step_up() {
+        let pending = vec![RunResource::AddressAudience {
+            hostname: "homelab.example.ts.net".into(),
+            before: users(&["alice@example.com", "bob@example.com"]),
+            after: users(&["alice@example.com"]),
+        }];
+        assert_eq!(
+            undo_audience_action(&pending),
+            Some(SensitiveAction::ChangeTailnetPrincipals {
+                hostname: "homelab.example.ts.net".into()
+            })
+        );
+        let unchanged = vec![RunResource::AddressAudience {
+            hostname: "homelab.example.ts.net".into(),
+            before: users(&["alice@example.com"]),
+            after: users(&["alice@example.com"]),
+        }];
+        assert_eq!(undo_audience_action(&unchanged), None);
     }
 }

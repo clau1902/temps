@@ -3425,6 +3425,8 @@ mod apply_resume_and_progress_tests {
             gate_access_provider_id: None,
             gate_access_app_id: None,
             gate_access_aud: None,
+            private_via: None,
+            private_service: None,
         };
         let request = request();
         assert!(DomainDeliveryService::route_unchanged(&route, 1, &request));

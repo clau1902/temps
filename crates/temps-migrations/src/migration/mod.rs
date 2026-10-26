@@ -379,6 +379,8 @@ mod m20261023_000001_add_overlay_network_name;
 mod m20261023_000002_add_serves_own_temps_api_to_projects;
 mod m20261024_000001_reachability;
 mod m20261025_000001_private_audience;
+mod m20261026_000001_tailnet_serve;
+mod m20261026_000002_tailnet_principals;
 mod m20261027_000001_signed_in_gate;
 mod m20261027_000002_cloudflare_access;
 
@@ -849,6 +851,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20261024_000001_reachability::Migration),
             // ADR 064 D5: the range, worker and listener that bound a private address.
             Box::new(m20261025_000001_private_audience::Migration),
+            // ADR 065 D1/D4: Tailscale ways in, and the Serve entries workers apply.
+            Box::new(m20261026_000001_tailnet_serve::Migration),
+            // ADR 065 D6: `tailnet_users` and who it admits.
+            Box::new(m20261026_000002_tailnet_principals::Migration),
             // ADR 065 D7/D8: the Temps gate for signed-in addresses.
             Box::new(m20261027_000001_signed_in_gate::Migration),
             Box::new(m20261027_000002_cloudflare_access::Migration),

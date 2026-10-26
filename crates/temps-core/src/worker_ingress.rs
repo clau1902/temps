@@ -200,6 +200,11 @@ pub struct LocalIngress {
     pub http_port: u16,
     #[serde(default = "default_https_port")]
     pub https_port: u16,
+    /// The worker owner allows the agent to drive tailscaled (ADR 065 D2):
+    /// Serve entries for tailnet names, `AdvertiseServices`, status and
+    /// whois. Without it the agent never opens tailscaled's socket.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tailscale_serve: bool,
 }
 
 fn default_http_port() -> u16 {
@@ -218,6 +223,7 @@ impl Default for LocalIngress {
             interface: None,
             http_port: 80,
             https_port: 443,
+            tailscale_serve: false,
         }
     }
 }
@@ -252,9 +258,14 @@ pub struct ListenerReport {
     /// it serves (ADR 064 D7).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub private_checks: Vec<PrivateCheck>,
-    /// What this agent enforces, e.g. `gate.v1` (ADR 065 D7). Routes that
-    /// need a capability go only to agents that report it; an agent that
-    /// predates the field reports none.
+    /// What the agent found about tailscaled and did with its Serve entries
+    /// (ADR 065 D2, D4). `None` from agents that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tailscale: Option<crate::tailnet::TailscaleReport>,
+    /// What this agent enforces, e.g. `gate.v1` (ADR 065 D7) or
+    /// `tailnet_identity.v1` (D6). Informational: what a snapshot may carry
+    /// is decided from what each request declares, never from this report.
+    /// An agent that predates the field reports none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<String>,
 }

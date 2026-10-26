@@ -183,6 +183,9 @@ async fn run(
         Vec<crate::route_store::PrivateRouteEntry>,
         tokio::time::Instant,
     )> = None;
+    // ADR 065: tailscaled, driven only with `--tailscale-serve`.
+    let mut tailscale = crate::tailscale_serve::ServeManager::new(store.clone());
+    let node_name = host_name();
 
     loop {
         if !config.pinned {
@@ -257,6 +260,7 @@ async fn run(
                                 node_id: config.node_id,
                                 node_token: config.node_token.clone(),
                                 private,
+                                tailnet: Some(tailscale.identity()),
                             };
                             match public_ingress::spawn(ingress, store.clone(), shutdown.clone())
                                 .await
@@ -314,6 +318,28 @@ async fn run(
             }
         }
 
+        // ADR 065 D11: a worker that never opted in and serves nothing
+        // through tailscaled reports nothing about it, and its agent never
+        // opens tailscaled's socket.
+        let tailscale_report = if local.tailscale_serve || !store.serve_entries().is_empty() {
+            Some(
+                tailscale
+                    .pass(&crate::tailscale_serve::PassInput {
+                        consent: local.tailscale_serve,
+                        node: node_name.clone(),
+                        private_listener: bound
+                            .as_ref()
+                            .filter(|b| b.private && b.handle.is_ready())
+                            .map(|b| b.https),
+                    })
+                    .await,
+            )
+        } else {
+            // D11: without consent tailscaled is never asked who anyone is.
+            tailscale.identity().set_api(None);
+            None
+        };
+
         let report = ListenerReport {
             interfaces: host_interfaces(),
             http: bound.as_ref().map(|b| b.http.to_string()),
@@ -321,9 +347,15 @@ async fn run(
             mode: Some(local.mode),
             error: error.clone(),
             private_checks: private_checks.clone(),
-            // This agent enforces the signed-in gate on every listener it
-            // runs; without it the control plane holds signed-in routes back.
-            capabilities: vec![crate::gate::GATE_CAPABILITY.to_string()],
+            tailscale: tailscale_report,
+            // What this agent enforces: the signed-in gate on every listener
+            // (ADR 065 D7) and who a tailnet visitor is (D6). Informational
+            // for the console; snapshots trust only what each request
+            // declares.
+            capabilities: crate::route_sync_client::DECLARED_CAPABILITIES
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
         };
         if last_reported.as_ref() != Some(&report) || last_report_at.elapsed() >= REPORT_INTERVAL {
             match send_report(&client, &base, &config, &report).await {
@@ -355,6 +387,13 @@ fn resolve(
 ) -> Result<Option<(SocketAddr, SocketAddr)>, String> {
     let (address, http_port, https_port) = match local.mode {
         IngressMode::Off => return Ok(None),
+        // `--tailscale-serve` alone (ADR 065 D2): served only through
+        // Tailscale Serve, no listener of its own.
+        IngressMode::Private
+            if local.tailscale_serve && local.listen.is_none() && local.interface.is_none() =>
+        {
+            return Ok(None)
+        }
         IngressMode::Private => {
             let ip = private_listen_address(local, &own_addresses())?;
             return Ok(Some((
@@ -520,6 +559,19 @@ fn explain_bind_error(error: &str, http: SocketAddr, https: SocketAddr) -> Strin
         format!("the agent may not bind ports {} and {}: ports below 1024 need root or CAP_NET_BIND_SERVICE. Run the agent service as root, or choose ports above 1024 and forward 80 and 443 to them.", http.port(), https.port())
     } else {
         error.to_string()
+    }
+}
+
+/// This machine's host name, for the worker's own messages.
+fn host_name() -> String {
+    let mut buffer = [0u8; 256];
+    // SAFETY: the buffer is valid for its length; gethostname writes at most
+    // that many bytes.
+    let result = unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) };
+    let end = buffer.iter().position(|b| *b == 0).unwrap_or(buffer.len());
+    match (result, std::str::from_utf8(&buffer[..end])) {
+        (0, Ok(name)) if !name.is_empty() => name.split('.').next().unwrap_or(name).to_string(),
+        _ => "this worker".to_string(),
     }
 }
 
@@ -698,6 +750,7 @@ mod tests {
                 address_id: format!("a{i}"),
                 range: "100.64.0.0/10".into(),
                 listener: "not-an-address".into(),
+                principals: None,
             })
             .collect();
         let checks = check_private_routes(&routes).await;
@@ -780,6 +833,22 @@ mod tests {
     }
 
     #[test]
+    fn tailscale_serve_alone_binds_no_listener() {
+        let serve_only = LocalIngress {
+            mode: IngressMode::Private,
+            tailscale_serve: true,
+            ..LocalIngress::default()
+        };
+        assert_eq!(resolve(&serve_only, None), Ok(None));
+        // Without consent a private worker still needs an address.
+        let neither = LocalIngress {
+            mode: IngressMode::Private,
+            ..LocalIngress::default()
+        };
+        assert!(resolve(&neither, None).is_err());
+    }
+
+    #[test]
     fn fixed_mode_keeps_the_workers_own_choice() {
         let local = LocalIngress {
             mode: IngressMode::Fixed,
@@ -787,6 +856,7 @@ mod tests {
             interface: None,
             http_port: 80,
             https_port: 443,
+            tailscale_serve: false,
         };
         let (http, _) = resolve(&local, None).unwrap().unwrap();
         assert!(http.ip().is_unspecified());

@@ -4517,6 +4517,8 @@ mod tests {
                 gate_access_provider_id: None,
                 gate_access_app_id: None,
                 gate_access_aud: None,
+                private_via: None,
+                private_service: None,
             }]]);
         let svc = ingress_config_service(db);
         let problem = validate_public_ingress_url(

@@ -1623,6 +1623,8 @@ mod tests {
             gate_access_provider_id: None,
             gate_access_app_id: None,
             gate_access_aud: None,
+            private_via: None,
+            private_service: None,
         };
         let response = CustomDomainLookupResponse::from(Some(CustomDomainWithInfo {
             custom_domain: model,

@@ -151,8 +151,8 @@ impl GateChannel {
             // The control plane serves gate requests only to a binary that
             // declares the gate on the request itself (ADR 065 D7).
             .header(
-                temps_core::gate::AGENT_CAPABILITIES_HEADER,
-                temps_core::gate::GATE_CAPABILITY,
+                temps_core::tailnet::AGENT_CAPABILITIES_HEADER,
+                crate::route_sync_client::declared_capabilities(),
             )
             .json(body)
             .send()

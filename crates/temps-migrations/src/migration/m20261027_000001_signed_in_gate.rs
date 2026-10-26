@@ -17,8 +17,6 @@
 //!   the console session or the user must not delete the row.
 //! - `gate_codes`: single-use sign-in codes, 60 seconds, by hash. Redeeming
 //!   deletes the row, so a code is consumed whether or not it then checks out.
-//! - `capabilities` on `node_public_ingress`: what the agent reports it
-//!   enforces (`gate.v1`). Signed-in routes go only to agents that report it.
 //! - `gate_revocation_notify`: revocation reaches listeners with the next
 //!   route snapshot (D8), and the snapshot is rebuilt on `route_table_changes`.
 //!   A console sign-out, a removal from a team or a project's teams, an admin
@@ -75,9 +73,6 @@ CREATE TABLE IF NOT EXISTS gate_codes (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS gate_codes_expires_at ON gate_codes (expires_at);
-
-ALTER TABLE node_public_ingress
-    ADD COLUMN IF NOT EXISTS capabilities JSONB;
 
 CREATE OR REPLACE FUNCTION gate_revocation_notify() RETURNS trigger AS $$
 DECLARE
@@ -157,7 +152,6 @@ BEGIN
     END IF;
 END $$;
 DROP FUNCTION IF EXISTS gate_revocation_notify();
-ALTER TABLE node_public_ingress DROP COLUMN IF EXISTS capabilities;
 DROP TABLE IF EXISTS gate_codes;
 DROP TABLE IF EXISTS gate_sessions;
 DROP TABLE IF EXISTS gate_keys;
