@@ -9058,28 +9058,39 @@ export type DatabaseChoice = {
  */
 export type DatabaseMetricsResponse = {
     /**
-     * One entry per database, sorted by the first metric descending
-     * (largest first) so the biggest database leads the table.
+     * One entry per database, largest first by the engine's
+     * `*.database_size_bytes` metric (ties broken by name) so the biggest
+     * database leads the table. Empty when the service's engine has no
+     * per-database series (for example Redis or S3) or nothing has been
+     * scraped yet. The MariaDB collector labels at most the 100 largest
+     * schemas per scrape; the response covers the latest lookback window, so
+     * during schema churn it can briefly include schemas from an earlier
+     * scrape as well.
      */
     databases: Array<DatabaseMetricsRow>;
 };
 
 /**
- * Per-database metric values for a Postgres service.
+ * Per-database metric values for a Postgres or MariaDB service.
  *
- * A Postgres instance can host many databases (some unrelated to this
- * service). The collector records per-`datname` series; this groups the
- * latest value of each requested metric by database so the UI can render a
- * "Databases" breakdown table instead of one collapsed number.
+ * A Postgres or MariaDB instance can host many databases (some unrelated to
+ * this service). The collector records one series per database — labelled
+ * `datname` for Postgres, `schema` for MariaDB; this groups the latest value
+ * of each of the engine's per-database metrics by database so the UI can
+ * render a "Databases" breakdown table instead of one collapsed number.
  */
 export type DatabaseMetricsRow = {
     /**
-     * Database name (`datname`).
+     * Database name: the `datname` of a Postgres database, or the schema
+     * name of a MariaDB database.
      */
     database: string;
     /**
-     * Latest value of each requested metric for this database
-     * (e.g. `{"pg.database_size_bytes": 7943871, "pg.cache_hit_ratio": 0.99}`).
+     * Latest value of each of the engine's per-database metrics for this
+     * database, keyed by metric name (e.g. `{"pg.database_size_bytes":
+     * 7943871, "pg.cache_hit_ratio": 0.99}` for Postgres, or
+     * `{"mariadb.database_size_bytes": 1589248, "mariadb.tables": 3}` for
+     * MariaDB). A metric that has not been reported is absent.
      */
     metrics: {
         [key: string]: number;
@@ -49978,6 +49989,10 @@ export type ExternalServiceMetricsByDatabaseErrors = {
      */
     401: unknown;
     /**
+     * External service not found
+     */
+    404: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -49989,7 +50004,7 @@ export type ExternalServiceMetricsByDatabaseErrors = {
 
 export type ExternalServiceMetricsByDatabaseResponses = {
     /**
-     * Per-database metric breakdown
+     * Per-database metric breakdown; empty for engines without per-database series
      */
     200: DatabaseMetricsResponse;
 };
