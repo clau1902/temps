@@ -1962,6 +1962,12 @@ pub struct ConsoleApiParams {
     pub ready_signal: Option<tokio::sync::oneshot::Sender<()>>,
     pub additional_templates: Vec<std::path::PathBuf>,
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
+    /// The process's activator (ADR-055 phase 10), shared with the
+    /// on-demand manager that registers environments with it.
+    pub activator: Arc<temps_workload_activator::Activator>,
+    /// Extra control-plane runtime drivers for the workload plane. Empty
+    /// today.
+    pub local_drivers: Arc<temps_workload_plane::LocalDrivers>,
     /// Additional plugins registered by an external entrypoint (e.g. the
     /// EE binary). Registered immediately before `initialize_plugins`, so
     /// they observe every OSS service in the registry and can wrap or
@@ -2017,6 +2023,10 @@ pub struct ConsoleApiParams {
     /// deployer reads this slot for each new container and never assumes that
     /// an enabled setting means a listener actually started.
     pub overlay_dns_slot: temps_dns::OverlayDnsSlot,
+    /// Node 0's network policy view. `NetworkPolicyPlugin`'s enforcer
+    /// stores a snapshot after each pass; the proxy-owned resolver answers
+    /// restricted workloads from the same slot.
+    pub dns_policy_slot: temps_dns::DnsPolicySlot,
     /// Shared "a newer release exists" slot. Owned by the caller
     /// (`commands/serve/mod.rs`), which spawns the background update
     /// notifier that writes into it; registered into the service registry
@@ -3146,6 +3156,23 @@ fn ai_read_allowlist() -> Vec<String> {
         // Databases and notifications
         "get_query_container_info",
         "get_notification_delivery_coverage",
+        // ── Workload plane (ADR-055): placement, volumes, node resources,
+        //    workload modes and network policy, read only ──
+        "admin_environment_pinning_recommendation",
+        "admin_environment_volume_status",
+        "admin_explain_environment_placement",
+        "admin_get_environment_workload_isolation",
+        "admin_get_environment_workload_mode",
+        "admin_get_node_resources",
+        "admin_list_environment_volumes",
+        "get_effective_policy",
+        "get_ingress_settings",
+        "get_rule",
+        "get_workload_mode",
+        "get_workload_pending_changes",
+        "list_node_modes",
+        "list_rules",
+        "node_state_status",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -3595,6 +3622,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         ready_signal,
         additional_templates,
         on_demand_waker,
+        activator,
+        local_drivers,
         extra_plugins,
         admin_gate_service: provided_admin_gate_service,
         admin_gate_handle: provided_admin_gate_handle,
@@ -3602,6 +3631,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         project_ip_gate_slot,
         request_policy_gate_slot,
         overlay_dns_slot,
+        dns_policy_slot,
         update_status,
         self_updater,
         traefik_discovery,
@@ -3781,6 +3811,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(project_ip_gate_slot.clone());
     service_context.register_service(request_policy_gate_slot.clone());
     service_context.register_service(overlay_dns_slot);
+    service_context.register_service(dns_policy_slot);
     // Update-notifier slot: the background loop in serve/mod.rs writes into
     // it; ConfigPlugin's `GET /settings/update-status` reads it so the web
     // console can render the upgrade banner.
@@ -3847,6 +3878,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         service_context.register_service(waker as Arc<dyn temps_core::OnDemandWaker>);
         debug!("Registered OnDemandWaker for environment wake/sleep endpoints");
     }
+
+    // ADR-055 phase 10: the activator, the plane handle the deployments
+    // plugin fills once the plane starts, and the extra runtimes it adds.
+    service_context.register_service(activator);
+    service_context.register_service(Arc::new(temps_workload_plane::SharedPlane::new()));
+    service_context.register_service(local_drivers);
 
     // Whether this process runs workloads on its own host. Plugins that exist
     // only to manage local containers are not constructed at all when it is
@@ -4251,6 +4288,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         external_plugin_config,
     ));
     plugin_manager.register_plugin(external_plugins_plugin);
+
+    // NetworkPolicyPlugin - network policy rules for every workload kind,
+    // per-node modes, and node 0's enforcer (ADR-052 §4, ADR-055 phase 7).
+    // Every node defaults to `legacy`, where the enforcer only reads the
+    // mode: no Docker call, no nftables.
+    debug!("Registering NetworkPolicyPlugin");
+    plugin_manager.register_plugin(Box::new(temps_network_policy::NetworkPolicyPlugin::new()));
 
     // Extra plugins from the calling binary (EE, etc.). Registered last so
     // they can resolve every OSS service via `require_service`. See ADR 0001
@@ -5047,6 +5091,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     });
     let node_routes =
         temps_deployments::handlers::nodes::configure_routes().with_state(node_app_state);
+    // ADR-055 §7: the node state stream, served to workers that advertise
+    // `state_stream`. The heartbeat handler reads the same service from an
+    // extension to record instance reports.
+    let node_routes =
+        match service_context.get_service::<temps_deployments::services::NodeStateService>() {
+            Some(node_state) => node_routes
+                .layer(axum::Extension(node_state.clone()))
+                .merge(
+                    temps_deployments::handlers::node_state::configure_routes().with_state(
+                        Arc::new(temps_deployments::handlers::node_state::NodeStateAppState {
+                            node_service: node_service.clone(),
+                            node_state,
+                            audit_service: service_context
+                                .require_service::<dyn temps_core::AuditLogger>(),
+                        }),
+                    ),
+                ),
+            None => {
+                debug!("Node state stream is not registered in this process; workers use /agent/*");
+                node_routes
+            }
+        };
 
     // Start periodic node health check with failover (every 60s)
     {
@@ -5202,6 +5268,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 .require_service::<temps_ingress::IngressConnectorService>(),
         }));
 
+    // Node-token endpoint for worker network policy enforcers.
+    let network_policy_node_routes =
+        temps_network_policy::node_routes(Arc::new(temps_network_policy::NetworkPolicyNodeState {
+            db: db.clone(),
+            service: plugin_manager
+                .service_context()
+                .require_service::<temps_network_policy::NetworkPolicyService>(),
+        }));
+
     // Build the split application: public routes (event ingest, AI gateway,
     // session replay ingest, etc.) and admin routes (auth, dashboard, CRUD).
     let split = plugin_manager
@@ -5339,7 +5414,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         .public
         .merge(node_routes)
         .merge(route_sync_routes)
-        .merge(ingress_node_routes);
+        .merge(ingress_node_routes)
+        .merge(network_policy_node_routes);
 
     // Use the caller-supplied admin-gate when present (so the proxy and the
     // console share one source of truth) and otherwise build a fresh one.

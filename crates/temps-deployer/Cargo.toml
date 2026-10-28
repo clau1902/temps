@@ -13,6 +13,9 @@ homepage.workspace = true
 [dependencies]
 nix = { version = "0.31", features = ["fs"] }
 temps-runtime-health = { path = "../temps-runtime-health" }
+# ADR-055 phase 1: containers are created through the Docker driver.
+temps-workload = { path = "../temps-workload" }
+temps-workload-docker = { path = "../temps-workload-docker" }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
@@ -52,13 +55,18 @@ temps-network = { path = "../temps-network", features = ["control_plane"] }
 # ADR-024: control-plane DNS resolver bootstrap (CP-only path; workers wire DNS
 # via `temps agent`).
 temps-dns = { path = "../temps-dns" }
+temps-dns-resolver = { path = "../temps-dns-resolver" }
 utoipa = { workspace = true }
 flate2 = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = { workspace = true }
 regex = { workspace = true }
+# Compose `command:` strings are split the way Compose splits them (ADR-055 §14).
+shlex = "1.3"
 
 [dev-dependencies]
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
 http = { workspace = true }
 # A fake agent that serves mutual TLS, for the mesh-dial client test.
 rustls = { workspace = true }

@@ -406,7 +406,11 @@ impl StandaloneSandboxRegistry {
     /// provider side returns handles for stopped sandboxes too, so lifecycle
     /// ops like `start` can act on them. Callers that need the container
     /// to be running (e.g. `exec`) must check separately.
-    async fn get_or_recover(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
+    pub(crate) async fn get_or_recover(
+        &self,
+        id: i32,
+        public_id: &str,
+    ) -> Result<SandboxHandle, AgentError> {
         if let Some(h) = self.handles.read().await.get(&id).cloned() {
             return Ok(h);
         }
@@ -682,6 +686,19 @@ impl StandaloneSandboxRegistry {
         }
     }
 
+    /// Apply an egress policy to the sandbox's compute. Same recovery as
+    /// [`Self::start`]. Callers serialize it with other compute changes
+    /// through [`Self::begin_planned_downtime`].
+    pub async fn set_egress_policy(
+        &self,
+        id: i32,
+        public_id: &str,
+        policy: &temps_agents::sandbox::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let handle = self.get_or_recover(id, public_id).await?;
+        self.provider.set_egress_policy(&handle, policy).await
+    }
+
     /// Grow the sandbox's root disk (Firecracker only). Same recovery.
     pub async fn resize_disk(
         &self,
@@ -941,6 +958,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             })
         }
 
@@ -1096,6 +1114,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             }))
         }
 
@@ -1615,6 +1634,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             },
         );
 
@@ -1644,6 +1664,7 @@ mod tests {
                 work_dir: PathBuf::from("/workspace"),
                 backend: temps_agents::sandbox::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             },
         );
 
@@ -1818,6 +1839,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -1851,6 +1873,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

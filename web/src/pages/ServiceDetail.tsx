@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  memberProgress,
+  type MemberProgressInput,
+} from '@/lib/cluster-member-progress'
 import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
@@ -25,9 +29,9 @@ import {
 } from '@/lib/external-service-backups'
 import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
-import { ServiceLogIngestionCard } from '@/components/storage/ServiceLogIngestionCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
+import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
   ServiceHealthBadge,
@@ -1099,15 +1103,12 @@ export function ServiceDetail() {
               />
             )}
 
-            {/* Always shown: the budget applies whether or not it is running. */}
-            <ServiceLogIngestionCard serviceId={service.service.id} />
-
             {/* Cluster Creation Progress */}
             {service.service.topology === 'cluster' &&
               service.service.status === 'creating' && (
                 <Callout tone="info" title="Creating cluster members…">
-                  This may take a minute. Members will appear below as they are
-                  provisioned.
+                  Members are created one at a time, the monitor first. Each row
+                  below shows what it is doing.
                 </Callout>
               )}
 
@@ -1263,6 +1264,7 @@ export function ServiceDetail() {
                                     </span>
                                   )}
                                 </div>
+                                <MemberProgressLine member={member} />
                               </div>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
@@ -1334,6 +1336,16 @@ export function ServiceDetail() {
 
             {/* Resources: container runtime, live CPU/mem, applied limits */}
             <ServiceResourcesPanel
+              serviceId={service.service.id}
+              serviceName={service.service.name}
+            />
+
+            {/*
+              How the database's container is built (ADR-055 workload plane)
+              and the recreate from its workload spec. Instance-admin only;
+              other roles see what it is and who can change it.
+            */}
+            <ServiceWorkloadModeCard
               serviceId={service.service.id}
               serviceName={service.service.name}
             />
@@ -2164,6 +2176,22 @@ function LinkedResourceNote({ serviceType }: { serviceType: string }) {
         </>
       ) : null}
       {copy.trail}
+    </p>
+  )
+}
+
+function MemberProgressLine({ member }: { member: MemberProgressInput }) {
+  const progress = memberProgress(member)
+  if (!progress) return null
+  return (
+    <p
+      className={
+        progress.tone === 'error'
+          ? 'text-xs text-destructive break-words'
+          : 'text-xs text-muted-foreground'
+      }
+    >
+      {progress.text}
     </p>
   )
 }

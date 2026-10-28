@@ -9166,7 +9166,11 @@ ORDER BY a.opened_at DESC
             .map_err(|source| super::BackupCapabilityError::LoadService { service_id, source })?
             .ok_or(super::BackupCapabilityError::ServiceNotFound { service_id })?;
 
-        Ok(super::capability::probe_external_service_backup_capability(&service).await)
+        Ok(super::capability::probe_external_service_backup_capability(
+            &service,
+            &self.external_service_manager,
+        )
+        .await)
     }
 
     pub async fn backup_external_service(
@@ -11552,6 +11556,7 @@ mod tests {
                 created_by_user_id: None,
                 continuous_archive_s3_source_id: None,
                 continuous_archive_pinned_at: None,
+                workload_mode: Default::default(),
                 log_ingest_lines_per_sec: None,
                 log_ingest_kib_per_sec: None,
             }
@@ -15228,6 +15233,7 @@ mod tests {
             created_by_user_id: Set(None),
             continuous_archive_s3_source_id: Set(None),
             continuous_archive_pinned_at: Set(None),
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: Set(None),
             log_ingest_kib_per_sec: Set(None),
             created_at: Set(chrono::Utc::now()),
@@ -15417,6 +15423,7 @@ mod tests {
             created_by_user_id: Set(None),
             continuous_archive_s3_source_id: Set(None),
             continuous_archive_pinned_at: Set(None),
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: Set(None),
             log_ingest_kib_per_sec: Set(None),
             created_at: Set(chrono::Utc::now()),
@@ -15913,6 +15920,7 @@ mod tests {
             created_by_user_id: Set(None),
             continuous_archive_s3_source_id: Set(None),
             continuous_archive_pinned_at: Set(None),
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: Set(None),
             log_ingest_kib_per_sec: Set(None),
             created_at: Set(chrono::Utc::now()),

@@ -194,6 +194,15 @@ pub enum UserServiceError {
         retry_after_seconds: i64,
     },
 
+    #[error(
+        "Failed to revoke the ingress login grants of user {user_id} while {operation}: {reason}"
+    )]
+    IngressGrantRevocation {
+        user_id: i32,
+        operation: &'static str,
+        reason: String,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -459,19 +468,42 @@ where
     Ok((permit, result?))
 }
 
-/// Delete every session (full or pending) for `user_id` except `keep`.
-/// Returns how many rows were removed.
+/// What [`revoke_sessions_except`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RevokedAccess {
+    /// Console sessions (full or pending) deleted.
+    pub sessions: u64,
+    /// Temps-login ingress grants revoked.
+    pub ingress_grants: u64,
+}
+
+/// Delete every session (full or pending) for `user_id` except `keep`, and
+/// revoke every live Temps-login ingress grant the user holds.
+///
+/// The grants go too because each was minted from one of those console
+/// sessions and is honoured by the proxy for hours without consulting the
+/// session again: a sweep that left them in place would let a session it
+/// just ended keep opening protected environments. A grant records no link
+/// to the session that minted it, so the one belonging to `keep` cannot be
+/// spared; that browser signs in to the environment again through the same
+/// redirect. Run it inside the caller's transaction so the sweep and the
+/// change that warranted it commit together.
 pub(crate) async fn revoke_sessions_except<C: sea_orm::ConnectionTrait>(
     conn: &C,
     user_id: i32,
     keep: Option<i32>,
-) -> Result<u64, sea_orm::DbErr> {
+) -> Result<RevokedAccess, sea_orm::DbErr> {
     let mut query = temps_entities::sessions::Entity::delete_many()
         .filter(temps_entities::sessions::Column::UserId.eq(user_id));
     if let Some(keep) = keep {
         query = query.filter(temps_entities::sessions::Column::Id.ne(keep));
     }
-    Ok(query.exec(conn).await?.rows_affected)
+    let sessions = query.exec(conn).await?.rows_affected;
+    let ingress_grants = crate::ingress_grants::revoke_for_user(conn, user_id).await?;
+    Ok(RevokedAccess {
+        sessions,
+        ingress_grants,
+    })
 }
 
 impl UserService {
@@ -931,11 +963,23 @@ impl UserService {
         user_update.deleted_at = Set(Some(now));
         user_update.email = Set(deleted_email);
 
-        let deleted_user = user_update.update(self.db.as_ref()).await?;
+        // The soft delete and the revocation of the user's Temps-login
+        // ingress grants commit together: a deleted user must not keep
+        // opening protected environments on a cookie minted earlier.
+        let transaction = self.db.begin().await?;
+        let deleted_user = user_update.update(&transaction).await?;
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "deleting the user",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
 
         info!(
-            "Soft deleted user with id: {}, email changed to prevent duplicates",
-            user_id
+            "Soft deleted user with id: {}, email changed to prevent duplicates; revoked {} ingress login grant(s)",
+            user_id, revoked
         );
         Ok(deleted_user)
     }
@@ -954,11 +998,14 @@ impl UserService {
                 UserServiceError::RoleNotFound(format!("Role {} not found", role_type.as_str()))
             })?;
 
-        // Delete the user_role entry
+        // Delete the user_role entry. Losing a role can take away the
+        // permission a Temps-login ingress grant was minted on, so the
+        // user's grants are revoked in the same transaction.
+        let transaction = self.db.begin().await?;
         let delete_result = temps_entities::user_roles::Entity::delete_many()
             .filter(temps_entities::user_roles::Column::UserId.eq(user_id_val))
             .filter(temps_entities::user_roles::Column::RoleId.eq(role.id))
-            .exec(self.db.as_ref())
+            .exec(&transaction)
             .await?;
 
         if delete_result.rows_affected == 0 {
@@ -969,10 +1016,20 @@ impl UserService {
             )));
         }
 
+        let revoked = crate::ingress_grants::revoke_for_user(&transaction, user_id_val)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id: user_id_val,
+                operation: "removing a role",
+                reason: e.to_string(),
+            })?;
+        transaction.commit().await?;
+
         info!(
-            "Removed role {} from user {}",
+            "Removed role {} from user {}; revoked {} ingress login grant(s)",
             role_type.as_str(),
-            user_id_val
+            user_id_val,
+            revoked
         );
         Ok(())
     }
@@ -1057,11 +1114,20 @@ impl UserService {
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .exec(&transaction)
             .await?;
+        // Ingress login grants are minted from those sessions; a reset that
+        // assumes the old credentials are compromised ends them too.
+        crate::ingress_grants::revoke_for_user(&transaction, user_id)
+            .await
+            .map_err(|e| UserServiceError::IngressGrantRevocation {
+                user_id,
+                operation: "resetting the password",
+                reason: e.to_string(),
+            })?;
 
         transaction.commit().await?;
 
         info!(
-            "Temporary password issued for user {}; existing sessions revoked",
+            "Temporary password issued for user {}; existing sessions and ingress login grants revoked",
             user_id
         );
         Ok((updated_user, temporary_password))
@@ -1301,8 +1367,9 @@ impl UserService {
 
         info!(
             user_id,
-            revoked_sessions = revoked,
-            "MFA enabled; other sessions revoked"
+            revoked_sessions = revoked.sessions,
+            revoked_ingress_grants = revoked.ingress_grants,
+            "MFA enabled; other sessions and ingress login grants revoked"
         );
         Ok(())
     }
@@ -2076,6 +2143,7 @@ mod tests {
             .unwrap();
             ids.push(session.id);
         }
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
 
         let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
         let code = crate::mfa_guard::test_support::code_at(&secret, Utc::now());
@@ -2083,6 +2151,10 @@ mod tests {
             .verify_and_enable_mfa(user.id, &code, Some(ids[0]))
             .await
             .expect("valid enrolment code enables MFA");
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an ingress grant minted before enrolment must not outlive the session sweep"
+        );
 
         let remaining: Vec<i32> = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::UserId.eq(user.id))

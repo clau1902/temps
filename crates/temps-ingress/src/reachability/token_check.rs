@@ -38,7 +38,8 @@ const DENIED_CODES: [i64; 3] = [10000, 10001, 9109];
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct TokenCheckRequest {
-    /// The token, as pasted. Used for this check only; not stored.
+    /// The token, as pasted. Used for this check only; not stored. A
+    /// secret field, so the AI assistant takes it through a secret slot.
     pub token: temps_core::secret_string::SecretString,
     /// The zone the token is meant for. With it, a token that reaches any
     /// other zone is not ready.

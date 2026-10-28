@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod docker;
+pub mod driver;
+pub mod facade;
 pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod guest_agent_build;
@@ -14,6 +16,7 @@ pub mod pty_agent_bundle;
 pub mod remote;
 pub mod routing;
 pub mod user;
+pub mod workload_vm;
 
 /// The Docker named volume holding `/home/temps` for a sandbox whose
 /// container suffix is `label`.
@@ -31,6 +34,11 @@ pub fn home_volume_name_for_label(label: &str) -> String {
         label
     )
 }
+
+/// A sandbox's outbound policy (which hosts and CIDR blocks it may reach).
+pub use temps_workload::{
+    EgressMode, EgressPolicyError, EgressRule, SandboxEgressPolicy, MAX_EGRESS_RULES,
+};
 
 pub use user::{
     SANDBOX_CHOWN, SANDBOX_GID, SANDBOX_GROUP, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER,
@@ -109,6 +117,19 @@ pub enum SandboxBackend {
     Local,
 }
 
+/// The backends a caller may ask for, in the order they are offered. `Local`
+/// is a dev-only fallback, never a choice.
+pub const SELECTABLE_SANDBOX_BACKENDS: [SandboxBackend; 3] = [
+    SandboxBackend::Docker,
+    SandboxBackend::Firecracker,
+    SandboxBackend::Microsandbox,
+];
+
+/// The backends a worker node runs sandboxes on (ADR-048): its agent creates
+/// Docker containers only. [`remote::RemoteSandboxProvider`] answers from
+/// this, and so does every surface that says what a worker can run.
+pub const WORKER_SANDBOX_BACKENDS: [SandboxBackend; 1] = [SandboxBackend::Docker];
+
 impl std::str::FromStr for SandboxBackend {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -175,6 +196,15 @@ pub struct SandboxHandle {
     /// booted instead of a vague "platform default". Empty on recovered
     /// handles (the DB already holds the recorded value).
     pub image: String,
+    /// What the driver facade found when it placed the sandbox (ADR-055
+    /// §5, §6): `LimitEnforced = False` with the reason when a requested
+    /// limit could not be applied, and `Scheduled` when the preferred
+    /// driver was passed over. Only the facade sets it; empty on the
+    /// single-backend providers it wraps, and then omitted from the wire so
+    /// a handle without conditions serializes as it always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<Object>)]
+    pub conditions: Vec<temps_workload::Condition>,
 }
 
 /// Configuration for creating a new sandbox.
@@ -224,6 +254,12 @@ pub struct SandboxCreateConfig {
     pub disk_size_mb: Option<u64>,
     /// Network access: "full", "restricted", "none"
     pub network_mode: Option<String>,
+    /// Which destinations the sandbox may reach once it has a network. The
+    /// default (`internet`) is any public destination on ports 80/443; a
+    /// `restricted` policy needs a backend with egress allow-lists (Docker)
+    /// and is refused with [`AgentError::SandboxEgressPolicyUnsupported`]
+    /// elsewhere.
+    pub egress_policy: SandboxEgressPolicy,
     /// Environment variables to inject (ANTHROPIC_API_KEY, etc.)
     pub env_vars: HashMap<String, String>,
     /// Maximum time the sandbox should stay alive without activity
@@ -252,6 +288,29 @@ impl SandboxCreateConfig {
                     "sandbox run {}: allow_docker requires the microsandbox backend; {} does not support guest Docker",
                     self.run_id, backend
                 ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The name a create request goes by in errors: the explicit label, or
+    /// the run id.
+    pub(crate) fn sandbox_label(&self) -> String {
+        self.container_name_override
+            .clone()
+            .unwrap_or_else(|| self.run_id.to_string())
+    }
+
+    /// Fail closed on a backend that cannot enforce a restricted egress
+    /// policy, rather than starting a sandbox with more access than asked.
+    pub(crate) fn refuse_restricted_egress(
+        &self,
+        backend: SandboxBackend,
+    ) -> Result<(), AgentError> {
+        if self.egress_policy.is_restricted() {
+            return Err(AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: self.sandbox_label(),
+                backend: backend.to_string(),
             });
         }
         Ok(())
@@ -943,6 +1002,27 @@ pub trait SandboxProvider: Send + Sync {
         })
     }
 
+    /// A byte pipe to TCP `port` on the sandbox's own loopback, carrying
+    /// whatever protocol the process listening there speaks. The ingress
+    /// uses it for preview URLs of sandboxes it cannot dial directly, i.e.
+    /// those on worker nodes. The caller must authorize the request first.
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        Err(AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason: format!(
+                "port {} of sandbox '{}' cannot be reached through provider '{}'",
+                port,
+                handle.sandbox_name,
+                self.name()
+            ),
+        })
+    }
+
     /// Execute a command inside an existing sandbox, streaming stdout via callback.
     async fn exec(
         &self,
@@ -1327,6 +1407,26 @@ done
                 self.name()
             ),
         })
+    }
+
+    /// Replace the egress policy of an existing sandbox, running or stopped.
+    /// `policy` is normalized. The new policy holds for every connection
+    /// opened after this returns; connections already open may be cut.
+    /// Default: the provider cannot enforce allow-lists, so `internet` (what
+    /// it already does) is accepted and `restricted` is refused with a typed
+    /// error.
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        if policy.is_restricted() {
+            return Err(AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: handle.sandbox_name.clone(),
+                backend: handle.backend.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Attempt to recover a sandbox after server restart (by naming convention).
@@ -2024,6 +2124,7 @@ mod tests {
             work_dir: std::env::current_dir().expect("current directory"),
             backend: SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         };
         let provider = local::LocalSandboxProvider::new();
         let fence_result = provider

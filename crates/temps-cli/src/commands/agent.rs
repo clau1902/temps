@@ -101,6 +101,12 @@ pub struct AgentCommand {
     #[arg(long, default_value_t = 443)]
     pub public_ingress_https_port: u16,
 
+    /// Do not run the node runtime or advertise the `state_stream`
+    /// capability (ADR-055 §7): the control plane drives this node through
+    /// the `/agent/*` API only, as older agents are. A rollback switch.
+    #[arg(long)]
+    pub disable_state_stream: bool,
+
     #[command(subcommand)]
     pub service: Option<AgentSubcommand>,
 }
@@ -135,6 +141,7 @@ impl AgentCommand {
             .build()?;
 
         rt.block_on(async move {
+            let disable_state_stream = self.disable_state_stream;
             let config = self.resolve_config()?;
 
             let docker = bollard::Docker::connect_with_defaults()
@@ -328,6 +335,37 @@ impl AgentCommand {
                 }
             }
 
+            // Network policy: the same enforcer as node 0, fed by the
+            // control plane. In `legacy` (the default) a pass is one
+            // request and nothing else. Its DNS view is shared with the
+            // node resolver (started by the network sync loop), which
+            // answers restricted workloads from it.
+            let dns_policy = temps_dns::open_dns_policy_slot();
+            match temps_agent::with_control_plane_trust(
+                reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)),
+                temps_agent::control_plane_ca(&config),
+            )
+            .build()
+            {
+                Ok(http) => {
+                    if let Err(e) = temps_agent::network_policy::spawn_worker_enforcer(
+                        http,
+                        &config.control_plane_url,
+                        config.node_id,
+                        config.token.clone(),
+                        docker.clone(),
+                        dns_policy.clone(),
+                        &agent_data_dir(),
+                    ) {
+                        tracing::warn!(error = %e, "network policy enforcer could not start");
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "network policy enforcer could not start: building its HTTP client failed"
+                ),
+            }
+
             // netwatch on this node (ADR 066 D12), when TEMPS_NETWATCH turns
             // it on: its bans join this node's lists.
             route_store
@@ -481,7 +519,7 @@ impl AgentCommand {
                 });
             }
 
-            temps_agent::server::start_agent_server(
+            temps_agent::server::start_agent_server_with(
                 deployer,
                 builder,
                 Some(docker),
@@ -490,8 +528,12 @@ impl AgentCommand {
                     overlay_bridge_address,
                     overlay_peers,
                     host_bind_address: host_bind_slot,
+                    dns_policy,
                 },
                 docker_socket_grant,
+                temps_agent::server::AgentServerOptions {
+                    state_stream: !disable_state_stream,
+                },
             )
             .await
             .map_err(|e| anyhow::anyhow!("Agent server error: {}", e))?;

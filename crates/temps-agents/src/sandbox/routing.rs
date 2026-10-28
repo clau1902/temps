@@ -278,12 +278,30 @@ impl SandboxProvider for RoutingSandboxProvider {
         self.owner_of(handle).attach_pty(handle).await
     }
 
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<super::PtyAttachment, AgentError> {
+        self.owner_of(handle).connect_port(handle, port).await
+    }
+
     async fn resize_disk(
         &self,
         handle: &SandboxHandle,
         new_size_mb: u64,
     ) -> Result<(), AgentError> {
         self.owner_of(handle).resize_disk(handle, new_size_mb).await
+    }
+
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &super::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .set_egress_policy(handle, policy)
+            .await
     }
 
     async fn take_snapshot(
@@ -453,6 +471,7 @@ mod tests {
                 work_dir: "/home/temps/workspace".into(),
                 backend: self.backend,
                 image: "test-image".to_string(),
+                conditions: Vec::new(),
             }
         }
     }
@@ -612,6 +631,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

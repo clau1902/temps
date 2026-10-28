@@ -36,6 +36,7 @@ http = { workspace = true }
 rand = { workspace = true }
 argon2 = { workspace = true }
 hex = "0.4"
+ipnetwork = "0.21"
 url = { workspace = true }
 percent-encoding = "2.3"
 tokio-stream = { version = "0.1.17", features = ["sync"] }
@@ -47,6 +48,7 @@ sysinfo = { workspace = true }
 tar = { workspace = true }
 
 [dev-dependencies]
+bytes = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
 tempfile = { workspace = true }

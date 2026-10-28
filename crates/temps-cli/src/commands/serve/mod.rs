@@ -1052,6 +1052,26 @@ impl ServeCommand {
             on_demand_manager.start_sweep_task(std::time::Duration::from_secs(60));
         }
 
+        // ADR-055 phase 10: one activator per process wakes scale-to-zero
+        // targets on their first request and its one sweep (O(targets), every
+        // 30 s) puts idle ones back to sleep: on-demand environments whose
+        // `workload_mode` is `enforce`. Every other
+        // environment keeps the on-demand manager's own path above.
+        let activator = Arc::new(temps_workload_activator::Activator::new(
+            temps_workload_activator::ActivatorConfig::default(),
+        ));
+        if let Some(ref on_demand_manager) = on_demand_manager {
+            on_demand_manager.attach_activator(activator.clone());
+        }
+        {
+            let _runtime = rt.enter();
+            // Detached: it sweeps for the life of the process.
+            drop(activator.spawn_sweeper(std::time::Duration::from_secs(30)));
+        }
+        let local_drivers = Arc::new(temps_workload_plane::LocalDrivers::new(
+            local_runtime_drivers(),
+        ));
+
         // NOW start the route-reload machinery. `start_listening` subscribes to
         // PG NOTIFY synchronously and spawns the initial load in the background,
         // so none of these block the proxy bind. The sleeping callback above is
@@ -1234,6 +1254,10 @@ impl ServeCommand {
         let project_ip_gate_slot = Arc::new(temps_core::ProjectIpGateSlot::new_default());
         let request_policy_gate_slot = Arc::new(temps_core::RequestPolicyGateSlot::new_default());
         let overlay_dns_slot: temps_dns::OverlayDnsSlot = Arc::new(std::sync::RwLock::new(None));
+        // Node 0's network policy view: the enforcer (NetworkPolicyPlugin)
+        // writes it, the proxy-owned resolver answers restricted workloads
+        // from it. Both run in this process.
+        let dns_policy_slot = temps_dns::open_dns_policy_slot();
 
         // Resolve proxy enforcement before console startup. These builders are
         // the same extension boundary used by standalone `temps proxy`; they
@@ -1285,6 +1309,8 @@ impl ServeCommand {
             on_demand_waker: on_demand_manager
                 .clone()
                 .map(|m| m as Arc<dyn temps_core::OnDemandWaker>),
+            activator: activator.clone(),
+            local_drivers,
             extra_plugins,
             admin_gate_service: Some(admin_gate_service),
             admin_gate_handle: Some(admin_gate_handle.clone()),
@@ -1292,6 +1318,7 @@ impl ServeCommand {
             project_ip_gate_slot: project_ip_gate_slot.clone(),
             request_policy_gate_slot: request_policy_gate_slot.clone(),
             overlay_dns_slot: overlay_dns_slot.clone(),
+            dns_policy_slot: dns_policy_slot.clone(),
             update_status,
             self_updater,
             traefik_discovery: traefik_discovery_handle,
@@ -1444,11 +1471,18 @@ impl ServeCommand {
             project_ip_gate_slot as Arc<dyn temps_core::ProjectIpGate>,
             request_policy_gate_slot as Arc<dyn temps_core::RequestPolicyGate>,
             overlay_dns_slot,
+            Some(dns_policy_slot),
             docker_handle,
             self.profile.local_workloads_enabled(),
             console_startup_state,
         )
     }
+}
+
+/// Runtime drivers this binary adds on the control plane next to the node
+/// driver (ADR-055 phase 10). None today.
+fn local_runtime_drivers() -> Vec<Arc<dyn temps_workload::RuntimeDriver>> {
+    Vec::new()
 }
 
 #[cfg(test)]

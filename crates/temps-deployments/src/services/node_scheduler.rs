@@ -570,6 +570,25 @@ impl NodeScheduler {
         self
     }
 
+    /// The unified scheduler's configuration equivalent to this scheduler's
+    /// (ADR-055 Phase 5): the same load threshold, control-plane policy and
+    /// platform, and the same platform matcher. The shadow run and the
+    /// `enforce` path build their scheduler from it, so the two only differ
+    /// where ADR-055 says they do.
+    pub fn unified_scheduler_config(&self) -> temps_workload_plane::SchedulerConfig {
+        let mut config =
+            temps_workload_plane::SchedulerConfig::new(temps_deployer::platform::platforms_match);
+        config.max_load_threshold = self.max_load_threshold;
+        config.local_workloads_enabled = self.local_workloads_enabled;
+        config.local_platform = self.local_platform();
+        config
+    }
+
+    /// Seconds since the last heartbeat after which a node is not placed on.
+    pub fn heartbeat_threshold_secs(&self) -> i64 {
+        self.heartbeat_threshold_secs
+    }
+
     /// Get a reference to the underlying node service.
     /// The worker node `node_id` when it is active and has heartbeated within
     /// the scheduler's threshold, i.e. when a deployment may be sent to it.
@@ -1927,6 +1946,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

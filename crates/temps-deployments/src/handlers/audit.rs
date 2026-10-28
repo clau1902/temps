@@ -213,6 +213,16 @@ pub struct NodeArchitectureChangedAudit {
     pub to: String,
 }
 
+/// Cluster DNS was turned on because a worker joined and no operator had
+/// decided either way. A settings change no user made, so it is recorded with
+/// the node that caused it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClusterDnsEnabledForWorkerAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub node_name: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NodePublicIngressChangedAudit {
     pub context: AuditContext,
@@ -564,6 +574,10 @@ impl_audit_operation!(ExternalImageDeletedAudit, "EXTERNAL_IMAGE_DELETED");
 impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
+impl_audit_operation!(
+    ClusterDnsEnabledForWorkerAudit,
+    "CLUSTER_DNS_ENABLED_FOR_WORKER"
+);
 impl_audit_operation!(NodePublicIngressChangedAudit, "NODE_PUBLIC_INGRESS_CHANGED");
 impl_audit_operation!(
     NodePublicIngressSettingsChangedAudit,
@@ -733,3 +747,91 @@ mod node_audit_tests {
         assert_eq!(json["failed_redeploys"], 1);
     }
 }
+
+/// An admin changed an environment's `workload_mode` (ADR-055 Phase 5).
+/// Moving back to `legacy` is the rollback, so both values are recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentWorkloadModeChangedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub previous_mode: String,
+    pub workload_mode: String,
+}
+
+impl_audit_operation!(
+    EnvironmentWorkloadModeChangedAudit,
+    "ENVIRONMENT_WORKLOAD_MODE_CHANGED"
+);
+
+/// An admin changed the isolation an environment's plane-run deployments
+/// request (ADR-055 Phase 10). `process` is the rollback.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentWorkloadIsolationChangedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub previous_isolation: String,
+    pub workload_isolation: String,
+}
+
+impl_audit_operation!(
+    EnvironmentWorkloadIsolationChangedAudit,
+    "ENVIRONMENT_WORKLOAD_ISOLATION_CHANGED"
+);
+
+/// An admin changed a node's resource policy or system reserve (node 0 is
+/// the control plane).
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeResourcesChangedAudit {
+    pub context: AuditContext,
+    pub node_id: i32,
+    pub previous_resource_policy: String,
+    pub resource_policy: String,
+    pub previous_system_reserved: temps_entities::node_resource_settings::SystemReserved,
+    pub system_reserved: temps_entities::node_resource_settings::SystemReserved,
+}
+
+impl_audit_operation!(NodeResourcesChangedAudit, "NODE_RESOURCES_CHANGED");
+
+/// An admin created a volume for an environment (ADR-055 Phase 9).
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVolumeCreatedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub volume_id: i64,
+    pub name: String,
+    pub size_mb: Option<u64>,
+    pub retain_on_delete: bool,
+}
+
+impl_audit_operation!(EnvironmentVolumeCreatedAudit, "ENVIRONMENT_VOLUME_CREATED");
+
+/// An admin attached (`mount_path` set) or detached (`None`) an
+/// environment's volume.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVolumeAttachmentChangedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub volume_id: i64,
+    pub name: String,
+    pub mount_path: Option<String>,
+    pub read_only: bool,
+}
+
+impl_audit_operation!(
+    EnvironmentVolumeAttachmentChangedAudit,
+    "ENVIRONMENT_VOLUME_ATTACHMENT_CHANGED"
+);
+
+/// An admin deleted an environment's volume, and whether its data went
+/// with it.
+#[derive(Debug, Clone, Serialize)]
+pub struct EnvironmentVolumeDeletedAudit {
+    pub context: AuditContext,
+    pub environment_id: i32,
+    pub volume_id: i64,
+    pub name: String,
+    pub backing_removed: bool,
+    pub backing_kept_reason: Option<String>,
+}
+
+impl_audit_operation!(EnvironmentVolumeDeletedAudit, "ENVIRONMENT_VOLUME_DELETED");

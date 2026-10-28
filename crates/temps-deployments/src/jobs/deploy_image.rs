@@ -24,6 +24,7 @@ use temps_deployer::{
     DeployRequest, ImageBuilder, PortMapping, Protocol, ResourceLimits, RestartPolicy,
 };
 use temps_entities::deployment_containers;
+use temps_entities::environment_workload_mode::EnvironmentWorkloadMode;
 use temps_logs::{LogLevel, LogService};
 use tokio::time::{sleep, Duration};
 
@@ -586,6 +587,22 @@ pub struct DeploymentJobConfig {
     /// When anti-affinity is enabled, these nodes are excluded from scheduling
     /// to prevent new replicas from landing on the same nodes as old ones.
     pub exclude_node_ids: Vec<i32>,
+    /// The environment's ADR-055 mode. `Legacy` (the default) is today's
+    /// deploy path, unchanged; `Shadow` also asks the unified scheduler and
+    /// logs whether it agrees; `Enforce` places with the unified scheduler
+    /// and starts control-plane replicas through the workload plane.
+    pub workload_mode: temps_entities::environment_workload_mode::EnvironmentWorkloadMode,
+    /// The environment's attached volumes (ADR-055 Phase 9), sources
+    /// resolved. Empty for every environment without one, which deploys
+    /// exactly as before. Mounted only in `enforce`, one replica, on the
+    /// control plane; anything else fails the deployment with the reason.
+    pub volume_mounts: Vec<temps_workload::VolumeMount>,
+    /// Where those volumes pin the replica, when any has a node yet.
+    pub volume_pin: Option<temps_workload_volumes::VolumePin>,
+    /// What `enforce` replicas ask the plane for (ADR-055 Phase 10, the
+    /// environment's `workload_isolation`). `legacy` and `shadow` keep a
+    /// container whatever it says.
+    pub workload_isolation: temps_workload::Isolation,
 }
 
 /// One replica's placement, and the guarantee the scheduler attached to it.
@@ -636,8 +653,23 @@ impl Default for DeploymentJobConfig {
             cross_node_service_blockers: Vec::new(),
             anti_affinity: true,
             exclude_node_ids: Vec::new(),
+            workload_mode: Default::default(),
+            volume_mounts: Vec::new(),
+            volume_pin: None,
+            workload_isolation: temps_workload::Isolation::Process,
         }
     }
+}
+
+/// What a `shadow` or `enforce` deployment needs (ADR-055 Phase 5): the
+/// unified scheduler's inputs, and the plane that runs control-plane
+/// replicas in `enforce`. Absent for `legacy`, which never touches either.
+#[derive(Clone)]
+pub struct WorkloadPlaneDeploy {
+    pub placement: Arc<crate::services::WorkloadPlacementService>,
+    /// `None` when this process did not start a plane; `enforce` then fails
+    /// with that reason instead of degrading to the legacy path.
+    pub plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 /// Target environment for deployment
@@ -659,6 +691,8 @@ pub struct DeployImageJob {
     /// Node scheduler for distributing replicas across the cluster.
     /// When None, all replicas deploy locally (single-node mode).
     node_scheduler: Option<Arc<crate::services::NodeScheduler>>,
+    /// ADR-055: set for `shadow`/`enforce` environments only.
+    workload_plane: Option<WorkloadPlaneDeploy>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     /// Container IDs stored as soon as containers are created for cleanup on failure
@@ -1423,6 +1457,7 @@ impl DeployImageJob {
             config: DeploymentJobConfig::default(),
             container_deployer,
             node_scheduler: None,
+            workload_plane: None,
             log_id: None,
             log_service: None,
             container_ids: Arc::new(Mutex::new(Vec::new())),
@@ -1498,6 +1533,11 @@ impl DeployImageJob {
 
     pub fn with_node_scheduler(mut self, scheduler: Arc<crate::services::NodeScheduler>) -> Self {
         self.node_scheduler = Some(scheduler);
+        self
+    }
+
+    pub fn with_workload_plane(mut self, workload_plane: WorkloadPlaneDeploy) -> Self {
+        self.workload_plane = Some(workload_plane);
         self
     }
 
@@ -3029,9 +3069,31 @@ impl DeployImageJob {
         // actually mounted the socket: a gated deployment the executing host
         // silently started *without* it is a service running with none of the
         // access it exists for, reported as healthy.
-        let (node_assignments, docker_socket_required) = if let Some(ref scheduler) =
-            self.node_scheduler
-        {
+        // ADR-055 `enforce`: the unified scheduler places (strict pins, the
+        // node reserve, enforced capacity, placements in flight) and the
+        // reservation is held until the replicas are started.
+        let enforce = self.config.workload_mode == EnvironmentWorkloadMode::Enforce;
+        // ADR-055 Phase 9: attached volumes are mounted only through the
+        // plane, by one replica, on the control plane. Anything else fails
+        // here with the fix, never deploys a replica without its data.
+        if !self.config.volume_mounts.is_empty() {
+            if let Some(message) = crate::services::workload_volumes::volumes_blocker(
+                context.environment_id,
+                self.config.workload_mode,
+                i32::try_from(self.config.replicas).unwrap_or(i32::MAX),
+                self.config.volume_pin.as_ref().map(|pin| pin.node_id),
+            ) {
+                self.log(context, format!("ERROR: {message}")).await?;
+                return Err(WorkflowError::JobExecutionFailed(message));
+            }
+        }
+        let mut _in_flight: Option<temps_workload_plane::inventory::InFlightGuard> = None;
+        let (node_assignments, docker_socket_required) = if enforce {
+            let (assignments, socket_required, guard) =
+                self.enforced_placement(image_output, context).await?;
+            _in_flight = Some(guard);
+            (assignments, socket_required)
+        } else if let Some(ref scheduler) = self.node_scheduler {
             // A node-built image is handed to each replica's node from its
             // builder, so the build location does not constrain placement;
             // the platform filter below does.
@@ -3043,24 +3105,28 @@ impl DeployImageJob {
             // match none of them are excluded from the pool instead of being
             // handed a container that cannot start.
             let image_platforms = self.available_image_platforms(image_output).await;
-            match scheduler
-                .schedule_placement(
-                    crate::services::node_scheduler::ReplicaPlacementRequest {
-                        replica_count: self.config.replicas,
-                        labels: target_labels,
-                        target_node_ids: target_ids,
-                        anti_affinity: self.config.anti_affinity,
-                        exclude_node_ids: &self.config.exclude_node_ids,
-                        image_platforms: &image_platforms,
-                        // ADR 045: lets the scheduler refuse, up front, to
-                        // place a socket-granted project on a host that does
-                        // not grant it.
-                        project_slug: self.config.project_slug.as_deref(),
-                        exclude_control_plane: false,
-                    },
-                )
-                .await
-            {
+            let placement_result = scheduler
+                .schedule_placement(crate::services::node_scheduler::ReplicaPlacementRequest {
+                    replica_count: self.config.replicas,
+                    labels: target_labels,
+                    target_node_ids: target_ids,
+                    anti_affinity: self.config.anti_affinity,
+                    exclude_node_ids: &self.config.exclude_node_ids,
+                    image_platforms: &image_platforms,
+                    // ADR 045: lets the scheduler refuse, up front, to
+                    // place a socket-granted project on a host that does
+                    // not grant it.
+                    project_slug: self.config.project_slug.as_deref(),
+                    exclude_control_plane: false,
+                })
+                .await;
+            // ADR-055 `shadow`: NodeScheduler still decides; the unified
+            // scheduler's answer for the same request is only logged.
+            if self.config.workload_mode == EnvironmentWorkloadMode::Shadow {
+                self.log_shadow_placement(scheduler, &placement_result, &image_platforms, context)
+                    .await;
+            }
+            match placement_result {
                 Ok(outcome) => {
                     // Say which nodes were passed over and why. The scheduler
                     // only had `tracing` for this, which the user never sees —
@@ -3248,6 +3314,15 @@ impl DeployImageJob {
             None => None,
         };
 
+        // `enforce`: every replica is created through the plane, pinned to
+        // the node chosen here; the product keeps the health check and
+        // blue/green around them.
+        let plane_deployer: Option<Arc<dyn ContainerDeployer>> = if enforce {
+            Some(self.plane_deployer(context, self.container_deployer.clone(), None)?)
+        } else {
+            None
+        };
+
         for (replica_index, assignment) in node_assignments.iter().enumerate() {
             // The tag this replica deploys. Reassigned below for remote nodes
             // whose architecture only becomes known after querying the agent.
@@ -3292,7 +3367,10 @@ impl DeployImageJob {
                         context,
                     )
                     .await?;
-                    self.container_deployer.clone()
+                    match plane_deployer.as_ref() {
+                        Some(plane_deployer) => plane_deployer.clone(),
+                        None => self.container_deployer.clone(),
+                    }
                 }
                 crate::services::NodeAssignment::Remote {
                     address,
@@ -3300,6 +3378,17 @@ impl DeployImageJob {
                     platform,
                     ..
                 } => {
+                    // The agent's deploy call carries no volumes: a replica
+                    // with volumes never starts there without its data.
+                    if !self.config.volume_mounts.is_empty() {
+                        let message = format!(
+                            "Replica {} was placed on node '{node_name}', but this environment \
+                             mounts volumes, which only control-plane replicas receive",
+                            replica_index + 1
+                        );
+                        self.log(context, format!("ERROR: {message}")).await?;
+                        return Err(WorkflowError::JobExecutionFailed(message));
+                    }
                     // Look up the node and its token from the node service
                     let (node, token) = self.get_remote_node(assignment).await?;
                     // Build the deployer via the shared factory so https:// nodes
@@ -3372,7 +3461,13 @@ impl DeployImageJob {
                     )
                     .await?;
 
-                    remote
+                    if enforce {
+                        // The worker's agent stays the deployer of every
+                        // operation after the create.
+                        self.plane_deployer(context, remote, assignment.node_id())?
+                    } else {
+                        remote
+                    }
                 }
             };
 
@@ -4759,6 +4854,328 @@ impl WorkflowTask for DeployImageJob {
     }
 }
 
+/// The job's resource settings as the plane's [`temps_workload::Resources`]:
+/// limits as limits, requests as requests, `0` MB memory as uncapped.
+fn workload_resources(usage: &ResourceUsage) -> temps_workload::Resources {
+    let cpu = |value: &Option<String>| {
+        value
+            .as_deref()
+            .and_then(parse_cpu_cores)
+            .filter(|cores| *cores > 0.0)
+            .map(|cores| (cores * 1000.0).ceil() as u32)
+    };
+    let memory = |value: &Option<String>| {
+        value
+            .as_deref()
+            .and_then(parse_memory_mb)
+            .filter(|mb| *mb > 0)
+            .map(|mb| u32::try_from(mb).unwrap_or(u32::MAX))
+    };
+    let amounts = |cpu_millis, memory_mb| {
+        let amounts = temps_workload::ResourceAmounts {
+            cpu_millis,
+            memory_mb,
+            disk_mb: None,
+            pids: None,
+        };
+        (!amounts.is_empty()).then_some(amounts)
+    };
+    temps_workload::Resources {
+        requests: amounts(cpu(&usage.cpu_request), memory(&usage.memory_request)),
+        limits: amounts(cpu(&usage.cpu_limit), memory(&usage.memory_limit)),
+    }
+}
+
+impl DeployImageJob {
+    fn workload_placement_spec(
+        &self,
+    ) -> Result<temps_workload::PlacementSpec, crate::services::WorkloadPlacementError> {
+        crate::services::workload_placement::placement_spec_from_job(
+            self.config.target_nodes.as_deref(),
+            self.config.target_labels.as_ref(),
+            self.config.anti_affinity,
+            self.config.replicas,
+        )
+    }
+
+    /// `shadow`: ask the unified scheduler what it would do with the request
+    /// NodeScheduler just answered, and log the comparison. Never fails the
+    /// deployment: the legacy answer is the one that is used.
+    async fn log_shadow_placement(
+        &self,
+        scheduler: &crate::services::NodeScheduler,
+        legacy: &Result<
+            crate::services::node_scheduler::SchedulingOutcome,
+            crate::services::node_service::NodeError,
+        >,
+        image_platforms: &[String],
+        context: &WorkflowContext,
+    ) {
+        use crate::services::workload_placement::{describe_shadow, ShadowOutcome, ShadowRequest};
+        let Some(workload_plane) = self.workload_plane.as_ref() else {
+            tracing::warn!(
+                deployment_id = context.deployment_id,
+                "workload_mode is shadow but the placement service is not wired; comparison skipped"
+            );
+            return;
+        };
+        let placement = match self.workload_placement_spec() {
+            Ok(placement) => placement,
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    "shadow placement skipped: {e}"
+                );
+                let _ = self
+                    .log(
+                        context,
+                        format!("WARNING: workload plane shadow run skipped: {e}"),
+                    )
+                    .await;
+                return;
+            }
+        };
+        let resources = workload_resources(&self.config.resources);
+        let request = ShadowRequest {
+            placement: &placement,
+            target_labels: self.config.target_labels.as_ref(),
+            resources: &resources,
+            exclude_node_ids: &self.config.exclude_node_ids,
+            image_platforms,
+            project_slug: self.config.project_slug.as_deref(),
+        };
+        match workload_plane
+            .placement
+            .shadow_run(
+                scheduler,
+                Some(ShadowOutcome::from_legacy(legacy)),
+                &request,
+            )
+            .await
+        {
+            Ok(comparison) => {
+                if comparison.is_unexpected() {
+                    tracing::warn!(
+                        deployment_id = context.deployment_id,
+                        legacy = ?comparison.legacy,
+                        unified = ?comparison.unified,
+                        "workload plane shadow run: unexpected disagreement"
+                    );
+                } else {
+                    tracing::info!(
+                        deployment_id = context.deployment_id,
+                        agrees = comparison.agrees(),
+                        disagreement = ?comparison.disagreement,
+                        "workload plane shadow run"
+                    );
+                }
+                let _ = self.log(context, describe_shadow(&comparison)).await;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    deployment_id = context.deployment_id,
+                    "workload plane shadow run failed: {e}"
+                );
+                let _ = self
+                    .log(
+                        context,
+                        format!("WARNING: workload plane shadow run failed: {e}"),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    fn enforce_unavailable(&self) -> Option<String> {
+        match self.workload_plane.as_ref() {
+            None => Some(
+                "This environment's workload_mode is enforce, but this process did not wire the \
+                 workload plane's placement service into the deploy job. Set workload_mode back \
+                 to legacy to deploy it"
+                    .to_string(),
+            ),
+            Some(WorkloadPlaneDeploy { plane: None, .. }) => Some(
+                "This environment's workload_mode is enforce, but the workload plane is not \
+                 running in this process (it needs an audit logger, and starts at boot). Set \
+                 workload_mode back to legacy to deploy it"
+                    .to_string(),
+            ),
+            Some(_) => None,
+        }
+    }
+
+    /// `enforce`: place every replica with the unified scheduler, strictly
+    /// (a pin that cannot be met fails the deployment, it is never moved),
+    /// and hold the placement's reservation until the replicas started.
+    async fn enforced_placement(
+        &self,
+        image_output: &BuildImageOutput,
+        context: &WorkflowContext,
+    ) -> Result<
+        (
+            Vec<crate::services::NodeAssignment>,
+            bool,
+            temps_workload_plane::inventory::InFlightGuard,
+        ),
+        WorkflowError,
+    > {
+        if let Some(message) = self.enforce_unavailable() {
+            self.log(context, format!("ERROR: {message}")).await?;
+            return Err(WorkflowError::JobExecutionFailed(message));
+        }
+        let (Some(workload_plane), Some(plane)) = (
+            self.workload_plane.as_ref(),
+            self.workload_plane.as_ref().and_then(|w| w.plane.clone()),
+        ) else {
+            return Err(WorkflowError::JobExecutionFailed(
+                "workload plane unavailable".to_string(),
+            ));
+        };
+        let mut placement = self.workload_placement_spec().map_err(|e| {
+            WorkflowError::JobExecutionFailed(format!("Cannot schedule this deployment: {e}"))
+        })?;
+        // A node-local volume pins the replica (§8, strict): to the
+        // volume's node, or to the control plane where an uncreated volume
+        // will be created.
+        if !self.config.volume_mounts.is_empty() {
+            let pin = self.config.volume_pin.clone().unwrap_or_else(|| {
+                temps_workload_volumes::VolumePin {
+                    node_id: temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID,
+                    volumes: self
+                        .config
+                        .volume_mounts
+                        .iter()
+                        .map(|m| m.volume.clone())
+                        .collect(),
+                }
+            });
+            placement.nodes = Some(vec![pin.node_id]);
+            self.log(context, format!("Replica {pin}")).await?;
+        }
+        let image_platforms = self.available_image_platforms(image_output).await;
+        let spec = temps_workload::WorkloadSpec {
+            owner: temps_workload::WorkloadRef::new(
+                temps_workload::WorkloadKind::Deployment,
+                i64::from(context.deployment_id),
+            ),
+            artifact: temps_workload::Artifact::oci(image_output.image_tag.clone()),
+            isolation: self.config.workload_isolation,
+            process: Default::default(),
+            env: Default::default(),
+            resources: workload_resources(&self.config.resources),
+            volumes: Vec::new(),
+            ports: Vec::new(),
+            network: Default::default(),
+            probes: Default::default(),
+            placement,
+            lifetime: temps_workload::Lifetime::LongRunning {
+                restart: temps_workload::RestartPolicy::UnlessStopped,
+            },
+            security: None,
+            labels: Default::default(),
+        };
+        let hints = temps_workload_plane::inventory::PlacementHints {
+            project_slug: self.config.project_slug.clone(),
+            image_platforms,
+            exclude_node_ids: self.config.exclude_node_ids.clone(),
+            affinity_nodes: Vec::new(),
+            exclude_control_plane: false,
+        };
+        self.log(
+            context,
+            format!(
+                "Placing replicas with the unified scheduler (workload_mode: enforce, \
+                 isolation: {})",
+                temps_workload_plane::scheduler::isolation_name(self.config.workload_isolation)
+            ),
+        )
+        .await?;
+        let name = format!("deployment-{}", context.deployment_id);
+        let (placed, guard) = match plane.schedule(&name, &spec, &hints).await {
+            Ok(placed) => placed,
+            Err(e) => {
+                let message = format!("Cannot schedule this deployment: {e}");
+                self.log(context, format!("ERROR: {message}")).await?;
+                return Err(WorkflowError::JobExecutionFailed(message));
+            }
+        };
+        for exclusion in &placed.exclusions {
+            let line = if exclusion.excluded {
+                format!("Skipping {exclusion}")
+            } else {
+                format!("WARNING: {exclusion}")
+            };
+            self.log(context, line).await?;
+        }
+        for warning in &placed.warnings {
+            self.log(context, format!("WARNING: {warning}")).await?;
+        }
+        let assignments = workload_plane
+            .placement
+            .assignments_for(&placed.nodes)
+            .await
+            .map_err(|e| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cannot map the unified placement {:?} onto nodes: {e}",
+                    placed.nodes
+                ))
+            })?;
+        for (i, assignment) in assignments.iter().enumerate() {
+            let line = match assignment {
+                crate::services::NodeAssignment::Local => {
+                    format!("Replica {} scheduled on local node", i + 1)
+                }
+                crate::services::NodeAssignment::Remote {
+                    node_name, node_id, ..
+                } => format!(
+                    "Replica {} scheduled on node '{}' (id={})",
+                    i + 1,
+                    node_name,
+                    node_id
+                ),
+            };
+            self.log(context, line).await?;
+        }
+        Ok((assignments, placed.socket_required, guard))
+    }
+
+    /// The deployer `enforce` uses for replicas on `node_id` (`None`: the
+    /// control plane), with `node_deployer` for every operation after the
+    /// create.
+    fn plane_deployer(
+        &self,
+        context: &WorkflowContext,
+        node_deployer: Arc<dyn ContainerDeployer>,
+        node_id: Option<i32>,
+    ) -> Result<Arc<dyn ContainerDeployer>, WorkflowError> {
+        let plane = self
+            .workload_plane
+            .as_ref()
+            .and_then(|w| w.plane.clone())
+            .ok_or_else(|| {
+                WorkflowError::JobExecutionFailed(
+                    self.enforce_unavailable()
+                        .unwrap_or_else(|| "workload plane unavailable".to_string()),
+                )
+            })?;
+        let deployer = crate::services::plane_deployer::PlaneContainerDeployer::new(
+            plane,
+            node_deployer,
+            context.deployment_id,
+            Duration::from_secs(self.config.health_check_timeout_secs.max(30)),
+        )
+        .with_volumes(
+            self.config.volume_mounts.clone(),
+            crate::services::workload_volumes::environment_volume_owner(context.environment_id),
+        )
+        .with_isolation(self.config.workload_isolation);
+        Ok(Arc::new(match node_id {
+            Some(node_id) => deployer.on_node(node_id),
+            None => deployer,
+        }))
+    }
+}
+
 /// Builder for DeployImageJob
 pub struct DeployImageJobBuilder {
     job_id: Option<String>,
@@ -4766,6 +5183,7 @@ pub struct DeployImageJobBuilder {
     target: Option<DeploymentTarget>,
     config: DeploymentJobConfig,
     node_scheduler: Option<Arc<crate::services::NodeScheduler>>,
+    workload_plane: Option<WorkloadPlaneDeploy>,
     log_id: Option<String>,
     log_service: Option<Arc<LogService>>,
     external_image_tag: Option<String>,
@@ -4860,6 +5278,7 @@ impl DeployImageJobBuilder {
                 }
             },
             node_scheduler: None,
+            workload_plane: None,
             log_id: None,
             log_service: None,
             external_image_tag: None,
@@ -5054,6 +5473,35 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// The environment's ADR-055 workload mode, and what `shadow` and
+    /// `enforce` need. `legacy` ignores `workload_plane`.
+    pub fn workload_mode(
+        mut self,
+        mode: temps_entities::environment_workload_mode::EnvironmentWorkloadMode,
+        workload_plane: Option<WorkloadPlaneDeploy>,
+    ) -> Self {
+        self.config.workload_mode = mode;
+        self.workload_plane = workload_plane;
+        self
+    }
+
+    /// The environment's attached volumes (ADR-055 Phase 9).
+    pub fn volume_mounts(
+        mut self,
+        mounts: Vec<temps_workload::VolumeMount>,
+        pin: Option<temps_workload_volumes::VolumePin>,
+    ) -> Self {
+        self.config.volume_mounts = mounts;
+        self.config.volume_pin = pin;
+        self
+    }
+
+    /// The isolation `enforce` replicas request (ADR-055 Phase 10).
+    pub fn workload_isolation(mut self, isolation: temps_workload::Isolation) -> Self {
+        self.config.workload_isolation = isolation;
+        self
+    }
+
     /// Set node IDs to exclude from scheduling (rolling update awareness).
     /// These are nodes that still host containers from the previous deployment.
     pub fn exclude_node_ids(mut self, node_ids: Vec<i32>) -> Self {
@@ -5145,6 +5593,9 @@ impl DeployImageJobBuilder {
 
         if let Some(scheduler) = self.node_scheduler {
             job = job.with_node_scheduler(scheduler);
+        }
+        if let Some(workload_plane) = self.workload_plane {
+            job = job.with_workload_plane(workload_plane);
         }
         if let Some(log_id) = self.log_id {
             job = job.with_log_id(log_id);
@@ -7289,6 +7740,7 @@ mod tests {
                 dns_resolver_consecutive_failures: 0,
                 dns_resolver_last_error: None,
                 dns_resolver_record_count: None,
+                deployments_without_resolver: None,
                 build_limits: None,
                 public_ingress_enabled: false,
                 public_ingress_running: None,
@@ -7377,6 +7829,7 @@ mod tests {
                 dns_resolver_consecutive_failures: 0,
                 dns_resolver_last_error: None,
                 dns_resolver_record_count: None,
+                deployments_without_resolver: None,
                 build_limits: None,
                 public_ingress_enabled: false,
                 public_ingress_running: None,
@@ -7466,6 +7919,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -7665,6 +8119,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -7752,6 +8207,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

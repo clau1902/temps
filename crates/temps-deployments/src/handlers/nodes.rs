@@ -338,6 +338,14 @@ pub struct HeartbeatApiRequest {
     /// clears it.
     pub docker_socket_projects: Option<Vec<String>>,
     pub public_ingress: Option<PublicIngressHeartbeat>,
+    /// What the node runtime observed of the workload instances assigned to
+    /// this node (ADR-055 §7), only those that changed since its last
+    /// accepted heartbeat. Sent by agents that advertise the `state_stream`
+    /// capability; absent from older agents. A report this control plane
+    /// cannot read is dropped (and logged), never the heartbeat.
+    #[serde(default, deserialize_with = "lenient_instance_reports")]
+    #[schema(value_type = Option<Vec<Object>>)]
+    pub instances: Option<Vec<temps_workload::stream::InstanceReport>>,
     /// Software RAID and drive SMART health read by the agent
     /// (`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw
     /// JSON here and parsed after the heartbeat is recorded, so a malformed
@@ -352,6 +360,49 @@ pub struct HeartbeatApiRequest {
     /// The node's occupied IPv4 ranges (ADR 056), sent when they change.
     #[serde(default)]
     pub occupied_ranges: Option<Vec<OccupiedRangeReport>>,
+    /// Deployment ids with a container on this node created without the
+    /// node's cluster resolver, so it cannot resolve `*.temps.local` until
+    /// redeployed. Empty while cluster DNS is off; absent from older agents,
+    /// which leaves the stored value untouched.
+    #[serde(default)]
+    pub deployments_without_resolver: Option<Vec<i64>>,
+    /// The overlay address of each running Temps container on the node, sent
+    /// when the set changes. Absent from older agents.
+    #[serde(default)]
+    pub overlay_addresses: Option<Vec<OverlayAddressReport>>,
+}
+
+/// One running container's overlay address, from a heartbeat.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct OverlayAddressReport {
+    pub container_name: String,
+    pub ip: String,
+}
+
+/// Read `instances`, dropping entries this version cannot decode (a newer
+/// agent's condition kind), so a heartbeat is never refused for them.
+fn lenient_instance_reports<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<temps_workload::stream::InstanceReport>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    Ok(raw.map(|entries| {
+        entries
+            .into_iter()
+            .filter_map(|entry| match serde_json::from_value(entry) {
+                Ok(report) => Some(report),
+                Err(e) => {
+                    warn!(
+                        "dropped an instance report this control plane cannot read: {}",
+                        e
+                    );
+                    None
+                }
+            })
+            .collect()
+    }))
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -407,6 +458,13 @@ pub struct ContainerInventoryItem {
 pub struct HeartbeatResponse {
     pub status: String,
     pub message: String,
+    /// Whether the instance reports in this heartbeat (ADR-055 §7) were
+    /// recorded. `false` when it carried none, when recording them failed,
+    /// or when this process runs no node state stream: the node must keep
+    /// resending them until a heartbeat answers `true`. The heartbeat itself
+    /// still succeeds, so a failed ingest never costs the node its liveness.
+    /// Absent from older servers, which agents read as `false`.
+    pub instances_accepted: bool,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -650,6 +708,43 @@ pub struct NodeDnsStatusEntry {
     pub dns_resolver_record_count: Option<i32>,
 }
 
+/// An internal DNS name two owners publish (ADR-055 §10). The holder's
+/// records are served; the other owner's publishes are refused, and any
+/// records it had before the conflict was found stay in the zone untouched.
+/// Part of `GET /api/cluster/dns/status`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct DnsNameConflictEntry {
+    /// The contested name, normalised (lower case, no trailing dot).
+    pub fqdn: String,
+    /// Owner whose publish is refused: `environment`, `service_role`,
+    /// `service_member`, `node` or `static`.
+    pub owner_kind: String,
+    pub owner_id: i64,
+    /// Owner that holds the name.
+    pub holder_kind: String,
+    pub holder_id: i64,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+}
+
+impl From<temps_entities::dns_name_conflicts::Model> for DnsNameConflictEntry {
+    fn from(c: temps_entities::dns_name_conflicts::Model) -> Self {
+        Self {
+            fqdn: c.fqdn,
+            owner_kind: c.owner_kind,
+            owner_id: c.owner_id,
+            holder_kind: c.holder_kind,
+            holder_id: c.holder_id,
+            first_seen_at: c
+                .first_seen_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            last_seen_at: c
+                .last_seen_at
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        }
+    }
+}
+
 /// Response from `GET /api/cluster/dns/status`.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ClusterDnsStatusResponse {
@@ -663,6 +758,18 @@ pub struct ClusterDnsStatusResponse {
     /// node's resolver health.
     pub total_record_count: i64,
     pub nodes: Vec<NodeDnsStatusEntry>,
+    /// Names refused because another owner holds them. Empty on a healthy
+    /// cluster; each entry needs one side renamed or removed.
+    pub name_conflicts: Vec<DnsNameConflictEntry>,
+    /// Applications whose running containers were created without the
+    /// cluster resolver, so they cannot resolve `*.temps.local` names until
+    /// redeployed: a container's nameservers are fixed when it is created.
+    /// Empty while cluster DNS is off. Databases are not listed; they do not
+    /// look up other services by name.
+    pub deployments_without_resolver: Vec<crate::services::DeploymentWithoutResolver>,
+    /// Set when the list above could not be computed; the rest of the
+    /// response is still accurate.
+    pub deployments_without_resolver_error: Option<String>,
 }
 
 #[derive(OpenApi)]
@@ -735,7 +842,10 @@ pub struct ClusterDnsStatusResponse {
         NodePlacementReference,
         DrainStatusResponse,
         NodeDnsStatusEntry,
+        DnsNameConflictEntry,
         ClusterDnsStatusResponse,
+        crate::services::DeploymentWithoutResolver,
+        crate::services::ResolverCoverageHost,
         DockerDiskUsage,
         DockerDiskUsageCategory,
         NodeCapabilityResponse,
@@ -759,6 +869,7 @@ pub struct ClusterDnsStatusResponse {
         crate::handlers::cluster_network::ClusterNetworkChangeResponse,
         crate::handlers::cluster_network::UpdateClusterNetworkRequest,
         OccupiedRangeReport,
+        OverlayAddressReport,
         OverlayHeartbeat,
         crate::handlers::node_pairings::CreateNodePairingRequest,
         crate::handlers::node_pairings::CreateNodePairingResponse,
@@ -920,7 +1031,7 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
 }
 
 /// SHA-256 hash a token string
-fn sha256_hash(token: &str) -> String {
+pub(crate) fn sha256_hash(token: &str) -> String {
     let digest = sha2::Sha256::digest(token.as_bytes());
     hex::encode(digest)
 }
@@ -1170,7 +1281,7 @@ fn node_registration_uses_mtls(cluster_requires_mtls: bool, csr_present: bool) -
 }
 
 /// Constant-time comparison of two byte slices to prevent timing attacks on token hashes.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1226,7 +1337,7 @@ fn is_safe_api_address(addr: &str) -> bool {
 }
 
 /// Extract and verify the bearer token from request headers.
-fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Result<String, Problem> {
     let auth_header = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
@@ -1568,6 +1679,51 @@ async fn authorize_enrollment<'a>(
     }
 }
 
+/// Turn cluster DNS on now that the cluster has a worker, unless an operator
+/// has decided either way. Best-effort, like the overlay setup above: a
+/// failure is logged and the join goes on; the operator can still turn it on
+/// in Settings.
+async fn enable_cluster_dns_for_worker(
+    app_state: &NodeAppState,
+    node: &temps_entities::nodes::Model,
+    peer: std::net::SocketAddr,
+) {
+    match app_state
+        .config_service
+        .enable_cluster_dns_for_worker()
+        .await
+    {
+        Ok(false) => {}
+        Ok(true) => {
+            info!(
+                node_id = node.id,
+                node = %node.name,
+                "Turned cluster DNS on: the cluster has a worker, and no operator had set it"
+            );
+            let audit = crate::handlers::audit::ClusterDnsEnabledForWorkerAudit {
+                context: AuditContext {
+                    // No user made this change; `0` is the convention for an
+                    // actor that isn't one.
+                    user_id: 0,
+                    ip_address: Some(peer.ip().to_string()),
+                    user_agent: format!("temps-agent/node-{}", node.id),
+                },
+                node_id: node.id,
+                node_name: node.name.clone(),
+            };
+            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(node_id = node.id, "Failed to create audit log: {}", error);
+            }
+        }
+        Err(error) => warn!(
+            node_id = node.id,
+            node = %node.name,
+            %error,
+            "Could not turn cluster DNS on for the new worker; it stays off until an operator enables it in Settings"
+        ),
+    }
+}
+
 async fn register_node_inner(
     State(app_state): State<Arc<NodeAppState>>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -1847,6 +2003,7 @@ async fn register_node_inner(
         .node_service
         .remediate_overlay_allocation(node.id)
         .await;
+    enable_cluster_dns_for_worker(&app_state, &node, addr).await;
 
     Ok((
         StatusCode::CREATED,
@@ -2452,6 +2609,9 @@ async fn node_heartbeat(
     // for the architecture-change audit — without it, an operator repointing a
     // daemon and something impersonating the node produce identical records.
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    // The node state stream (ADR-055 §7). Layered onto the node routes by
+    // `temps serve`; absent elsewhere, where instance reports are ignored.
+    node_state: Option<axum::Extension<Arc<crate::services::NodeStateService>>>,
     Path(node_id): Path<i32>,
     Json(request): Json<HeartbeatApiRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -2508,6 +2668,7 @@ async fn node_heartbeat(
         occupied_ranges: request
             .occupied_ranges
             .map(|reports| occupied_ranges_from_report(Some(node_id), reports)),
+        deployments_without_resolver: request.deployments_without_resolver,
     };
 
     let architecture_change = app_state
@@ -2515,6 +2676,23 @@ async fn node_heartbeat(
         .heartbeat(node_id, heartbeat)
         .await
         .map_err(Problem::from)?;
+
+    // A Docker restart can hand the node's service containers new overlay
+    // addresses; move the records that still name the old ones. A failure is
+    // logged, not returned: the agent resends the addresses periodically.
+    if let Some(addresses) = request.overlay_addresses {
+        let observed = addresses
+            .into_iter()
+            .map(|a| (a.container_name, a.ip))
+            .collect();
+        if let Err(error) = app_state
+            .node_service
+            .follow_member_addresses(node_id, observed)
+            .await
+        {
+            warn!(node_id, %error, "could not follow the node's container overlay addresses");
+        }
+    }
 
     // Only an accepted heartbeat (valid token, known node) reaches the store.
     // Written in a background task so a slow metrics store can never delay the
@@ -2583,6 +2761,19 @@ async fn node_heartbeat(
         }
     }
 
+    // Instance reports of the node runtime: written only when they changed.
+    // A failure is the plane's to report; the response tells the node
+    // whether they were recorded, so it resends what was not on its next
+    // beat, and the heartbeat itself still succeeds.
+    let instances_accepted = ingest_instance_reports(
+        node_state
+            .as_ref()
+            .map(|axum::Extension(service)| service.as_ref()),
+        node_id,
+        request.instances.as_deref(),
+    )
+    .await;
+
     // Reconcile container state when the agent sends its inventory.
     // This happens on the first heartbeat after agent startup/reconnect.
     if let Some(containers) = request.containers {
@@ -2620,7 +2811,47 @@ async fn node_heartbeat(
     Ok(Json(HeartbeatResponse {
         status: "ok".to_string(),
         message: "Heartbeat received".to_string(),
+        instances_accepted,
     }))
+}
+
+/// Record a heartbeat's instance reports. `true` only when there were
+/// reports and every one was ingested; otherwise the node must not consider
+/// them delivered (it suppresses a report it believes delivered until it
+/// changes, so an unacknowledged loss would never be resent).
+async fn ingest_instance_reports(
+    node_state: Option<&crate::services::NodeStateService>,
+    node_id: i32,
+    reports: Option<&[temps_workload::stream::InstanceReport]>,
+) -> bool {
+    let Some(reports) = reports.filter(|reports| !reports.is_empty()) else {
+        return false;
+    };
+    let Some(node_state) = node_state else {
+        tracing::debug!(
+            node_id,
+            count = reports.len(),
+            "instance reports not recorded: no node state stream in this process"
+        );
+        return false;
+    };
+    match node_state.ingest(node_id, reports).await {
+        Ok(changed) => {
+            if changed > 0 {
+                tracing::debug!(node_id, changed, "recorded instance reports");
+            }
+            true
+        }
+        Err(e) => {
+            warn!(
+                node_id,
+                count = reports.len(),
+                "instance reports were not recorded; the node will resend them: {}",
+                e
+            );
+            false
+        }
+    }
 }
 
 /// Get decrypted S3 credentials for a backup/restore operation.
@@ -3439,6 +3670,25 @@ async fn cluster_dns_status(
         .await
         .map_err(Problem::from)?;
 
+    // Best-effort like the setting read above: a Docker or lookup failure
+    // costs this list, not the resolver health the page exists for.
+    let (deployments_without_resolver, deployments_without_resolver_error) = if cluster_dns_enabled
+    {
+        match app_state
+            .resolver_coverage
+            .deployments_without_resolver(&nodes)
+            .await
+        {
+            Ok(list) => (list, None),
+            Err(error) => {
+                warn!("{}", error);
+                (Vec::new(), Some(error.to_string()))
+            }
+        }
+    } else {
+        (Vec::new(), None)
+    };
+
     let now = chrono::Utc::now();
     let node_entries = nodes
         .into_iter()
@@ -3456,10 +3706,22 @@ async fn cluster_dns_status(
         })
         .collect();
 
+    let name_conflicts = app_state
+        .node_service
+        .dns_name_conflicts()
+        .await
+        .map_err(Problem::from)?
+        .into_iter()
+        .map(DnsNameConflictEntry::from)
+        .collect();
+
     Ok(Json(ClusterDnsStatusResponse {
         cluster_dns_enabled,
         total_record_count,
         nodes: node_entries,
+        name_conflicts,
+        deployments_without_resolver,
+        deployments_without_resolver_error,
     }))
 }
 
@@ -5081,6 +5343,19 @@ impl From<NodeError> for Problem {
                 .with_value("node_name", node_name.clone())
                 .with_value("containers_confirmed_gone", confirmed_gone)
                 .with_value("containers_unconfirmed", unremoved_count),
+            NodeError::HostsManagedServices {
+                node_id,
+                ref node_name,
+                ref services,
+            } => {
+                let services = serde_json::to_value(services).unwrap_or_default();
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Node Hosts Managed Services")
+                    .with_detail(error.to_string())
+                    .with_value("node_id", node_id)
+                    .with_value("node_name", node_name.clone())
+                    .with_value("services", services)
+            }
             NodeError::StillServing {
                 node_id,
                 ref node_name,
@@ -5782,6 +6057,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -6047,6 +6323,26 @@ mod tests {
         let json = r#"{"capacity": {"cpu_percent": 10}}"#;
         let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
         assert!(req.dns_resolver.is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_instance_reports_are_optional_and_unreadable_ones_are_dropped() {
+        let old: HeartbeatApiRequest = serde_json::from_str(r#"{"capacity": {}}"#).unwrap();
+        assert!(old.instances.is_none());
+
+        let json = r#"{
+            "capacity": {"node_capabilities": ["state_stream"]},
+            "instances": [
+                {"instance_id": 4, "phase": "running", "conditions": []},
+                {"instance_id": "not-a-number", "phase": "running"},
+                {"instance_id": 5, "phase": "failed", "exit_code": 2}
+            ]
+        }"#;
+        let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
+        let reports = req.instances.expect("instances must deserialize");
+        let ids: Vec<i64> = reports.iter().map(|r| r.instance_id).collect();
+        assert_eq!(ids, vec![4, 5]);
+        assert_eq!(reports[1].exit_code, Some(2));
     }
 
     #[test]
@@ -6987,6 +7283,115 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    fn running_report(instance_id: i64) -> temps_workload::stream::InstanceReport {
+        temps_workload::stream::InstanceReport {
+            instance_id,
+            phase: "running".to_string(),
+            exit_code: None,
+            started_at: None,
+            finished_at: None,
+            conditions: Vec::new(),
+            published_ports: Vec::new(),
+        }
+    }
+
+    struct AcceptingAudit;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for AcceptingAudit {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A node state service whose plane runs over `db`.
+    fn node_state_over(db: sea_orm::DatabaseConnection) -> crate::services::NodeStateService {
+        let service = crate::services::NodeStateService::new();
+        service.set_plane(Arc::new(temps_workload_plane::WorkloadPlane::new(
+            Arc::new(db),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("heartbeat-ack-test"),
+        )));
+        service
+    }
+
+    #[tokio::test]
+    async fn instance_reports_are_acknowledged_only_when_recorded() {
+        let reports = [running_report(4)];
+
+        // Nothing to acknowledge.
+        assert!(!ingest_instance_reports(None, 1, None).await);
+        assert!(!ingest_instance_reports(None, 1, Some(&[])).await);
+        // No node state stream in this process: not recorded.
+        assert!(!ingest_instance_reports(None, 1, Some(&reports)).await);
+        // A stream without a running plane: not recorded.
+        let without_plane = crate::services::NodeStateService::new();
+        assert!(!ingest_instance_reports(Some(&without_plane), 1, Some(&reports)).await);
+
+        // The plane fails to read the reported instances: not recorded.
+        let failing = node_state_over(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())])
+                .into_connection(),
+        );
+        assert!(!ingest_instance_reports(Some(&failing), 1, Some(&reports)).await);
+
+        // The plane reads them (none changed): recorded.
+        let recording = node_state_over(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::workload_instances::Model>::new()])
+                .into_connection(),
+        );
+        assert!(ingest_instance_reports(Some(&recording), 1, Some(&reports)).await);
+    }
+
+    #[tokio::test]
+    async fn test_heartbeat_reports_unrecorded_instances_as_not_accepted() {
+        // This app has no node state stream, so the reports cannot be
+        // recorded: the heartbeat succeeds, the reports are not acknowledged.
+        let mut node = sample_node();
+        node.token_hash = sha256_hash("test-token");
+        let updated_node = node.clone();
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![node.clone()]])
+            .append_query_results(vec![vec![node]])
+            .append_query_results(vec![vec![updated_node]])
+            .into_connection();
+
+        let app = make_app(db);
+        let body = serde_json::json!({
+            "capacity": { "cpu_percent": 50.0 },
+            "instances": [{ "instance_id": 4, "phase": "running", "conditions": [] }]
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/nodes/1/heartbeat")
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(ack["status"], "ok");
+        assert_eq!(ack["instances_accepted"], serde_json::json!(false));
     }
 
     #[tokio::test]

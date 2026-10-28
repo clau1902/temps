@@ -79,6 +79,8 @@ pub mod deployments;
 pub mod dns_instance_identity;
 pub mod dns_managed_domains;
 pub mod dns_managed_record_states;
+pub mod dns_name_claims;
+pub mod dns_name_conflicts;
 pub mod dns_providers;
 pub mod dns_reconciliation_runs;
 pub mod domain_delivery_bindings;
@@ -278,3 +280,31 @@ pub mod http_checks;
 
 pub mod env_var_history;
 pub mod secret_history;
+
+pub mod workload_events;
+pub mod workload_instances;
+pub mod workloads;
+// ADR-055 Phase 8: ingress endpoints and access policies
+pub mod control_plane_node_settings;
+pub mod ingress_access_policies;
+pub mod ingress_endpoints;
+pub mod ingress_login_grants;
+pub mod ingress_mode;
+pub mod network_policy_profiles;
+pub mod network_policy_rules;
+pub mod network_policy_state;
+pub mod node_network_policy_modes;
+// ADR-055 Phase 5: deployment workload mode and node resource settings
+pub mod environment_workload_mode;
+pub mod node_resource_settings;
+
+// ADR-055 Phase 4: databases onto the workload plane
+pub mod external_service_workload_mode;
+
+// ADR-055 Phase 9: volumes for deployments; backups as jobs
+pub mod workload_volume_attachments;
+pub mod workload_volumes;
+// ADR-055 Phase 10: functions
+pub mod functions;
+// ADR-055 Phase 10: Firecracker for deployments
+pub mod environment_workload_isolation;

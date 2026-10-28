@@ -16,6 +16,7 @@ import {
   KeyRound,
   LockKeyhole,
   Monitor,
+  Network,
   RadioTower,
   Server,
   Settings2,
@@ -135,6 +136,12 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         url: '/settings/on-demand-tls',
         icon: LockKeyhole,
         keywords: ['certificates', 'https', 'ssl', "let's encrypt", 'acme'],
+      },
+      {
+        title: 'Network Policy',
+        url: '/settings/network-policy',
+        icon: Network,
+        keywords: ['egress', 'ingress', 'firewall', 'rules', 'isolation'],
       },
       { title: 'Rate Limiting', url: '/settings/rate-limiting', icon: Monitor },
       {

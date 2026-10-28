@@ -88,6 +88,8 @@ import {
 } from '@/components/sandboxes/helpers'
 import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
+import { SandboxPreviewAccessCard } from '@/components/sandboxes/SandboxPreviewAccessCard'
+import { SandboxEgressCard } from '@/components/sandboxes/SandboxEgressCard'
 import { SandboxFilesCard } from '@/components/sandboxes/SandboxFilesCard'
 import {
   PREVIEW_ACCESS_ANCHOR,
@@ -98,6 +100,7 @@ import { terminalUnavailableReason } from '@/components/sandboxes/sandbox-termin
 import { SandboxNodeValue } from '@/components/sandboxes/SandboxNode'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isVerifiedNotFound } from '@/lib/read-failure'
+import { execFailureResult } from '@/lib/sandbox-exec'
 
 // Presentation for each timeline event type: icon, human label, and an
 // optional one-line detail derived from the event's structured payload.
@@ -380,9 +383,11 @@ export default function SandboxDetail() {
       setExecResult(result)
       invalidate()
     },
+    // Typed `Error` by the mutation, but at runtime the client throws the
+    // parsed problem body; `execFailureResult` handles either.
     onError: (err: Error) => {
       setExecDuration(null)
-      setExecResult({ exit_code: -1, stdout: '', stderr: err.message })
+      setExecResult(execFailureResult(err))
     },
   })
 
@@ -502,6 +507,9 @@ export default function SandboxDetail() {
     { tone: StatusTone; label: string }
   > = {
     running: { tone: 'ok', label: 'Running' },
+    // The create is still running: the first sandbox on a node builds its
+    // image, which can take minutes. The page refetches until it is up.
+    starting: { tone: 'idle', label: 'Starting' },
     stopped: { tone: 'warn', label: workspace ? 'Sleeping' : 'Stopped' },
     destroyed: { tone: 'error', label: 'Destroyed' },
   }
@@ -604,22 +612,6 @@ export default function SandboxDetail() {
           Substitute <code className="font-mono">{'{port}'}</code> for any port
           bound inside the sandbox. Use &ldquo;Open preview&rdquo; above to
           launch common dev-server ports directly.
-        </p>
-      </CardContent>
-    </Card>
-  ) : sandbox.node_id != null ? (
-    // Worker sandboxes get no preview URL yet (ADR-048 phase 2); say so
-    // instead of silently dropping the card.
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="text-sm font-medium">Preview URLs</CardTitle>
-      </CardHeader>
-      <CardContent>
-        <p className="text-xs text-muted-foreground">
-          Preview URLs are not available yet for sandboxes on worker nodes. This
-          sandbox runs on {sandbox.node_name}; create one with{' '}
-          <code className="font-mono">--node control-plane</code> to preview its
-          ports.
         </p>
       </CardContent>
     </Card>
@@ -1107,10 +1099,16 @@ export default function SandboxDetail() {
               running={running}
               destroyed={destroyed}
               configured={Boolean(sandbox.preview_url_template)}
-              onWorkerNode={sandbox.node_id != null}
             />
             {Boolean(sandbox.preview_url_template) && (
-              <div id={PREVIEW_ACCESS_ANCHOR} className="scroll-mt-4">
+              <div id={PREVIEW_ACCESS_ANCHOR} className="scroll-mt-4 space-y-4">
+                <SandboxPreviewAccessCard
+                  sandboxId={sandbox.id}
+                  access={sandbox.preview_access}
+                  allowedCidrs={sandbox.preview_allowed_cidrs}
+                  hasPassword={Boolean(sandbox.preview_password_hint)}
+                  disabled={destroyed}
+                />
                 <SandboxPreviewPasswordCard
                   sandboxId={sandbox.id}
                   hint={sandbox.preview_password_hint ?? undefined}
@@ -1118,6 +1116,12 @@ export default function SandboxDetail() {
                 />
               </div>
             )}
+            <SandboxEgressCard
+              sandboxId={sandbox.id}
+              policy={sandbox.egress_policy}
+              backend={sandbox.backend}
+              disabled={destroyed}
+            />
 
             <SandboxFilesCard
               sandboxId={sandbox.id}

@@ -21,6 +21,12 @@ path = "src/main.rs"
 name = "temps_cli"
 path = "src/lib.rs"
 
+[features]
+default = []
+# Embed the network policy eBPF programs (needs nightly Rust with rust-src
+# and bpf-linker at build time). Without it nodes enforce with nftables.
+ebpf = ["temps-network-policy/ebpf", "temps-agent/ebpf"]
+
 [dependencies]
 # All library crates
 temps-agent = { path = "../temps-agent" }
@@ -81,6 +87,9 @@ temps-telemetry = { path = "../temps-telemetry" }
 temps-projects = { path = "../temps-projects" }
 temps-providers = { path = "../temps-providers" }
 temps-proxy = { path = "../temps-proxy" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-activator = { path = "../temps-workload-activator" }
+temps-workload-plane = { path = "../temps-workload-plane" }
 temps-routes = { path = "../temps-routes" }
 temps-queue = { path = "../temps-queue" }
 temps-screenshots = { path = "../temps-screenshots" }
@@ -91,6 +100,7 @@ temps-project-groups = { path = "../temps-project-groups" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-webhooks = { path = "../temps-webhooks" }
 temps-wireguard = { path = "../temps-wireguard" }
+temps-network-policy = { path = "../temps-network-policy" }
 tokio-util = { workspace = true }
 
 # CLI and runtime dependencies - reference from crates workspace

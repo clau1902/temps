@@ -162,6 +162,7 @@ mod tests {
             work_dir: PathBuf::from("/workspace"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -183,6 +184,7 @@ mod tests {
             idle_timeout: Duration::from_secs(60),
             backend: None,
             owner_user_id: None,
+            egress_policy: Default::default(),
         }
     }
 

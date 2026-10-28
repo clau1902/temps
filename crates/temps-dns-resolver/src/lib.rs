@@ -25,18 +25,38 @@
 pub mod authority;
 pub mod config;
 pub mod error;
+#[cfg(feature = "sync")]
 pub mod handle;
+pub mod host_dns;
+pub mod probe;
 pub mod record;
+#[cfg(feature = "sync")]
 pub mod sync_client;
 pub mod upstream;
 pub mod zone_store;
 
-pub use authority::{RESOLVER_MARKER_NAME, RESOLVER_MARKER_VALUE};
+pub use authority::{ZoneAuthority, RESOLVER_MARKER_NAME, RESOLVER_MARKER_VALUE};
 pub use config::ResolverConfig;
 pub use error::ResolverError;
+#[cfg(feature = "sync")]
 pub use handle::{ResolverHandle, ResolverStatus};
 pub use record::{OwnerKind, RecordKind, ZoneRecord};
+#[cfg(feature = "sync")]
 pub use sync_client::{SyncClient, SyncStatus};
 pub use zone_store::ZoneStore;
 
 pub type Result<T> = std::result::Result<T, ResolverError>;
+
+/// The network policy's DNS view of one node, shared by the node's enforcer,
+/// which swaps in a new snapshot after every pass, and the node's resolver,
+/// which answers restricted workloads from it (ADR-055 §9). One per node and
+/// process: an enforcer and a resolver given different slots enforce nothing.
+pub type DnsPolicySlot = std::sync::Arc<arc_swap::ArcSwap<temps_workload_netpol::DnsPolicy>>;
+
+/// A slot answering every source as unrestricted until the enforcer's first
+/// pass stores a snapshot.
+pub fn open_dns_policy_slot() -> DnsPolicySlot {
+    std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
+        temps_workload_netpol::DnsPolicy::open(),
+    ))
+}

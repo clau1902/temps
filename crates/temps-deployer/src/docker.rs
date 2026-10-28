@@ -30,6 +30,9 @@ use tempfile::TempDir;
 use temps_core::docker_socket_grant::DockerSocketGrant;
 use temps_core::static_files::MAX_STATIC_PATH_COMPONENTS;
 use temps_core::DockerHandle;
+use temps_workload_docker::secrets::{
+    default_secrets_root, image_owner, validate_secret_dir_name, write_secrets_to_host_dir,
+};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 
@@ -963,78 +966,12 @@ fn extract_bounded_static_archive(
     process_bounded_static_archive(archive_path, Some(destination), image_name, source_path)
 }
 
-/// Extracts `nameserver` entries from resolv.conf-formatted text, excluding
-/// loopback addresses — meaningless inside a container's own network
-/// namespace, and the classic case for systemd-resolved's `127.0.0.53`
-/// stub. Pure/deterministic so it's unit-testable without touching the
-/// filesystem; see [`host_default_dns_servers`] for the I/O side.
-fn parse_non_loopback_nameservers(resolv_conf: &str) -> Vec<String> {
-    resolv_conf
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix("nameserver"))
-        .map(str::trim)
-        .filter(|ip| {
-            ip.parse::<std::net::IpAddr>()
-                .map(|addr| !addr.is_loopback())
-                .unwrap_or(false)
-        })
-        .map(str::to_string)
-        .collect()
-}
-
-/// Best-effort read of the host's own already-configured DNS servers, so
-/// they — not a hardcoded public resolver — can be appended as a fallback
-/// after the per-node Hickory resolver. Air-gapped/on-prem installs often
-/// route DNS to an internal-only server; assuming 1.1.1.1/8.8.8.8 would be
-/// unreachable there, and would leak queries externally for operators who
-/// specifically kept resolution internal.
-///
-/// Checks `/etc/resolv.conf` first. On systemd-resolved hosts that file is
-/// usually just the loopback stub (`127.0.0.53`, unreachable from inside a
-/// container's own netns), so this falls through to
-/// `/run/systemd/resolve/resolv.conf`, which systemd-resolved maintains
-/// specifically to expose the *real* upstream servers to tools — Docker's
-/// own embedded-DNS "ExtServers" detection reads the same file for the same
-/// reason.
-fn host_default_dns_servers() -> Vec<String> {
-    for path in ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"] {
-        if let Ok(contents) = std::fs::read_to_string(path) {
-            let servers = parse_non_loopback_nameservers(&contents);
-            if !servers.is_empty() {
-                return servers;
-            }
-        }
-    }
-    Vec::new()
-}
-
-/// Appends entries from `fallback_pool` to `primary`, deduplicated and
-/// capped at 3 total entries — glibc and musl both fail over to the next
-/// `nameserver` line once the current one times out, but both also ignore
-/// anything past the third line in `/etc/resolv.conf`.
-fn merge_dns_with_fallback(mut primary: Vec<String>, fallback_pool: &[String]) -> Vec<String> {
-    for fallback in fallback_pool {
-        if primary.len() >= 3 {
-            break;
-        }
-        if !primary.contains(fallback) {
-            primary.push(fallback.clone());
-        }
-    }
-    primary
-}
-
-/// Appends the host's own already-configured DNS servers (see
-/// [`host_default_dns_servers`]) to `primary`, so `temps-dns-resolver` is
-/// never a single point of failure for outbound DNS.
-///
-/// Shared by the app-container path ([`DockerRuntime::dns_for_container`])
-/// and the managed-service path (`temps_agent::service_handlers`) so
-/// neither one can silently regress into wiring the Hickory resolver as the
-/// sole nameserver.
-pub fn dns_with_fallback(primary: Vec<String>) -> Vec<String> {
-    merge_dns_with_fallback(primary, &host_default_dns_servers())
-}
+/// Appends the host's own DNS servers to the cluster resolver, so it is never
+/// a container's only nameserver. Shared by the app-container path
+/// ([`DockerRuntime::dns_for_container`]), the workload plane and managed
+/// services; lives in `temps-dns-resolver` next to the resolver's own
+/// upstream selection.
+pub use temps_dns_resolver::host_dns::dns_with_fallback;
 
 /// The one bind a project granted host Docker access receives, or `None`.
 ///
@@ -1087,22 +1024,14 @@ pub fn hardened_host_config(
     secrets_bind: Option<String>,
     docker_socket_bind: Option<&str>,
 ) -> bollard::models::HostConfig {
-    let binds: Vec<String> = secrets_bind
-        .into_iter()
-        .chain(docker_socket_bind.map(str::to_string))
-        .collect();
-    bollard::models::HostConfig {
-        // Security hardening: drop all Linux capabilities by default
-        cap_drop: Some(vec!["ALL".to_string()]),
-        // Security hardening: prevent privilege escalation via setuid/setgid
-        security_opt: Some(vec!["no-new-privileges:true".to_string()]),
-        // Security hardening: limit number of processes to prevent fork bombs
-        pids_limit: Some(512),
-        // Security hardening: use init process for proper signal handling and zombie reaping
-        init: Some(true),
-        binds: (!binds.is_empty()).then_some(binds),
-        ..Default::default()
-    }
+    // ADR-055 phase 1: the hardening lives with the Docker driver, which
+    // every workload container is created through.
+    temps_workload_docker::hardened_host_config(
+        secrets_bind
+            .into_iter()
+            .chain(docker_socket_bind.map(str::to_string))
+            .collect(),
+    )
 }
 
 /// Host address published container ports bind to, shared with whoever may
@@ -1887,37 +1816,7 @@ impl DockerRuntime {
             // defaults to root; the actual deploy runs on a worker node.
             return (0, 0);
         };
-        let inspect = match docker.inspect_image(image_name).await {
-            Ok(i) => i,
-            Err(e) => {
-                warn!(
-                    "Failed to inspect image '{}' for secrets chown; defaulting to root: {}",
-                    image_name, e
-                );
-                return (0, 0);
-            }
-        };
-
-        let user_spec = inspect
-            .config
-            .as_ref()
-            .and_then(|c| c.user.as_ref())
-            .map(|u| u.as_str())
-            .unwrap_or("");
-
-        match parse_numeric_user_spec(user_spec) {
-            Some(pair) => pair,
-            None => {
-                warn!(
-                    "Image '{}' declares USER='{}' which is not numeric; \
-                     secrets will be owned by root and may be unreadable. \
-                     Use numeric UIDs (e.g. USER 1000:1000) for secrets \
-                     to work with this image.",
-                    image_name, user_spec
-                );
-                (0, 0)
-            }
-        }
+        image_owner(&docker, image_name).await
     }
 
     /// Construct with a concrete Docker client.
@@ -3111,14 +3010,12 @@ impl DockerRuntime {
         }
     }
 
-    fn map_restart_policy(policy: &crate::RestartPolicy) -> bollard::models::RestartPolicyNameEnum {
+    fn workload_restart_policy(policy: &crate::RestartPolicy) -> temps_workload::RestartPolicy {
         match policy {
-            crate::RestartPolicy::Never => bollard::models::RestartPolicyNameEnum::NO,
-            crate::RestartPolicy::Always => bollard::models::RestartPolicyNameEnum::ALWAYS,
-            crate::RestartPolicy::OnFailure => bollard::models::RestartPolicyNameEnum::ON_FAILURE,
-            crate::RestartPolicy::UnlessStopped => {
-                bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED
-            }
+            crate::RestartPolicy::Never => temps_workload::RestartPolicy::Never,
+            crate::RestartPolicy::Always => temps_workload::RestartPolicy::Always,
+            crate::RestartPolicy::OnFailure => temps_workload::RestartPolicy::OnFailure,
+            crate::RestartPolicy::UnlessStopped => temps_workload::RestartPolicy::UnlessStopped,
         }
     }
 
@@ -4223,24 +4120,26 @@ impl ContainerDeployer for DockerRuntime {
             }
         }
 
-        // Create port bindings
-        let mut port_bindings = HashMap::new();
-        let mut exposed_ports = Vec::new();
-
-        for port_mapping in &request.port_mappings {
-            let container_port_key =
-                format!("{}/{}", port_mapping.container_port, port_mapping.protocol);
-            let host_port_binding = self.host_port_binding(port_mapping);
-
-            port_bindings.insert(container_port_key.clone(), Some(vec![host_port_binding]));
-            exposed_ports.push(container_port_key);
-        }
-
-        // Create host config with log rotation to prevent unbounded disk growth
-        let log_config = request
-            .log_config
-            .as_ref()
-            .map(|lc| lc.to_bollard_log_config());
+        // ADR-055 phase 1: the request is built by the Docker driver from an
+        // instance spec. The golden captures in
+        // `tests/golden_container_create.rs` pin it to the request this
+        // function built by hand before.
+        let ports: Vec<temps_workload::PortBinding> = request
+            .port_mappings
+            .iter()
+            .map(|port_mapping| {
+                let binding = self.host_port_binding(port_mapping);
+                temps_workload::PortBinding {
+                    container_port: port_mapping.container_port,
+                    protocol: match port_mapping.protocol {
+                        crate::Protocol::Tcp => temps_workload::PortProtocol::Tcp,
+                        crate::Protocol::Udp => temps_workload::PortProtocol::Udp,
+                    },
+                    host_ip: binding.host_ip.unwrap_or_default(),
+                    host_port: binding.host_port.and_then(|p| p.parse().ok()),
+                }
+            })
+            .collect();
 
         // When secrets are present, materialize them as files in a per-container
         // host directory (mode 0700) and bind-mount that directory into the
@@ -4308,85 +4207,91 @@ impl ContainerDeployer for DockerRuntime {
             );
         }
 
-        let host_config = bollard::models::HostConfig {
-            port_bindings: Some(port_bindings),
-            network_mode: Some(self.network_name.clone()),
-            dns: dns_for_container,
-            restart_policy: Some(bollard::models::RestartPolicy {
-                name: Some(Self::map_restart_policy(&request.restart_policy)),
+        // A limit of 0 is the explicit "uncapped" sentinel: leave Docker's
+        // memory cap unset so the container runs unlimited. Swap is capped at
+        // the memory limit so the advertised hard cap is real (Docker would
+        // otherwise let a "512 MB" app reach ~1 GiB of memory+swap).
+        let memory_bytes = request
+            .resource_limits
+            .memory_limit_mb
+            .filter(|&mb| mb > 0)
+            .map(|mb| mb as i64 * 1024 * 1024);
+        let spec = temps_workload::InstanceSpec {
+            owner: temps_workload::WorkloadRef::new(temps_workload::WorkloadKind::Deployment, 0),
+            name: request.container_name.clone(),
+            image: request.image_name.clone(),
+            platform: None,
+            env: request
+                .environment_vars
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            // Delivered through `secrets_bind`, prepared above.
+            secret_files: Vec::new(),
+            command: request.command.clone(),
+            entrypoint: None,
+            workdir: None,
+            user: None,
+            ports,
+            restart: Self::workload_restart_policy(&request.restart_policy),
+            limits: temps_workload::InstanceLimits {
+                nano_cpus: request
+                    .resource_limits
+                    .cpu_limit
+                    .map(|cores| (cores * 1_000_000_000.0) as i64),
+                memory_bytes,
+                memory_swap_bytes: memory_bytes,
+                pids: None,
+                disk_mb: None,
+            },
+            log_rotation: request
+                .log_config
+                .as_ref()
+                .map(|lc| temps_workload::LogRotation {
+                    max_size: lc.max_size.clone(),
+                    max_file: lc.max_file,
+                }),
+            // Used by the log aggregator for container discovery.
+            labels: request
+                .labels
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            security: if docker_socket_bind.is_some() {
+                temps_workload::SecurityProfile::HostPrivileged
+            } else {
+                temps_workload::SecurityProfile::Trusted
+            },
+        };
+        let attachments = temps_workload::Attachments {
+            network: temps_workload::NetworkAttachment {
+                primary: Some(self.network_name.clone()),
+                dns: dns_for_container,
                 ..Default::default()
-            }),
-            // A limit of 0 is the explicit "uncapped" sentinel → leave Docker's
-            // memory cap unset (None) so the container runs unlimited.
-            memory: request
-                .resource_limits
-                .memory_limit_mb
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb as i64 * 1024 * 1024),
-            // Cap swap at the memory limit so the advertised hard cap is real.
-            // Docker lets a container use swap up to its memory limit when
-            // memory_swap is left unset, which would let a "512 MB" app reach
-            // ~1 GiB of memory+swap.
-            // Setting memory_swap == memory disables swap for the container.
-            memory_swap: request
-                .resource_limits
-                .memory_limit_mb
-                .filter(|&mb| mb > 0)
-                .map(|mb| mb as i64 * 1024 * 1024),
-            nano_cpus: request
-                .resource_limits
-                .cpu_limit
-                .map(|cores| (cores * 1_000_000_000.0) as i64),
-            log_config,
-            // Capability drops, no-new-privileges, the PID limit, the init
-            // process and every bind (secrets, plus the ADR-045 Docker socket
-            // when this host grants it) come from one pure helper so the
-            // hardening cannot drift between call sites or be weakened by
-            // adding a mount.
-            ..hardened_host_config(secrets_bind, docker_socket_bind)
+            },
+            volumes: Vec::new(),
         };
-
-        // Build container labels (used by log aggregator for container discovery)
-        let container_labels = if request.labels.is_empty() {
-            None
-        } else {
-            Some(request.labels.clone())
-        };
-
-        // Create container config
-        let container_config = bollard::models::ContainerCreateBody {
-            image: Some(request.image_name.clone()),
-            env: Some(
-                request
-                    .environment_vars
-                    .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
-                    .collect(),
-            ),
-            exposed_ports: Some(exposed_ports),
-            host_config: Some(host_config),
-            cmd: request.command.clone(),
-            labels: container_labels,
-            ..Default::default()
-        };
+        // Secrets first, then the socket: binds are collected, never
+        // assigned, so neither can drop the other.
+        let binds: Vec<String> = secrets_bind
+            .into_iter()
+            .chain(docker_socket_bind.map(str::to_string))
+            .collect();
 
         // Create container — require the daemon here (as late as possible).
         // If Docker is unavailable, ensure_network_exists() above already
         // returned DockerUnavailable; this call is the guard for paths that
         // skip network creation (e.g. when it already exists).
         let docker = self.require_docker()?;
-        let container = docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&request.container_name)
-                        .build(),
-                ),
-                container_config,
-            )
+        let container = temps_workload_docker::DockerDriver::new(docker.as_ref().clone())
+            .create_with_binds(&spec, &attachments, binds)
             .await
             .map_err(|e| {
-                DeployerError::DeploymentFailed(format!("Failed to create container: {}", e))
+                let reason = match e {
+                    temps_workload::DriverError::Runtime { reason, .. } => reason,
+                    other => other.to_string(),
+                };
+                DeployerError::DeploymentFailed(format!("Failed to create container: {}", reason))
             })?;
 
         // Write the host-owned receipt before the candidate can be assigned a
@@ -4909,261 +4814,6 @@ impl ContainerRuntime for DockerRuntime {
             available_disk_mb: 0, // Docker doesn't easily expose this
         })
     }
-}
-
-/// Resolve the persistent root directory for materialized secret files.
-///
-/// Order of preference, mirroring the rest of the codebase
-/// (`temps-sandbox`, agent session storage):
-///   1. `$TEMPS_DATA_DIR/secrets`
-///   2. `$HOME/.temps/secrets`
-///   3. `./.temps/secrets` (last-resort fallback for headless container
-///      runtimes where neither env var is set)
-///
-/// Crucially, NONE of these resolve to `std::env::temp_dir()`. On most
-/// Linux distros `/tmp` is mounted as tmpfs and wiped at boot, which
-/// caused container `/run/secrets` mounts to point at empty/missing
-/// directories after a host reboot and forced a redeploy.
-fn default_secrets_root() -> PathBuf {
-    let base = std::env::var("TEMPS_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(".temps")
-        });
-    base.join("secrets")
-}
-
-fn validate_secret_dir_name(name: &str) -> std::io::Result<()> {
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name.contains('/')
-        || name.contains('\\')
-        || name.contains('\0')
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "invalid container name '{}': must be a single path component",
-                name
-            ),
-        ));
-    }
-
-    Ok(())
-}
-
-/// Writes secrets as files into a per-container host directory for Docker
-/// to bind-mount into `/run/secrets`. The directory is created (or recreated)
-/// fresh on each call so stale entries from a previous deployment of the same
-/// container name don't leak through. Directory mode 0700, file mode 0400.
-///
-/// When `owner` is provided, the directory and every file inside are
-/// `chown`ed to that (uid, gid). Combined with 0700/0400 this means only
-/// that UID inside the container can read the secrets — matching the
-/// image's declared `USER` so distroless/nonroot images work without
-/// world-readable files.
-///
-/// Rejects keys that would escape the directory (path separators, `.`, `..`)
-/// to defend against a maliciously-crafted secret name.
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn write_secrets_to_host_dir(
-    dir: &Path,
-    secrets: &HashMap<String, String>,
-    owner: Option<(u32, u32)>,
-) -> std::io::Result<()> {
-    use std::fs;
-    use std::io::Write;
-
-    // Ensure the parent (secrets root) exists. The runtime's `new()` already
-    // best-effort creates it, but a hostile chmod or fresh install between
-    // restarts could have left it missing — recreate so we don't fail with
-    // ENOENT. We deliberately do NOT chmod the parent here: that's the
-    // runtime's job, and on shared hosts the parent may be intentionally
-    // owned by a different user.
-    if let Some(parent) = dir.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
-    // Recreate fresh — wipes any stale files from a previous container with
-    // the same name (rolling deploys, retries after failure, etc.).
-    //
-    // After a host reboot we may inherit a leaf directory whose contents
-    // were chowned to the previous container's USER (e.g. nonroot uid
-    // 65532) while the parent is owned by the temps user. `remove_dir_all`
-    // on such a tree fails with EACCES because we can't unlink files we
-    // don't own inside a directory we *do* own (sticky-bit semantics on
-    // some filesystems). Reset the leaf's perms to 0700 owned-by-us first
-    // so the recursive remove can succeed.
-    if dir.exists() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            // Best-effort: if this chmod fails (we don't own the dir), the
-            // remove below will still surface the real error.
-            let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
-        }
-        if let Err(e) = fs::remove_dir_all(dir) {
-            // If the leaf itself is owned by another uid (e.g. previous
-            // container's USER) and we can't traverse into it, fall back
-            // to renaming it aside so the deploy can proceed. The orphan
-            // is logged for operator cleanup; it's not in /tmp anymore so
-            // it won't auto-vanish on reboot, but it's also not blocking
-            // the deploy.
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                let orphan = dir.with_extension(format!(
-                    "orphan-{}",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                ));
-                fs::rename(dir, &orphan).map_err(|rename_err| {
-                    std::io::Error::new(
-                        rename_err.kind(),
-                        format!(
-                            "failed to clear stale secrets dir {} \
-                             (rename to {} also failed: {}; original error: {})",
-                            dir.display(),
-                            orphan.display(),
-                            rename_err,
-                            e
-                        ),
-                    )
-                })?;
-                warn!(
-                    "Renamed unowned stale secrets dir to {} so deploy could proceed; \
-                     please remove manually",
-                    orphan.display()
-                );
-            } else {
-                return Err(e);
-            }
-        }
-    }
-    fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
-    }
-
-    for (key, value) in secrets {
-        // Keys must be plain identifiers — defense-in-depth even though
-        // SecretService::validate_secret_key already enforces this.
-        if key.is_empty()
-            || key == "."
-            || key == ".."
-            || key.contains('/')
-            || key.contains('\\')
-            || key.contains('\0')
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "invalid secret key '{}': contains path-separator characters",
-                    key
-                ),
-            ));
-        }
-        let path = dir.join(key);
-        let mut f = fs::File::create(&path)?;
-        f.write_all(value.as_bytes())?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
-        }
-    }
-
-    // Chown after files are written so we don't have to re-chown on every
-    // write. Dir chown happens last so we still have permission to create
-    // files in it while writing (when running as non-root, chown-to-self
-    // is a no-op; when running as root we own it either way).
-    //
-    // chown(2) requires root on every sensible OS, or chown-to-self. When
-    // Temps itself runs unprivileged (local macOS dev is the common case)
-    // and the image runs as a non-root uid like 1000, the chown will fail
-    // with EPERM. Rather than breaking the deploy, fall back to
-    // world-readable permissions (0755 dir, 0444 files) so the container
-    // can read its secrets. The container still has `cap_drop: ALL` and
-    // `no-new-privileges`, and the bind mount is read-only — the trust
-    // boundary is still the container itself.
-    #[cfg(unix)]
-    if let Some((uid, gid)) = owner {
-        use std::os::unix::fs::{chown, PermissionsExt};
-
-        let chown_result: std::io::Result<()> = (|| {
-            for key in secrets.keys() {
-                chown(dir.join(key), Some(uid), Some(gid))?;
-            }
-            chown(dir, Some(uid), Some(gid))?;
-            Ok(())
-        })();
-
-        if let Err(e) = chown_result {
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                warn!(
-                    "chown of secrets dir {} to {}:{} denied (Temps is not root); \
-                     falling back to world-readable mode so nonroot containers can read. \
-                     Run Temps as root for strict per-uid ownership.",
-                    dir.display(),
-                    uid,
-                    gid
-                );
-                // World-readable fallback. Parent dir already restricts
-                // access on the host side (only the Temps user can traverse
-                // into the secrets root under $TEMPS_DATA_DIR/secrets);
-                // these bits are what the container sees.
-                fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
-                for key in secrets.keys() {
-                    fs::set_permissions(dir.join(key), fs::Permissions::from_mode(0o444))?;
-                }
-            } else {
-                return Err(e);
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Parses a Docker image `USER` spec into a numeric `(uid, gid)` pair.
-///
-/// Handles the forms Docker accepts in a Dockerfile `USER` directive and
-/// in `Config.User`: `""` (root), `"0"`, `"1000"`, `"1000:1000"`,
-/// `"1000:gname"`, `":1000"`. Named users/groups cannot be resolved
-/// without consulting the image's `/etc/passwd` — those return `None`
-/// so the caller can decide whether to look them up or fall back.
-///
-/// When only a uid is given, gid defaults to the same value (matches
-/// Docker's behavior: `USER 1000` runs as uid=1000, gid=1000).
-fn parse_numeric_user_spec(spec: &str) -> Option<(u32, u32)> {
-    let spec = spec.trim();
-    if spec.is_empty() || spec == "root" {
-        return Some((0, 0));
-    }
-
-    let (user_part, group_part) = match spec.split_once(':') {
-        Some((u, g)) => (u, Some(g)),
-        None => (spec, None),
-    };
-
-    let uid = if user_part.is_empty() {
-        0
-    } else {
-        user_part.parse::<u32>().ok()?
-    };
-
-    let gid = match group_part {
-        Some(g) if !g.is_empty() => g.parse::<u32>().ok()?,
-        _ => uid,
-    };
-
-    Some((uid, gid))
 }
 
 #[cfg(test)]
@@ -6096,75 +5746,6 @@ mod docker_tests {
         assert!(dns.len() <= 3);
     }
 
-    // --- parse_non_loopback_nameservers: pure parsing, deterministic ---
-
-    #[test]
-    fn test_parse_non_loopback_nameservers_skips_systemd_resolved_stub() {
-        let resolv_conf = "nameserver 127.0.0.53\noptions edns0 trust-ad\n";
-        assert!(parse_non_loopback_nameservers(resolv_conf).is_empty());
-    }
-
-    #[test]
-    fn test_parse_non_loopback_nameservers_keeps_real_servers() {
-        let resolv_conf = "nameserver 10.0.0.53\nnameserver 8.8.8.8\nsearch example.com\n";
-        assert_eq!(
-            parse_non_loopback_nameservers(resolv_conf),
-            vec!["10.0.0.53", "8.8.8.8"]
-        );
-    }
-
-    #[test]
-    fn test_parse_non_loopback_nameservers_skips_ipv6_loopback_and_malformed() {
-        let resolv_conf = "nameserver ::1\nnameserver not-an-ip\nnameserver 2001:4860:4860::8888\n";
-        assert_eq!(
-            parse_non_loopback_nameservers(resolv_conf),
-            vec!["2001:4860:4860::8888"]
-        );
-    }
-
-    // --- merge_dns_with_fallback: pure merge, deterministic ---
-
-    #[test]
-    fn test_merge_dns_with_fallback_appends_pool_after_primary() {
-        let merged = merge_dns_with_fallback(
-            vec!["172.18.0.1".to_string()],
-            &["10.0.0.53".to_string(), "10.0.0.54".to_string()],
-        );
-        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53", "10.0.0.54"]);
-    }
-
-    #[test]
-    fn test_merge_dns_with_fallback_caps_at_three() {
-        let merged = merge_dns_with_fallback(
-            vec!["172.18.0.1".to_string()],
-            &[
-                "10.0.0.53".to_string(),
-                "10.0.0.54".to_string(),
-                "10.0.0.55".to_string(),
-            ],
-        );
-        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53", "10.0.0.54"]);
-    }
-
-    #[test]
-    fn test_merge_dns_with_fallback_dedupes_against_primary() {
-        // Primary already equals the host's configured server (single-host
-        // setup where the resolver IP happens to match) — must not repeat it.
-        let merged = merge_dns_with_fallback(
-            vec!["172.18.0.1".to_string(), "10.0.0.53".to_string()],
-            &["10.0.0.53".to_string()],
-        );
-        assert_eq!(merged, vec!["172.18.0.1", "10.0.0.53"]);
-    }
-
-    #[test]
-    fn test_merge_dns_with_fallback_empty_pool_leaves_primary_untouched() {
-        // Host default DNS undiscoverable (e.g. no readable resolv.conf) —
-        // must not panic or invent servers, just keep the primary resolver.
-        let merged = merge_dns_with_fallback(vec!["172.18.0.1".to_string()], &[]);
-        assert_eq!(merged, vec!["172.18.0.1"]);
-    }
-
     /// Runs `cmd` inside `container_id` and returns combined stdout+stderr,
     /// bounded so a hung DNS query (the exact failure mode this crate
     /// exists to prevent) can't hang the test suite.
@@ -6209,7 +5790,7 @@ mod docker_tests {
     /// against the local Docker daemon — no mocks — because the bug lived
     /// in what Docker actually writes to `/etc/resolv.conf`, not in our
     /// in-memory list-building logic (already covered by the pure
-    /// `dns_for_container` / `merge_dns_with_fallback` tests above).
+    /// `dns_for_container` tests above and `temps_dns_resolver::host_dns`).
     /// The worker side of static extraction: a path is streamed out of a
     /// local image as a container-archive tar the control plane can unpack.
     #[tokio::test]
@@ -6370,243 +5951,6 @@ mod docker_tests {
             labels: HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
-        }
-    }
-
-    #[test]
-    fn test_write_secrets_to_host_dir_creates_files_with_correct_perms() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("c1");
-
-        let mut secrets = HashMap::new();
-        secrets.insert("DB_PASSWORD".to_string(), "s3cret".to_string());
-        secrets.insert("API_KEY".to_string(), "abc\ndef".to_string());
-
-        write_secrets_to_host_dir(&dir, &secrets, None).expect("write");
-
-        let db = std::fs::read_to_string(dir.join("DB_PASSWORD")).unwrap();
-        assert_eq!(db, "s3cret");
-        let api = std::fs::read_to_string(dir.join("API_KEY")).unwrap();
-        assert_eq!(api, "abc\ndef");
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(dir_mode, 0o700);
-            let file_mode = std::fs::metadata(dir.join("DB_PASSWORD"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(file_mode, 0o400);
-        }
-    }
-
-    #[test]
-    fn test_write_secrets_to_host_dir_overwrites_stale_dir() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("c2");
-
-        let mut first = HashMap::new();
-        first.insert("OLD".to_string(), "old".to_string());
-        write_secrets_to_host_dir(&dir, &first, None).unwrap();
-        assert!(dir.join("OLD").exists());
-
-        let mut second = HashMap::new();
-        second.insert("NEW".to_string(), "new".to_string());
-        write_secrets_to_host_dir(&dir, &second, None).unwrap();
-        // Stale file from first call must be gone
-        assert!(!dir.join("OLD").exists());
-        assert!(dir.join("NEW").exists());
-    }
-
-    #[test]
-    fn test_default_secrets_root_uses_temps_data_dir() {
-        // Smoke test the env precedence. We can't unset HOME without
-        // breaking other tests, so verify TEMPS_DATA_DIR wins when set.
-        let tmp = TempDir::new().unwrap();
-        let prev = std::env::var("TEMPS_DATA_DIR").ok();
-        std::env::set_var("TEMPS_DATA_DIR", tmp.path());
-        let root = default_secrets_root();
-        assert_eq!(root, tmp.path().join("secrets"));
-        // Critically, this must NOT live under /tmp (unless TEMPS_DATA_DIR
-        // points there explicitly) — that was the bug we just fixed.
-        match prev {
-            Some(v) => std::env::set_var("TEMPS_DATA_DIR", v),
-            None => std::env::remove_var("TEMPS_DATA_DIR"),
-        }
-    }
-
-    #[test]
-    fn test_default_secrets_root_is_persistent_path() {
-        // Without TEMPS_DATA_DIR, the resolved root must live under
-        // $HOME/.temps/secrets — i.e. NOT under std::env::temp_dir(),
-        // which is tmpfs on most Linux distros and was the source of
-        // the post-reboot redeploy regression.
-        let prev_data = std::env::var("TEMPS_DATA_DIR").ok();
-        std::env::remove_var("TEMPS_DATA_DIR");
-        let root = default_secrets_root();
-        assert!(
-            !root.starts_with(std::env::temp_dir()),
-            "secrets root unexpectedly resolved to a tmpfs path: {}",
-            root.display()
-        );
-        if let Some(v) = prev_data {
-            std::env::set_var("TEMPS_DATA_DIR", v);
-        }
-    }
-
-    #[test]
-    fn test_validate_secret_dir_name_rejects_path_traversal_components() {
-        for bad in [
-            "",
-            ".",
-            "..",
-            "../escaped/deployment-1",
-            "a/b",
-            "a\\b",
-            "with\0null",
-        ] {
-            let err = validate_secret_dir_name(bad).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "name={}", bad);
-        }
-
-        validate_secret_dir_name("project-1").unwrap();
-    }
-
-    #[test]
-    fn test_write_secrets_to_host_dir_rejects_path_traversal() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("c3");
-
-        for bad in ["..", ".", "../escape", "a/b", "a\\b", "with\0null"] {
-            let mut secrets = HashMap::new();
-            secrets.insert(bad.to_string(), "v".to_string());
-            let err = write_secrets_to_host_dir(&dir, &secrets, None).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "key={}", bad);
-        }
-    }
-
-    #[test]
-    fn test_write_secrets_to_host_dir_empty_creates_empty_dir() {
-        let tmp = TempDir::new().unwrap();
-        let dir = tmp.path().join("c4");
-        let secrets: HashMap<String, String> = HashMap::new();
-        write_secrets_to_host_dir(&dir, &secrets, None).unwrap();
-        assert!(dir.exists());
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn test_parse_numeric_user_spec() {
-        // Empty / root → (0, 0)
-        assert_eq!(parse_numeric_user_spec(""), Some((0, 0)));
-        assert_eq!(parse_numeric_user_spec("  "), Some((0, 0)));
-        assert_eq!(parse_numeric_user_spec("root"), Some((0, 0)));
-        assert_eq!(parse_numeric_user_spec("0"), Some((0, 0)));
-
-        // Uid only → gid defaults to uid (Docker's behavior)
-        assert_eq!(parse_numeric_user_spec("1000"), Some((1000, 1000)));
-        assert_eq!(parse_numeric_user_spec("65532"), Some((65532, 65532)));
-
-        // uid:gid
-        assert_eq!(parse_numeric_user_spec("1000:2000"), Some((1000, 2000)));
-        assert_eq!(parse_numeric_user_spec("65532:65532"), Some((65532, 65532)));
-
-        // :gid (uid defaults to 0 — matches Docker)
-        assert_eq!(parse_numeric_user_spec(":1000"), Some((0, 1000)));
-
-        // uid: (trailing colon → gid falls back to uid)
-        assert_eq!(parse_numeric_user_spec("1000:"), Some((1000, 1000)));
-
-        // Named users/groups are not numeric — caller falls back
-        assert_eq!(parse_numeric_user_spec("node"), None);
-        assert_eq!(parse_numeric_user_spec("node:node"), None);
-        assert_eq!(parse_numeric_user_spec("1000:node"), None);
-        assert_eq!(parse_numeric_user_spec("node:1000"), None);
-
-        // Malformed
-        assert_eq!(parse_numeric_user_spec("abc"), None);
-        assert_eq!(parse_numeric_user_spec("-1"), None);
-        assert_eq!(parse_numeric_user_spec("1:2:3"), None);
-    }
-
-    #[test]
-    fn test_write_secrets_to_host_dir_chown_to_self_is_noop() {
-        // chown(2) only succeeds when chown-ing to yourself (unless root).
-        // We verify the happy path by chown-ing to our own uid/gid: the
-        // function must succeed and leave the mode bits intact. This guards
-        // against the chown being accidentally reordered before the file
-        // writes (which would fail) or changing the permission bits.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            use std::os::unix::fs::PermissionsExt;
-
-            let tmp = TempDir::new().unwrap();
-            let dir = tmp.path().join("c5");
-
-            let mut secrets = HashMap::new();
-            secrets.insert("DB_PASSWORD".to_string(), "s3cret".to_string());
-
-            let my_uid = std::fs::metadata(tmp.path()).unwrap().uid();
-            let my_gid = std::fs::metadata(tmp.path()).unwrap().gid();
-
-            write_secrets_to_host_dir(&dir, &secrets, Some((my_uid, my_gid))).unwrap();
-
-            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(dir_mode, 0o700);
-            let file_mode = std::fs::metadata(dir.join("DB_PASSWORD"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(file_mode, 0o400);
-        }
-    }
-
-    #[test]
-    fn test_write_secrets_to_host_dir_falls_back_to_world_readable_on_eperm() {
-        // When Temps runs unprivileged and is asked to chown to a uid that
-        // isn't its own, chown returns EPERM. The function must not fail
-        // the deploy — it must downgrade permissions so the container can
-        // still read its secrets. Only runs as non-root (skipped under sudo).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            use std::os::unix::fs::PermissionsExt;
-
-            let tmp = TempDir::new().unwrap();
-            let my_uid = std::fs::metadata(tmp.path()).unwrap().uid();
-            if my_uid == 0 {
-                eprintln!("running as root; skipping EPERM fallback test");
-                return;
-            }
-
-            let dir = tmp.path().join("c6");
-            let mut secrets = HashMap::new();
-            secrets.insert("DB_PASSWORD".to_string(), "s3cret".to_string());
-
-            // Ask for a uid/gid we definitely don't own — forces EPERM.
-            write_secrets_to_host_dir(&dir, &secrets, Some((65532, 65532)))
-                .expect("fallback must succeed, not error");
-
-            let dir_mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
-            assert_eq!(dir_mode, 0o755, "dir must be world-traversable on fallback");
-
-            let file_mode = std::fs::metadata(dir.join("DB_PASSWORD"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(file_mode, 0o444, "file must be world-readable on fallback");
-
-            // Content still intact.
-            assert_eq!(
-                std::fs::read_to_string(dir.join("DB_PASSWORD")).unwrap(),
-                "s3cret"
-            );
         }
     }
 

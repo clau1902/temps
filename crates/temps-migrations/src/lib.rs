@@ -20,6 +20,22 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
 };
 pub use migration::Migrator;
 
+pub use migration::m20261022_000001_dns_name_claims::{
+    backfill_sql as dns_name_claims_backfill_sql, Migration as DnsNameClaimsMigration,
+};
+
+pub use migration::m20261022_000002_workloads::{
+    Migration as WorkloadsMigration, WORKLOAD_TABLES_SQL,
+};
+
+pub use migration::m20261022_000003_node_state_changes::{
+    Migration as NodeStateChangesMigration, NODE_STATE_DNS_SQL, NODE_STATE_TABLES_SQL,
+};
+
+pub use migration::m20261023_000009_workload_instance_ports::{
+    Migration as WorkloadInstancePortsMigration, UP_SQL as WORKLOAD_INSTANCE_PORTS_SQL,
+};
+
 pub use migration::m20260921_000001_http_checks::Migration as HttpChecksMigration;
 
 pub use migration::m20260921_000002_env_check_history::Migration as EnvCheckHistoryMigration;
@@ -37,3 +53,19 @@ pub use migration::m20261017_000001_retain_ci_cancellation::Migration as RetainC
 pub use migration::m20261017_000002_runtime_health::Migration as RuntimeHealthMigration;
 
 pub use migration::m20261019_000002_reconcile_error_group_counts::Migration as ReconcileErrorGroupCountsMigration;
+
+pub use migration::m20261022_000007_network_policy::{
+    backfill_sql as network_policy_backfill_sql, Migration as NetworkPolicyMigration,
+};
+pub use migration::m20261022_000008_ingress_endpoints::Migration as IngressEndpointsMigration;
+pub use migration::m20261023_000010_workload_volumes::{
+    Migration as WorkloadVolumesMigration, VOLUME_TABLES_SQL,
+};
+pub use migration::m20261023_000030_environment_workload_isolation::Migration as EnvironmentWorkloadIsolationMigration;
+
+pub use migration::m20261022_000004_external_services_workload_mode::Migration as ExternalServicesWorkloadModeMigration;
+pub use migration::m20261022_000005_deployment_workload_mode::Migration as DeploymentWorkloadModeMigration;
+pub use migration::m20261024_000001_drop_sandbox_driver_mode::{
+    Migration as DropSandboxDriverModeMigration, DOWN_SQL as DROP_SANDBOX_DRIVER_MODE_DOWN_SQL,
+    UP_SQL as DROP_SANDBOX_DRIVER_MODE_UP_SQL,
+};

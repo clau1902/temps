@@ -16,11 +16,14 @@ pub mod network;
 pub mod node_pairings;
 pub mod node_public_ingress;
 pub mod node_ssh;
+pub mod node_state;
 pub mod nodes;
 pub mod remote_deployments;
 pub mod traefik_discovery;
 pub mod types;
 pub mod wireguard_mesh;
+pub mod workload_placement;
+pub mod workload_volumes;
 
 pub mod ci_dispatch;
 

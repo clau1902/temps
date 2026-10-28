@@ -60,6 +60,7 @@ pub mod docker_socket_grant;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
+pub mod sandbox_preview_relay;
 pub mod sandbox_runtime;
 pub mod secret_string;
 pub mod secrets_manager;
@@ -144,7 +145,9 @@ pub use on_demand::*;
 pub use project_access::{
     ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
 };
-pub use project_deletion::ProjectDeletionHook;
+pub use project_deletion::{
+    ProjectDeletionHook, ProjectDeletionHookError, ProjectDeletionHooks, ProjectDeletionHooksFailed,
+};
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
@@ -188,17 +191,18 @@ pub use app_settings::{
     AiWorkspaceFileLimitsSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
     BuildLimitsSettings, CeilingEnforcement, ClickHouseCompression, ClickHouseSettings,
     CloudSettings, ClusterDnsSettings, ConnectionLimitSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, DnsProviderSettings, DockerRegistrySettings, GeoLicenseKeyIntent,
-    GeoSettings, GeoSettingsError, ImageRetentionSettings, KvSettings, LetsEncryptSettings,
-    LoopbackJa4HeaderError, McpServerSettings, MetricsStoreKind, MonitoringSettings,
-    MultiNodeSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    OnDemandTlsSettings, ParseClickHouseCompressionError, PreviewGatewaySettings, ProviderConfig,
-    RateLimitSettings, RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
-    SelfUpdateSettings, ShieldSettings, TenantResourceCeilings,
-    DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
-    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
-    DEFAULT_GEO_STALE_LOOKUP_DAYS, DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR,
-    GEO_CHECK_STATUS_OK, GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
+    ControlPlaneResourceSettings, DiskSpaceAlertSettings, DnsProviderSettings,
+    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
+    ImageRetentionSettings, KvSettings, LetsEncryptSettings, LoopbackJa4HeaderError,
+    McpServerSettings, MetricsStoreKind, MonitoringSettings, MultiNodeSettings,
+    ObservabilityCompressionSettings, ObservabilityRetentionSettings, OnDemandTlsSettings,
+    ParseClickHouseCompressionError, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
+    ShieldSettings, TenantResourceCeilings, DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS,
+    DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+    DEFAULT_GEO_REFRESH_INTERVAL_HOURS, DEFAULT_GEO_STALE_LOOKUP_DAYS,
+    DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK,
+    GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
     GEO_SOURCE_MAXMIND_OFFICIAL, IP_REFERENCE_SLACK_DAYS, MAX_ANALYTICS_RETENTION_DAYS,
     MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MAX_GEO_REFRESH_INTERVAL_HOURS,
     MAX_GEO_STALE_LOOKUP_DAYS, MIN_ANALYTICS_RETENTION_DAYS,

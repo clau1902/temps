@@ -1201,6 +1201,7 @@ mod tests {
             work_dir: std::path::PathBuf::from("/workspace"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -1401,6 +1402,9 @@ mod tests {
             expires_at: now + chrono::Duration::seconds(3600),
             preview_password_hash: None,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -1896,6 +1900,9 @@ mod tests {
             expires_at: now,
             preview_password_hash: None,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,

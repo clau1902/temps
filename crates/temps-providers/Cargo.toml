@@ -23,9 +23,13 @@ temps-query-s3 = { path = "../temps-query-s3" }
 temps-query-redis = { path = "../temps-query-redis" }
 temps-query-mongodb = { path = "../temps-query-mongodb" }
 temps-dns = { path = "../temps-dns" }
+temps-dns-resolver = { path = "../temps-dns-resolver" }
 temps-network = { path = "../temps-network" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-docker = { path = "../temps-workload-docker" }
+temps-workload-plane = { path = "../temps-workload-plane" }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -69,6 +73,8 @@ hex = { workspace = true }
 docker-tests = []
 
 [dev-dependencies]
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
 tokio-test = "0.4"
 testcontainers = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }

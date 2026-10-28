@@ -36,6 +36,22 @@ mod m20261020_000004_client_outcomes;
 mod m20261020_000005_client_outcome_receipts;
 mod m20261020_000006_otel_ingest_receipts;
 mod m20261022_000001_add_github_repo_webhook;
+pub(crate) mod m20261022_000001_dns_name_claims;
+pub(crate) mod m20261022_000002_workloads;
+pub(crate) mod m20261022_000003_node_state_changes;
+pub(crate) mod m20261022_000004_external_services_workload_mode;
+pub(crate) mod m20261022_000005_deployment_workload_mode;
+pub(crate) mod m20261022_000006_nodes_sandbox_driver_mode;
+pub(crate) mod m20261022_000007_network_policy;
+pub(crate) mod m20261022_000008_ingress_endpoints;
+pub(crate) mod m20261023_000009_workload_instance_ports;
+pub(crate) mod m20261023_000010_workload_volumes;
+pub(crate) mod m20261023_000020_functions;
+pub(crate) mod m20261023_000030_environment_workload_isolation;
+pub(crate) mod m20261023_000031_workload_instance_handle_id_index;
+pub(crate) mod m20261024_000001_drop_sandbox_driver_mode;
+pub(crate) mod m20261024_000010_sandbox_preview_access;
+pub(crate) mod m20261024_000011_sandbox_egress_policy;
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -384,10 +400,12 @@ mod m20261026_000001_create_shield;
 mod m20261026_000001_tailnet_serve;
 mod m20261026_000002_tailnet_principals;
 mod m20261026_000003_add_ja4_to_proxy_logs;
+mod m20261027_000001_nodes_deployments_without_resolver;
 mod m20261027_000001_signed_in_gate;
 mod m20261027_000002_cloudflare_access;
 mod m20261028_000001_tunnel_environment_hosts;
 mod m20261028_000002_compose_placements;
+mod m20261028_000002_drop_functions;
 mod m20261029_000001_shield_selective;
 mod m20261030_000001_shield_worker_route_notify;
 mod m20261031_000001_shield_proposals;
@@ -860,6 +878,22 @@ impl MigratorTrait for Migrator {
             Box::new(m20261024_000001_reachability::Migration),
             // ADR 064 D5: the range, worker and listener that bound a private address.
             Box::new(m20261025_000001_private_audience::Migration),
+            Box::new(m20261022_000001_dns_name_claims::Migration),
+            Box::new(m20261022_000002_workloads::Migration),
+            Box::new(m20261022_000003_node_state_changes::Migration),
+            Box::new(m20261022_000004_external_services_workload_mode::Migration),
+            Box::new(m20261022_000005_deployment_workload_mode::Migration),
+            Box::new(m20261022_000006_nodes_sandbox_driver_mode::Migration),
+            Box::new(m20261022_000007_network_policy::Migration),
+            Box::new(m20261022_000008_ingress_endpoints::Migration),
+            Box::new(m20261023_000009_workload_instance_ports::Migration),
+            Box::new(m20261023_000010_workload_volumes::Migration),
+            Box::new(m20261023_000020_functions::Migration),
+            Box::new(m20261023_000030_environment_workload_isolation::Migration),
+            Box::new(m20261023_000031_workload_instance_handle_id_index::Migration),
+            Box::new(m20261024_000001_drop_sandbox_driver_mode::Migration),
+            Box::new(m20261024_000010_sandbox_preview_access::Migration),
+            Box::new(m20261024_000011_sandbox_egress_policy::Migration),
             Box::new(m20261025_000002_add_log_ingest_overrides::Migration),
             // ADR 066 phase 2: reputation lists, snapshots and the logged verdict.
             Box::new(m20261026_000001_create_shield::Migration),
@@ -874,6 +908,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20261027_000002_cloudflare_access::Migration),
             // ADR 068 D3: a tunnel that publishes every environment's host.
             Box::new(m20261028_000001_tunnel_environment_hosts::Migration),
+            // Deployments a node runs without the cluster resolver.
+            Box::new(m20261027_000001_nodes_deployments_without_resolver::Migration),
+            // Functions were removed before release; drop what the retired
+            // migration created where it ran.
+            Box::new(m20261028_000002_drop_functions::Migration),
             Box::new(m20261028_000002_compose_placements::Migration),
             // ADR 066 phases 4 to 7: Shield modes, bypass tokens, operator
             // rules, what the fleet learned, and events without ClickHouse.

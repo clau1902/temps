@@ -164,6 +164,17 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
             .await
     }
 
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        self.owner_of(handle)
+            .await?
+            .connect_port(handle, port)
+            .await
+    }
+
     async fn exec(
         &self,
         handle: &SandboxHandle,
@@ -323,6 +334,17 @@ impl SandboxProvider for NodeRoutingSandboxProvider {
         self.owner_of(handle)
             .await?
             .resize_disk(handle, new_size_mb)
+            .await
+    }
+
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &super::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        self.owner_of(handle)
+            .await?
+            .set_egress_policy(handle, policy)
             .await
     }
 
@@ -540,6 +562,20 @@ impl NodeProviderFactory for MtlsProviderFactory {
         )
         .await
         .map_err(|e| e.to_string())?;
+        // Byte channels (terminal, agent runtime, preview ports) present the
+        // same identity as `client` on their WebSocket.
+        let ws_connector = if temps_deployments::cluster_ca::is_https_address(&endpoint.dial_url) {
+            let config = temps_deployments::cluster_ca::cp_ws_client_config(
+                &endpoint,
+                self.config_service.as_ref(),
+                self.encryption_service.as_ref(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            Some(tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+        } else {
+            None
+        };
         Ok(Arc::new(
             RemoteSandboxProvider::new(
                 node.id,
@@ -548,7 +584,8 @@ impl NodeProviderFactory for MtlsProviderFactory {
                 token,
                 client,
             )
-            .with_defaults(defaults),
+            .with_defaults(defaults)
+            .with_ws_connector(ws_connector),
         ))
     }
 }
@@ -777,6 +814,7 @@ mod tests {
                 work_dir: PathBuf::from("/w"),
                 backend: SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             })
         }
         async fn exec(
@@ -849,6 +887,7 @@ mod tests {
                 work_dir: PathBuf::from("/w"),
                 backend: SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             }))
         }
         fn name(&self) -> &str {
@@ -896,6 +935,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -975,6 +1015,7 @@ mod tests {
             work_dir: PathBuf::from("/w"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -1097,6 +1138,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

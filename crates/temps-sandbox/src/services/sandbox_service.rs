@@ -29,6 +29,7 @@ use temps_agents::error::AgentError;
 use temps_agents::sandbox::SandboxCreateConfig;
 use temps_agents::services::run_service::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
+use temps_entities::ingress_mode::SandboxPreviewAccess;
 use temps_entities::{
     agent_runs, ai_application_projects, ai_application_workspaces, ai_applications, environments,
     external_services, nodes, project_services, projects, sandbox_events, sandbox_services,
@@ -41,6 +42,7 @@ use crate::services::create_policy;
 use crate::services::exec::ExecOptions;
 use crate::services::job_tracker::JobTracker;
 use crate::services::placement;
+use crate::services::preview_access::access_after_clearing_password;
 use crate::services::preview_urls::{self, PreviewUrlParts};
 use crate::services::public_id;
 use crate::services::registry::{StandaloneSandboxRegistry, VmProbe};
@@ -204,6 +206,11 @@ pub struct CreateSandboxRequest {
     /// automatic placement. Resolved against the operator allow-list by
     /// [`crate::services::placement`].
     pub node: Option<String>,
+    /// Which outside destinations the sandbox may reach. The default,
+    /// `internet`, is any public destination on ports 80 and 443; a
+    /// `restricted` policy needs a backend that can enforce it (docker), and
+    /// create fails with a 422 rather than starting the sandbox without it.
+    pub egress_policy: temps_agents::sandbox::SandboxEgressPolicy,
     /// Check the request against the operator's sandbox limits
     /// (`agent_sandbox.max_*` settings, the host's memory and the per-user
     /// cap; see [`crate::services::create_policy`]). Set by the HTTP create
@@ -335,6 +342,11 @@ pub struct ApplicationWorkspaceUsage {
     pub cpu_usage_usec: Option<u64>,
     pub open_ports: Vec<u16>,
 }
+
+/// `reason` of the `stopped` event recorded when a started sandbox is
+/// stopped again because its restricted egress policy could not be
+/// re-applied.
+pub const EGRESS_POLICY_REAPPLY_FAILED: &str = "egress_policy_reapply_failed";
 
 const APPLICATION_WORKSPACE_NAME_PREFIX: &str = "ai-application:";
 
@@ -702,6 +714,15 @@ pub struct NodeSandboxes {
     pub page_size: u64,
 }
 
+/// The outcome of [`SandboxService::set_preview_access`]: the updated row
+/// plus what it replaced, for the caller's audit record.
+#[derive(Debug, Clone)]
+pub struct PreviewAccessChange {
+    pub previous_access: SandboxPreviewAccess,
+    pub previous_allowed_cidrs: Vec<String>,
+    pub sandbox: sandboxes::Model,
+}
+
 /// Output DTO — what the service returns to handlers and what handlers
 /// serialize into the response JSON. Wraps the DB model to keep internal
 /// columns out of the public surface.
@@ -720,6 +741,11 @@ pub struct SandboxSummary {
     /// last 4 chars of the plaintext — safe to display in the UI so
     /// users can tell two passwords apart.
     pub preview_password_hint: Option<String>,
+    /// Who may open the preview URLs: `temps_login` | `password` | `public`.
+    pub preview_access: SandboxPreviewAccess,
+    /// Client networks allowed to open the preview URLs (normalised CIDRs).
+    /// Empty = any address. Checked before `preview_access`.
+    pub preview_allowed_cidrs: Vec<String>,
     /// Ports the sandbox advertises (read from the `metadata` JSON
     /// column). Empty when the sandbox was created without declaring
     /// any ports.
@@ -745,6 +771,8 @@ pub struct SandboxSummary {
     /// `"control-plane"` or a `node-<id>` placeholder; service methods that
     /// return summaries replace the placeholder with the real node name.
     pub node_name: String,
+    /// The egress policy the sandbox enforces.
+    pub egress_policy: temps_agents::sandbox::SandboxEgressPolicy,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -764,6 +792,8 @@ impl From<&sandboxes::Model> for SandboxSummary {
             created_at: m.created_at,
             expires_at: m.expires_at,
             preview_password_hint: m.preview_password_hint.clone(),
+            preview_access: m.preview_access,
+            preview_allowed_cidrs: m.preview_allowed_cidrs.clone(),
             ports: ports_from_metadata(m.metadata.as_ref()),
             backend: m.backend.clone(),
             disk_size_mb: m
@@ -780,6 +810,7 @@ impl From<&sandboxes::Model> for SandboxSummary {
                 None => crate::services::placement::CONTROL_PLANE_NAME.to_string(),
                 Some(id) => format!("node-{id}"),
             },
+            egress_policy: m.egress_policy.0.clone(),
         }
     }
 }
@@ -1303,6 +1334,11 @@ pub struct SandboxService {
     /// Worker nodes whose sandboxes are being evicted right now. They take
     /// no new sandboxes, and a second eviction of the same node is refused.
     evicting_nodes: Arc<EvictingNodes>,
+    /// Sandboxes whose create is still running in this process. Their rows
+    /// already say `running`, but no container exists yet: reads report them
+    /// as `starting`, and exec/filesystem calls are refused instead of
+    /// trying to wake a container that was never made.
+    creates_in_progress: Arc<CreatesInProgress>,
     /// This server is a control plane that runs no workloads (ADR 063):
     /// placement never picks it, and anything that needs its own host is
     /// refused with a typed error. `false` on every install that runs
@@ -1339,6 +1375,46 @@ impl EvictingNodes {
 
     fn contains(&self, node_id: i32) -> bool {
         self.set().contains(&node_id)
+    }
+}
+
+/// Public ids of the sandboxes this process is creating right now. Bounded by
+/// the number of concurrent creates.
+#[derive(Default)]
+struct CreatesInProgress(std::sync::Mutex<std::collections::HashSet<String>>);
+
+impl CreatesInProgress {
+    fn set(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<String>> {
+        // Plain ids only; a poisoned lock is still consistent.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Mark `public_id` as being created until the guard drops, however the
+    /// create ends.
+    fn begin(self: &Arc<Self>, public_id: &str) -> CreateInProgress {
+        self.set().insert(public_id.to_string());
+        CreateInProgress {
+            creates: self.clone(),
+            public_id: public_id.to_string(),
+        }
+    }
+
+    fn contains(&self, public_id: &str) -> bool {
+        self.set().contains(public_id)
+    }
+}
+
+/// Holds a sandbox's create mark; see [`CreatesInProgress::begin`].
+struct CreateInProgress {
+    creates: Arc<CreatesInProgress>,
+    public_id: String,
+}
+
+impl Drop for CreateInProgress {
+    fn drop(&mut self) {
+        self.creates.set().remove(&self.public_id);
     }
 }
 
@@ -1380,6 +1456,7 @@ impl SandboxService {
             runtime_credentials: None,
             node_probe,
             evicting_nodes: Arc::new(EvictingNodes::default()),
+            creates_in_progress: Arc::new(CreatesInProgress::default()),
             control_plane_runs_no_workloads: false,
         }
     }
@@ -1654,6 +1731,7 @@ impl SandboxService {
             created_at: Set(now),
             last_activity_at: Set(now),
             expires_at: Set(now + chrono::Duration::seconds(timeout as i64)),
+            preview_access: Set(crate::services::preview_access::initial_access(false)),
             ..Default::default()
         };
         let row = active.insert(self.db.as_ref()).await?;
@@ -1697,6 +1775,7 @@ impl SandboxService {
             })),
         )
         .await;
+        self.record_driver_conditions(row.id, &handle).await;
 
         tracing::info!(
             "Created agent-run sandbox {} (internal {}) for run {}",
@@ -1928,7 +2007,30 @@ impl SandboxService {
         let policy = self.placement_policy().await?;
         let workers = self.placement_workers().await?;
         let live = placement::live_counts(self.db.as_ref()).await?;
-        Ok(placement::describe(&policy, &workers, &live))
+        let mut nodes = placement::describe(&policy, &workers, &live);
+        if let Some(control_plane) = nodes.iter_mut().find(|n| n.is_control_plane) {
+            control_plane.backends = self.control_plane_backends();
+        }
+        Ok(nodes)
+    }
+
+    /// What the control plane's own provider can run, with the setup step
+    /// for each backend it cannot. Registration is decided at startup, so
+    /// this is a read of in-memory state plus, for an unavailable
+    /// microsandbox, the host probe that names what is missing.
+    fn control_plane_backends(&self) -> Vec<placement::NodeBackend> {
+        let provider = self.registry.provider_arc();
+        temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS
+            .into_iter()
+            .map(|backend| {
+                let available = provider.supports_backend(backend);
+                placement::NodeBackend {
+                    backend,
+                    available,
+                    reason: (!available).then(|| backend_unavailable_message(backend)),
+                }
+            })
+            .collect()
     }
 
     /// Live sandboxes on one node, from every owner (the operator view on
@@ -2133,6 +2235,7 @@ impl SandboxService {
     /// Replace the `node-<id>` placeholders from `From<&Model>` with real
     /// node names (one query for the whole batch).
     pub async fn fill_node_names(&self, summaries: &mut [SandboxSummary]) {
+        self.mark_creates_in_progress(summaries);
         let ids: std::collections::HashSet<i32> =
             summaries.iter().filter_map(|s| s.node_id).collect();
         if ids.is_empty() {
@@ -2154,6 +2257,40 @@ impl SandboxService {
     /// the internal ID the provider indexes by), then asks the provider
     /// to create the container. On provider failure the DB row is marked
     /// "destroyed" so list doesn't show zombie entries.
+    /// Report sandboxes this process is still creating as `starting`: their
+    /// rows say `running` from the insert on, before any container exists.
+    pub fn mark_creates_in_progress(&self, summaries: &mut [SandboxSummary]) {
+        for summary in summaries.iter_mut() {
+            if summary.status == "running" && self.creates_in_progress.contains(&summary.public_id)
+            {
+                summary.status = "starting".to_string();
+            }
+        }
+    }
+
+    /// [`Self::create_sandbox`] in a task of its own, so it always reaches its
+    /// success or cleanup path, even when the caller stops waiting.
+    ///
+    /// The first sandbox on a node can spend minutes building its image. An
+    /// HTTP client or proxy that gives up drops the request's future, and a
+    /// create cancelled there left the row "running" with no backend while
+    /// the worker tore down the container it had just made, because the
+    /// control plane stopped waiting. `hold` is dropped when the create ends:
+    /// a lock the caller must keep for exactly that long.
+    pub fn spawn_create<H: Send + 'static>(
+        self: &Arc<Self>,
+        user_id: i32,
+        req: CreateSandboxRequest,
+        hold: H,
+    ) -> tokio::task::JoinHandle<Result<sandboxes::Model, SandboxError>> {
+        let service = Arc::clone(self);
+        tokio::spawn(async move {
+            let result = service.create_sandbox(user_id, req).await;
+            drop(hold);
+            result
+        })
+    }
+
     pub async fn create_sandbox(
         &self,
         user_id: i32,
@@ -2163,6 +2300,12 @@ impl SandboxService {
             None => SandboxLifecycle::default(),
             Some(value) => SandboxLifecycle::parse(value)?,
         };
+        let egress_policy =
+            req.egress_policy
+                .normalized()
+                .map_err(|error| SandboxError::Validation {
+                    message: format!("egress_policy: {error}"),
+                })?;
 
         if req.from_snapshot_artifact.is_some() && req.source.is_some() {
             return Err(SandboxError::Validation {
@@ -2287,18 +2430,11 @@ impl SandboxService {
                         .to_string(),
                 });
             }
-            if backend == Some(temps_agents::sandbox::SandboxBackend::Firecracker) {
+            if let Some(b) =
+                backend.filter(|b| !temps_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(b))
+            {
                 return Err(SandboxError::Validation {
-                    message: "the firecracker backend is not available on worker nodes yet; \
-                              use the docker backend or the control plane"
-                        .to_string(),
-                });
-            }
-            if backend == Some(temps_agents::sandbox::SandboxBackend::Microsandbox) {
-                return Err(SandboxError::Validation {
-                    message: "the microsandbox backend is not available on worker nodes \
-                              (ADR-050); use the docker backend or the control plane"
-                        .to_string(),
+                    message: placement::worker_backend_unavailable(b),
                 });
             }
         }
@@ -2408,10 +2544,17 @@ impl SandboxService {
             expires_at: Set(expires_at),
             preview_password_hash: Set(preview.as_ref().map(|p| p.hash.clone())),
             preview_password_hint: Set(preview.as_ref().map(|p| p.hint.clone())),
+            preview_access: Set(crate::services::preview_access::initial_access(
+                preview.is_some(),
+            )),
             lifecycle: Set(lifecycle.as_str().to_string()),
             project_id: Set(req.project_id),
             source_repo_url: Set(source_repo_url),
             node_id: Set(node_id),
+            // Part of the create config below, so the sandbox enforces it
+            // from its first instant; the row is marked destroyed if the
+            // create fails.
+            egress_policy: Set(sandboxes::StoredEgressPolicy(egress_policy.clone())),
             ..Default::default()
         };
         let inserted = match cap_txn {
@@ -2436,6 +2579,7 @@ impl SandboxService {
                 e.into()
             }
         })?;
+        let _create_in_progress = self.creates_in_progress.begin(&public_id_value);
 
         // Allocate host-side working directory. A worker node derives and
         // creates its own work directory, so nothing is made here for it.
@@ -2474,6 +2618,7 @@ impl SandboxService {
             pids_limit: req.pids_limit,
             disk_size_mb: req.disk_size_mb,
             allow_docker: req.allow_docker,
+            egress_policy,
             network_mode: None,
             env_vars: req.env,
             idle_timeout: Duration::from_secs(timeout),
@@ -2606,6 +2751,7 @@ impl SandboxService {
             })),
         )
         .await;
+        self.record_driver_conditions(row.id, &handle).await;
 
         tracing::info!(
             "Created standalone sandbox {} (internal {}) for user {}",
@@ -4884,6 +5030,7 @@ TEMPS_ASKPASS_EOF\n\
             .start(row.id, public_id_value)
             .await
             .map_err(|e| from_agent_error(public_id_value, e))?;
+        self.enforce_stored_egress_policy(&row).await?;
         let now = Utc::now();
         let new_expires = idle_deadline(now, row.timeout_secs);
         let sandbox_id = row.id;
@@ -4928,6 +5075,7 @@ TEMPS_ASKPASS_EOF\n\
             .restart(row.id, public_id_value)
             .await
             .map_err(|e| from_agent_error(public_id_value, e))?;
+        self.enforce_stored_egress_policy(&row).await?;
         let now = Utc::now();
         let sandbox_id = row.id;
         let changes = sandboxes::ActiveModel {
@@ -5006,6 +5154,197 @@ TEMPS_ASKPASS_EOF\n\
         )
         .await;
         Ok(updated)
+    }
+
+    /// Replace the sandbox's egress policy: which outside destinations it
+    /// may reach.
+    ///
+    /// The backend applies the policy first and the row is written only
+    /// once it has, so the stored policy is never one the sandbox does not
+    /// enforce. If that write then fails (the sandbox was destroyed
+    /// meanwhile, or the database is unavailable), the previous policy is
+    /// applied again before the error is returned. A running Docker sandbox
+    /// gets a new egress proxy, which cuts its outbound connections for a
+    /// second or two; a stopped one keeps the policy for its next start.
+    pub async fn set_egress_policy(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        policy: temps_agents::sandbox::SandboxEgressPolicy,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        let policy = policy
+            .normalized()
+            .map_err(|error| SandboxError::Validation {
+                message: format!("egress policy for sandbox {public_id_value}: {error}"),
+            })?;
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        ensure_not_agent_run(&row)?;
+        if row.status != "running" && row.status != "stopped" {
+            return Err(SandboxError::InvalidState {
+                sandbox_id: public_id_value.to_string(),
+                state: row.status.clone(),
+                operation: "change its egress policy".into(),
+            });
+        }
+        // Serializes with every other change to this sandbox's compute
+        // (restart, resize, a resume re-applying its policy), so two updates
+        // cannot leave the row naming one policy and the sandbox enforcing
+        // the other.
+        let _serialized = self.registry.begin_planned_downtime(row.id).await;
+        let previous = row.egress_policy.0.clone();
+        self.registry
+            .set_egress_policy(row.id, public_id_value, &policy)
+            .await
+            .map_err(|e| from_agent_error(public_id_value, e))?;
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            egress_policy: Set(sandboxes::StoredEgressPolicy(policy.clone())),
+            last_activity_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let updated = match self
+            .update_row_if(&row, changes, Expect::Live, None, "egress policy update")
+            .await
+        {
+            Ok(updated) => updated,
+            Err(error) => {
+                if let Err(rollback) = self
+                    .registry
+                    .set_egress_policy(row.id, public_id_value, &previous)
+                    .await
+                {
+                    tracing::error!(
+                        sandbox_id = %public_id_value,
+                        internal_id = row.id,
+                        applied_mode = policy.mode.as_str(),
+                        stored_mode = previous.mode.as_str(),
+                        "egress policy was applied but not stored ({error}), and restoring \
+                         the stored policy failed too ({rollback}); the sandbox enforces a \
+                         policy its row does not show until the policy is set again"
+                    );
+                }
+                return Err(error);
+            }
+        };
+        tracing::info!(
+            sandbox_id = %public_id_value,
+            internal_id = row.id,
+            from_mode = previous.mode.as_str(),
+            to_mode = policy.mode.as_str(),
+            rules = policy.rules.len(),
+            "sandbox egress policy updated"
+        );
+        self.record_event(
+            row.id,
+            "egress_policy_updated",
+            Some(serde_json::json!({
+                "from_mode": previous.mode.as_str(),
+                "to_mode": policy.mode.as_str(),
+                "rules": policy.rules.len(),
+            })),
+        )
+        .await;
+        Ok(updated)
+    }
+
+    /// Make a sandbox that has just started enforce its stored egress
+    /// policy. The backend carries the policy across a stop (Docker keeps it
+    /// on the parked egress proxy), so this is normally a no-op; it puts the
+    /// policy back on a sandbox whose proxy was lost while it was stopped.
+    /// A restricted sandbox that cannot get its policy back is stopped again
+    /// rather than left running with wider egress than its owner allowed.
+    async fn enforce_stored_egress_policy(
+        &self,
+        row: &sandboxes::Model,
+    ) -> Result<(), SandboxError> {
+        // `internet` is what a backend without a stored policy enforces, so
+        // only a restricted policy can need re-applying. A concurrent change
+        // to restricted is applied by `set_egress_policy` itself.
+        if !row.egress_policy.0.is_restricted() {
+            return Ok(());
+        }
+        let _serialized = self.registry.begin_planned_downtime(row.id).await;
+        // Re-read under the lock: a concurrent `set_egress_policy` may have
+        // replaced the policy since `row` was loaded.
+        let Some(current) = sandboxes::Entity::find_by_id(row.id)
+            .one(self.db.as_ref())
+            .await?
+        else {
+            return Ok(());
+        };
+        let policy = current.egress_policy.0;
+        let Err(error) = self
+            .registry
+            .set_egress_policy(row.id, &row.public_id, &policy)
+            .await
+        else {
+            return Ok(());
+        };
+        tracing::error!(
+            sandbox_id = %row.public_id,
+            internal_id = row.id,
+            "could not re-apply the restricted egress policy of a started sandbox ({error}); \
+             stopping it so it does not run with wider egress"
+        );
+        self.jobs.abort_all(row.id).await;
+        match self.registry.stop(row.id, &row.public_id).await {
+            Ok(()) | Err(temps_agents::error::AgentError::SandboxNotFound { .. }) => {
+                self.mark_stopped_for_egress_failure(row, &error).await;
+            }
+            Err(stop) => {
+                // The compute may still be running; a `stopped` row would hide
+                // it, so the row keeps its status and the error says why.
+                tracing::error!(
+                    sandbox_id = %row.public_id,
+                    internal_id = row.id,
+                    "could not stop sandbox after failing to re-apply its egress policy: {stop}"
+                );
+            }
+        }
+        Err(from_agent_error(&row.public_id, error))
+    }
+
+    /// Record that the service stopped a sandbox because its stored egress
+    /// policy could not be re-applied: the row moves to `stopped` (unless it
+    /// was destroyed meanwhile) and a `stopped` event carries the reason, so
+    /// the console can say why the sandbox is not running.
+    async fn mark_stopped_for_egress_failure(
+        &self,
+        row: &sandboxes::Model,
+        cause: &temps_agents::error::AgentError,
+    ) {
+        let changes = sandboxes::ActiveModel {
+            id: Set(row.id),
+            status: Set("stopped".to_string()),
+            last_activity_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        match row_status::update_when(self.db.as_ref(), changes, Expect::Live).await {
+            Ok(Some(_)) => {
+                self.record_event(
+                    row.id,
+                    "stopped",
+                    Some(serde_json::json!({
+                        "reason": EGRESS_POLICY_REAPPLY_FAILED,
+                        "detail": format!(
+                            "the sandbox's restricted egress policy could not be re-applied \
+                             after it started, so it was stopped rather than run with wider \
+                             egress: {cause}"
+                        ),
+                    })),
+                )
+                .await;
+            }
+            Ok(None) => {}
+            Err(db_error) => {
+                tracing::error!(
+                    sandbox_id = %row.public_id,
+                    internal_id = row.id,
+                    error = %db_error,
+                    "could not mark sandbox stopped after failing to re-apply its egress policy"
+                );
+            }
+        }
     }
 
     /// Seed an already-running sandbox with additional content. Mirrors
@@ -5180,6 +5519,39 @@ TEMPS_ASKPASS_EOF\n\
             })
     }
 
+    /// Put what the driver facade reported when it placed the sandbox on its
+    /// timeline (ADR-055 §5): a requested limit the driver could not apply
+    /// (`LimitEnforced = False`, with the reason) or a passed-over driver.
+    /// Nothing is recorded when there is nothing to say, which is always the
+    /// case outside `enforce` mode.
+    async fn record_driver_conditions(
+        &self,
+        sandbox_id: i32,
+        handle: &temps_agents::sandbox::SandboxHandle,
+    ) {
+        if handle.conditions.is_empty() {
+            return;
+        }
+        let conditions = match serde_json::to_value(&handle.conditions) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to encode driver conditions for sandbox {} ({}): {}",
+                    sandbox_id,
+                    handle.sandbox_name,
+                    e
+                );
+                return;
+            }
+        };
+        self.record_event(
+            sandbox_id,
+            "driver_conditions",
+            Some(serde_json::json!({ "conditions": conditions })),
+        )
+        .await;
+    }
+
     /// Append one operation to a sandbox's timeline. Best-effort — a failed
     /// insert is logged, never fatal to the operation it records.
     async fn record_event(
@@ -5275,35 +5647,113 @@ TEMPS_ASKPASS_EOF\n\
             }
         })?;
         let sandbox_id = row.id;
+        let previous_access = row.preview_access;
         let mut active: sandboxes::ActiveModel = row.into();
         active.preview_password_hash = Set(Some(hp.hash));
         active.preview_password_hint = Set(Some(hp.hint.clone()));
+        // Setting a password is choosing the password wall.
+        active.preview_access = Set(SandboxPreviewAccess::Password);
         active.update(self.db.as_ref()).await?;
-        self.record_event(sandbox_id, "preview_password_set", None)
-            .await;
+        self.record_event(
+            sandbox_id,
+            "preview_password_set",
+            Some(serde_json::json!({
+                "previous_access": previous_access.as_str(),
+                "access": SandboxPreviewAccess::Password.as_str(),
+            })),
+        )
+        .await;
         Ok(hp.hint)
     }
 
-    /// Remove the preview password. Subsequent preview requests fall back
-    /// to URL-only protection (the unguessable hex public_id). Idempotent —
-    /// clearing an already-unset password is a no-op, not an error.
+    /// Remove the preview password. A sandbox in `password` mode returns to
+    /// `temps_login` -- never to an open preview. Idempotent: clearing an
+    /// already-unset password is a no-op, not an error. Returns the access
+    /// mode the sandbox has afterwards.
     pub async fn clear_preview_password(
         &self,
         public_id_value: &str,
         user_id: i32,
-    ) -> Result<(), SandboxError> {
+    ) -> Result<SandboxPreviewAccess, SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
         let had_password = row.preview_password_hash.is_some();
+        let previous_access = row.preview_access;
+        let access = access_after_clearing_password(previous_access);
         let sandbox_id = row.id;
         let mut active: sandboxes::ActiveModel = row.into();
         active.preview_password_hash = Set(None);
         active.preview_password_hint = Set(None);
+        active.preview_access = Set(access);
         active.update(self.db.as_ref()).await?;
         if had_password {
-            self.record_event(sandbox_id, "preview_password_cleared", None)
-                .await;
+            self.record_event(
+                sandbox_id,
+                "preview_password_cleared",
+                Some(serde_json::json!({
+                    "previous_access": previous_access.as_str(),
+                    "access": access.as_str(),
+                })),
+            )
+            .await;
         }
-        Ok(())
+        Ok(access)
+    }
+
+    /// Change who may open the sandbox's preview URLs and from which
+    /// networks.
+    ///
+    /// `allowed_cidrs` replaces the stored allow-list (empty = any address)
+    /// after validation and normalisation. `password` is refused while no
+    /// preview password is set: the mode would admit nobody, and the caller
+    /// almost certainly meant to set one first. The proxy picks a change up
+    /// within its sandbox lookup cache TTL (30 s).
+    pub async fn set_preview_access(
+        &self,
+        public_id_value: &str,
+        user_id: i32,
+        access: SandboxPreviewAccess,
+        allowed_cidrs: &[String],
+    ) -> Result<PreviewAccessChange, SandboxError> {
+        let allowed_cidrs = crate::services::preview_access::normalize_allowed_cidrs(allowed_cidrs)
+            .map_err(|message| SandboxError::Validation {
+                message: format!(
+                    "Invalid preview allow-list for sandbox {public_id_value}: {message}"
+                ),
+            })?;
+        let row = self.find_by_public_id(public_id_value, user_id).await?;
+        if access == SandboxPreviewAccess::Password && row.preview_password_hash.is_none() {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "Sandbox {public_id_value} has no preview password, so `password` access \
+                     would admit nobody. Set one first with PUT \
+                     /v1/sandboxes/{public_id_value}/preview-password (which also switches \
+                     the sandbox to `password` access)."
+                ),
+            });
+        }
+        let previous_access = row.preview_access;
+        let previous_cidrs = row.preview_allowed_cidrs.clone();
+        let sandbox_id = row.id;
+        let mut active: sandboxes::ActiveModel = row.into();
+        active.preview_access = Set(access);
+        active.preview_allowed_cidrs = Set(allowed_cidrs.clone());
+        let updated = active.update(self.db.as_ref()).await?;
+        self.record_event(
+            sandbox_id,
+            "preview_access_changed",
+            Some(serde_json::json!({
+                "previous_access": previous_access.as_str(),
+                "access": access.as_str(),
+                "previous_allowed_cidrs": previous_cidrs,
+                "allowed_cidrs": allowed_cidrs,
+            })),
+        )
+        .await;
+        Ok(PreviewAccessChange {
+            previous_access,
+            previous_allowed_cidrs: previous_cidrs,
+            sandbox: updated,
+        })
     }
 
     // ── Helpers shared with the exec/fs modules ──────────────────────────
@@ -5588,6 +6038,16 @@ TEMPS_ASKPASS_EOF\n\
         user_id: i32,
     ) -> Result<(sandboxes::Model, i32), SandboxError> {
         let row = self.find_by_public_id(public_id_value, user_id).await?;
+        if self.creates_in_progress.contains(public_id_value) {
+            return Err(SandboxError::InvalidState {
+                sandbox_id: public_id_value.to_string(),
+                state: "starting".to_string(),
+                operation: "run exec or filesystem operations until its create finishes \
+                            (the first sandbox on a node builds its image, which can take \
+                            several minutes); retry when its status is running"
+                    .to_string(),
+            });
+        }
         let lifecycle = SandboxLifecycle::from_row(&row);
         if row.status == "stopped" {
             // Workspaces (ADR-036) are places a human comes back to, so a
@@ -5688,6 +6148,7 @@ TEMPS_ASKPASS_EOF\n\
                 });
             }
         }
+        self.enforce_stored_egress_policy(&row).await?;
 
         let now = Utc::now();
         let new_expires = idle_deadline(now, row.timeout_secs);
@@ -5769,14 +6230,17 @@ TEMPS_ASKPASS_EOF\n\
         }
         // No wake: minting a share link reads the row's password hash.
         let (row, _) = self.resolve_id_no_wake(public_id_value, user_id).await?;
-        let password_hash =
-            row.preview_password_hash
-                .as_deref()
-                .ok_or_else(|| SandboxError::InvalidState {
-                    sandbox_id: public_id_value.to_string(),
-                    state: "preview password disabled".into(),
-                    operation: "mint an expiring preview link; set a preview password first".into(),
-                })?;
+        // A share link stands in for the password, so it only exists while
+        // the password wall is the sandbox's access mode.
+        let password_hash = row
+            .preview_password_hash
+            .as_deref()
+            .filter(|_| row.preview_access == SandboxPreviewAccess::Password)
+            .ok_or_else(|| SandboxError::InvalidState {
+                sandbox_id: public_id_value.to_string(),
+                state: "preview password disabled".into(),
+                operation: "mint an expiring preview link; set a preview password first".into(),
+            })?;
 
         let now = SystemTime::now();
         let (grant, expires_at) = temps_core::encode_preview_session_grant(
@@ -5931,6 +6395,7 @@ fn application_sandbox_create_config(
         pids_limit: Some(config.pids_limit),
         disk_size_mb: Some(config.disk_limit_mb),
         allow_docker: false,
+        egress_policy: Default::default(),
         network_mode: None,
         env_vars: HashMap::new(),
         idle_timeout: Duration::from_secs(config.idle_timeout_secs),
@@ -6646,6 +7111,9 @@ pub(crate) mod tests {
             expires_at: now + chrono::Duration::hours(1),
             preview_password_hash: None,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "workspace".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -6925,6 +7393,9 @@ pub(crate) mod tests {
             expires_at: now,
             preview_password_hash: None,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -6936,7 +7407,147 @@ pub(crate) mod tests {
         row.user_id = Some(user_id);
         row.preview_password_hash = Some("argon2-current".into());
         row.preview_password_hint = Some("rent".into());
+        row.preview_access = SandboxPreviewAccess::Password;
         row
+    }
+
+    fn statements_of(service: SandboxService, db: Arc<DatabaseConnection>) -> String {
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service owns no database references after drop")
+            .into_transaction_log();
+        format!("{log:?}")
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_normalises_the_allow_list_and_records_an_event() {
+        let row = agent_run_row(None);
+        let mut updated = row.clone();
+        updated.preview_access = SandboxPreviewAccess::Public;
+        updated.preview_allowed_cidrs = vec!["192.0.2.0/24".into(), "2001:db8::1/128".into()];
+        let (service, db) = preview_test_service(vec![vec![row], vec![updated.clone()]]);
+
+        let got = service
+            .set_preview_access(
+                "sbx_deadbeef01234567",
+                1,
+                SandboxPreviewAccess::Public,
+                &["192.0.2.9/24".into(), "2001:db8::1".into()],
+            )
+            .await
+            .expect("owner may change preview access");
+        assert_eq!(got.sandbox, updated);
+        assert_eq!(got.previous_access, SandboxPreviewAccess::TempsLogin);
+        assert!(got.previous_allowed_cidrs.is_empty());
+
+        let statements = statements_of(service, db);
+        assert!(statements.contains("192.0.2.0/24"), "log: {statements}");
+        assert!(statements.contains("2001:db8::1/128"), "log: {statements}");
+        assert!(
+            statements.contains("preview_access_changed"),
+            "log: {statements}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_refuses_password_mode_without_a_password() {
+        let (service, _) = preview_test_service(vec![vec![agent_run_row(None)]]);
+        let error = service
+            .set_preview_access(
+                "sbx_deadbeef01234567",
+                1,
+                SandboxPreviewAccess::Password,
+                &[],
+            )
+            .await
+            .expect_err("password mode needs a password");
+        assert!(matches!(error, SandboxError::Validation { .. }));
+        let message = error.to_string();
+        assert!(message.contains("sbx_deadbeef01234567"), "{message}");
+        assert!(
+            message.contains("/v1/sandboxes/sbx_deadbeef01234567/preview-password"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_rejects_a_bad_cidr_before_touching_the_database() {
+        let (service, _) = preview_test_service(Vec::new());
+        let error = service
+            .set_preview_access(
+                "sbx_deadbeef01234567",
+                1,
+                SandboxPreviewAccess::TempsLogin,
+                &["10.0.0.0/8".into(), "10.0.0.0/40".into()],
+            )
+            .await
+            .expect_err("an invalid CIDR is a validation error");
+        assert!(matches!(error, SandboxError::Validation { .. }));
+        assert!(error.to_string().contains("allowed_cidrs[1]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn set_preview_access_hides_other_users_sandboxes() {
+        let (service, _) = preview_test_service(vec![vec![protected_preview_row(2)]]);
+        let error = service
+            .set_preview_access("sbx_deadbeef01234567", 1, SandboxPreviewAccess::Public, &[])
+            .await
+            .expect_err("a non-owner must not change preview access");
+        assert!(matches!(error, SandboxError::NotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn setting_a_preview_password_selects_password_access() {
+        let row = agent_run_row(None);
+        let updated = protected_preview_row(1);
+        let (service, db) = preview_test_service(vec![vec![row], vec![updated]]);
+        service
+            .set_preview_password("sbx_deadbeef01234567", 1, "correct horse battery")
+            .await
+            .expect("owner may set a password");
+        let statements = statements_of(service, db);
+        assert!(statements.contains("\"password\""), "log: {statements}");
+        assert!(
+            statements.contains("preview_password_set"),
+            "log: {statements}"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_preview_password_returns_to_temps_login() {
+        let row = protected_preview_row(1);
+        let mut updated = agent_run_row(None);
+        updated.preview_access = SandboxPreviewAccess::TempsLogin;
+        let (service, db) = preview_test_service(vec![vec![row], vec![updated]]);
+        let access = service
+            .clear_preview_password("sbx_deadbeef01234567", 1)
+            .await
+            .expect("owner may clear the password");
+        assert_eq!(access, SandboxPreviewAccess::TempsLogin);
+        let statements = statements_of(service, db);
+        assert!(statements.contains("\"temps_login\""), "log: {statements}");
+        assert!(
+            statements.contains("preview_password_cleared"),
+            "log: {statements}"
+        );
+    }
+
+    #[tokio::test]
+    async fn preview_share_link_requires_password_access_even_with_a_hash() {
+        let mut row = protected_preview_row(1);
+        row.preview_access = SandboxPreviewAccess::TempsLogin;
+        let (service, _) = preview_test_service(vec![vec![row]]);
+        let error = service
+            .preview_share_link(
+                "sbx_deadbeef01234567",
+                1,
+                3000,
+                "/",
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("a share link only exists in password mode");
+        assert!(matches!(error, SandboxError::InvalidState { .. }));
     }
 
     #[tokio::test]
@@ -7147,6 +7758,9 @@ pub(crate) mod tests {
             expires_at: now,
             preview_password_hash: None,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -7251,6 +7865,14 @@ mod storage_cleanup_tests {
         /// when it cannot stop a container whose isolation policy is stale.
         /// `start` clears it, as a successful start replaces that state.
         alive_check_fails: Arc<AtomicBool>,
+        /// Every egress policy applied, in order.
+        egress_calls: Arc<Mutex<Vec<temps_agents::sandbox::SandboxEgressPolicy>>>,
+        /// Refuse restricted policies, like a backend without allow-lists.
+        fail_egress: bool,
+        /// `create` takes this long, like a first image build.
+        create_delay: Option<Duration>,
+        /// The backends this host registered; `None` claims every one.
+        backends: Option<Vec<SandboxBackend>>,
     }
 
     impl FakeProvider {
@@ -7269,6 +7891,10 @@ mod storage_cleanup_tests {
                 lifecycle_calls: Arc::new(Mutex::new(Vec::new())),
                 alive: Arc::new(AtomicBool::new(true)),
                 alive_check_fails: Arc::new(AtomicBool::new(false)),
+                egress_calls: Arc::new(Mutex::new(Vec::new())),
+                fail_egress: false,
+                create_delay: None,
+                backends: None,
             }
         }
     }
@@ -7281,12 +7907,22 @@ mod storage_cleanup_tests {
             work_dir: PathBuf::from("/workspace"),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 
     #[async_trait]
     impl SandboxProvider for FakeProvider {
+        fn supports_backend(&self, backend: SandboxBackend) -> bool {
+            self.backends
+                .as_ref()
+                .is_none_or(|backends| backends.contains(&backend))
+        }
+
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            if let Some(delay) = self.create_delay {
+                tokio::time::sleep(delay).await;
+            }
             if self.fail_create {
                 return Err(AgentError::SandboxCreationFailed {
                     run_id: config.run_id,
@@ -7450,6 +8086,24 @@ mod storage_cleanup_tests {
             Ok(())
         }
 
+        async fn set_egress_policy(
+            &self,
+            handle: &SandboxHandle,
+            policy: &temps_agents::sandbox::SandboxEgressPolicy,
+        ) -> Result<(), AgentError> {
+            if self.fail_egress && policy.is_restricted() {
+                return Err(AgentError::SandboxEgressPolicyUnsupported {
+                    sandbox: handle.sandbox_name.clone(),
+                    backend: "firecracker".into(),
+                });
+            }
+            self.egress_calls
+                .lock()
+                .expect("egress call mutex")
+                .push(policy.clone());
+            Ok(())
+        }
+
         async fn recover(&self, _run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
             Ok(None)
         }
@@ -7606,6 +8260,9 @@ mod storage_cleanup_tests {
             expires_at: now + chrono::Duration::seconds(3600),
             preview_password_hash: None,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
+            egress_policy: Default::default(),
             lifecycle: "ephemeral".to_string(),
             project_id: None,
             source_repo_url: None,
@@ -9634,6 +10291,330 @@ mod storage_cleanup_tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
+    fn restricted_egress() -> temps_agents::sandbox::SandboxEgressPolicy {
+        temps_agents::sandbox::SandboxEgressPolicy::restricted(vec![
+            temps_agents::sandbox::EgressRule::host("API.example.com", &[443]),
+            temps_agents::sandbox::EgressRule::cidr("1.1.1.0/24", &[]),
+        ])
+    }
+
+    fn with_egress(
+        row: sandboxes::Model,
+        policy: &temps_agents::sandbox::SandboxEgressPolicy,
+    ) -> sandboxes::Model {
+        sandboxes::Model {
+            egress_policy: sandboxes::StoredEgressPolicy(policy.normalized().expect("valid")),
+            ..row
+        }
+    }
+
+    fn egress_event() -> sandbox_events::Model {
+        sandbox_events::Model {
+            event_type: "egress_policy_updated".into(),
+            ..destroyed_event()
+        }
+    }
+
+    #[tokio::test]
+    async fn an_egress_policy_is_applied_before_it_is_stored() {
+        let data_root = unique_data_root("egress-set");
+        let policy = restricted_egress();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            .append_query_results([vec![with_egress(
+                row_with(PUBLIC_ID, "ephemeral", "running"),
+                &policy,
+            )]])
+            .append_query_results([vec![egress_event()]])
+            .into_connection();
+        let db = Arc::new(db);
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service_shared(db.clone(), provider, data_root.clone());
+
+        let updated = service
+            .set_egress_policy(PUBLIC_ID, 1, policy.clone())
+            .await
+            .expect("applied and stored");
+
+        let normalized = policy.normalized().expect("valid");
+        assert_eq!(updated.egress_policy.0, normalized);
+        // The backend got the normalized policy, once.
+        assert_eq!(*calls.lock().expect("calls"), vec![normalized]);
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("only handle")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(sql.contains("egress_policy"), "the row is written: {sql}");
+        assert!(
+            sql.contains("egress_policy_updated"),
+            "an event is recorded: {sql}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_egress_policy_never_reaches_the_backend() {
+        let data_root = unique_data_root("egress-invalid");
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(
+                PUBLIC_ID,
+                1,
+                temps_agents::sandbox::SandboxEgressPolicy::restricted(vec![
+                    temps_agents::sandbox::EgressRule::cidr("10.0.0.0/8", &[]),
+                ]),
+            )
+            .await
+            .expect_err("a private range can never be allowed");
+
+        assert!(matches!(err, SandboxError::Validation { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(
+            text.contains(PUBLIC_ID) && text.contains("10.0.0.0/8"),
+            "{text}"
+        );
+        assert!(calls.lock().expect("calls").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn a_backend_that_cannot_enforce_a_restricted_policy_is_a_typed_refusal() {
+        let data_root = unique_data_root("egress-unsupported");
+        // Only the lookup: no write may follow a refusal.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            .into_connection();
+        let provider = FakeProvider {
+            fail_egress: true,
+            ..FakeProvider::new()
+        };
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(PUBLIC_ID, 1, restricted_egress())
+            .await
+            .expect_err("refused");
+
+        assert!(
+            matches!(&err, SandboxError::EgressPolicyUnsupported { sandbox_id, backend }
+                if sandbox_id == PUBLIC_ID && backend == "firecracker"),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn a_policy_that_cannot_be_stored_is_rolled_back_on_the_backend() {
+        let data_root = unique_data_root("egress-rollback");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            // The conditional write matches nothing: destroyed meanwhile.
+            .append_query_results([Vec::<sandboxes::Model>::new()])
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "destroyed")]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(PUBLIC_ID, 1, restricted_egress())
+            .await
+            .expect_err("destroyed meanwhile");
+
+        assert!(matches!(err, SandboxError::NotFound { .. }), "{err:?}");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![
+                restricted_egress().normalized().expect("valid"),
+                temps_agents::sandbox::SandboxEgressPolicy::internet(),
+            ],
+            "the stored policy is put back"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn the_egress_policy_of_an_agent_run_sandbox_is_not_changed_here() {
+        let data_root = unique_data_root("egress-agent-run");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, Some(42))]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let err = service
+            .set_egress_policy(PUBLIC_ID, 1, restricted_egress())
+            .await
+            .expect_err("managed by the run");
+
+        assert!(
+            matches!(err, SandboxError::ManagedByAgentRun { run_id: 42, .. }),
+            "{err:?}"
+        );
+        assert!(calls.lock().expect("calls").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_reapplies_a_stored_restricted_policy() {
+        let data_root = unique_data_root("egress-resume");
+        let policy = restricted_egress();
+        let stopped = with_egress(row_with(PUBLIC_ID, "ephemeral", "stopped"), &policy);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![stopped.clone()]])
+            // enforce_stored_egress_policy re-reads the row.
+            .append_query_results([vec![stopped.clone()]])
+            .append_query_results([vec![with_egress(
+                row_with(PUBLIC_ID, "ephemeral", "running"),
+                &policy,
+            )]])
+            .append_query_results([vec![destroyed_event()]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let row = service.resume_sandbox(PUBLIC_ID, 1).await.expect("resumed");
+
+        assert_eq!(row.status, "running");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            vec![policy.normalized().expect("valid")]
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_stops_a_sandbox_whose_restricted_policy_cannot_be_reapplied() {
+        let data_root = unique_data_root("egress-resume-fail");
+        let stopped = with_egress(
+            row_with(PUBLIC_ID, "ephemeral", "stopped"),
+            &restricted_egress(),
+        );
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![stopped.clone()]])
+                .append_query_results([vec![stopped.clone()]])
+                // mark_stopped_for_egress_failure: the row and its event.
+                .append_query_results([vec![stopped]])
+                .append_query_results([vec![destroyed_event()]])
+                .into_connection(),
+        );
+        let provider = FakeProvider {
+            fail_egress: true,
+            ..FakeProvider::new()
+        };
+        let lifecycle = provider.lifecycle_calls.clone();
+        let (service, _) = build_service_shared(db.clone(), provider, data_root.clone());
+
+        let err = service
+            .resume_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect_err("never runs with wider egress");
+
+        assert!(
+            matches!(err, SandboxError::EgressPolicyUnsupported { .. }),
+            "{err:?}"
+        );
+        assert_eq!(*lifecycle.lock().expect("calls"), vec!["start", "stop"]);
+        drop(service);
+        let sql = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("only handle")
+                .into_transaction_log()
+        );
+        assert!(!sql.contains("\"running\""), "never marked running: {sql}");
+        assert!(sql.contains(EGRESS_POLICY_REAPPLY_FAILED), "{sql}");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The row must not keep saying `running` for a sandbox the service
+    /// stopped because its egress policy could not be re-applied after a
+    /// restart; the `stopped` event names why.
+    #[tokio::test]
+    async fn restart_marks_stopped_a_sandbox_whose_restricted_policy_cannot_be_reapplied() {
+        let data_root = unique_data_root("egress-restart-fail");
+        let running = with_egress(
+            row_with(PUBLIC_ID, "ephemeral", "running"),
+            &restricted_egress(),
+        );
+        let stopped = with_egress(
+            row_with(PUBLIC_ID, "ephemeral", "stopped"),
+            &restricted_egress(),
+        );
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![running.clone()]])
+                // enforce_stored_egress_policy re-reads the row.
+                .append_query_results([vec![running]])
+                // mark_stopped_for_egress_failure: running -> stopped.
+                .append_query_results([vec![stopped]])
+                .append_query_results([vec![destroyed_event()]])
+                .into_connection(),
+        );
+        let provider = FakeProvider {
+            fail_egress: true,
+            ..FakeProvider::new()
+        };
+        let lifecycle = provider.lifecycle_calls.clone();
+        let (service, _) = build_service_shared(db.clone(), provider, data_root.clone());
+
+        let err = service
+            .restart_sandbox(PUBLIC_ID, 1)
+            .await
+            .expect_err("never runs with wider egress");
+
+        assert!(
+            matches!(err, SandboxError::EgressPolicyUnsupported { .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            lifecycle.lock().expect("calls").last().copied(),
+            Some("stop"),
+            "the container is stopped"
+        );
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("only handle")
+            .into_transaction_log();
+        let sql = format!("{log:?}");
+        assert!(
+            sql.contains("UPDATE") && sql.contains("\"stopped\""),
+            "the row is marked stopped: {sql}"
+        );
+        assert!(
+            sql.contains(EGRESS_POLICY_REAPPLY_FAILED) && sql.contains("egress policy"),
+            "the stopped event names the egress policy failure: {sql}"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn resume_of_an_internet_sandbox_does_not_touch_its_policy() {
+        let data_root = unique_data_root("egress-resume-internet");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "stopped")]])
+            .append_query_results([vec![row_with(PUBLIC_ID, "ephemeral", "running")]])
+            .append_query_results([vec![destroyed_event()]])
+            .into_connection();
+        let provider = FakeProvider::new();
+        let calls = provider.egress_calls.clone();
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        service.resume_sandbox(PUBLIC_ID, 1).await.expect("resumed");
+
+        assert!(calls.lock().expect("calls").is_empty());
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
     #[test]
     fn eviction_guard_serializes_evictions_of_one_node() {
         let nodes = Arc::new(EvictingNodes::default());
@@ -10104,6 +11085,130 @@ mod storage_cleanup_tests {
         let _ = std::fs::remove_dir_all(&data_root);
     }
 
+    /// A caller that stops waiting (a proxy timing out during a first image
+    /// build) must not cancel the create: it still reaches its cleanup path,
+    /// so no work dir or "running" row is stranded.
+    #[tokio::test]
+    async fn spawned_create_finishes_after_the_caller_stops_waiting() {
+        let data_root = unique_data_root("create-detached");
+        std::fs::create_dir_all(&data_root).expect("data root");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            // mark_destroyed update, reached only if the create was not cancelled
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let mut provider = FakeProvider::new();
+        provider.fail_create = true;
+        provider.create_delay = Some(Duration::from_millis(200));
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let (held, hold) = tokio::sync::oneshot::channel::<()>();
+        let waiting = service.spawn_create(1, CreateSandboxRequest::default(), held);
+        // The caller gives up while the provider is still creating.
+        let gave_up = tokio::time::timeout(Duration::from_millis(20), waiting).await;
+        assert!(gave_up.is_err(), "the create should still be running");
+        // `hold` is released only when the create has ended.
+        tokio::time::timeout(Duration::from_secs(5), hold)
+            .await
+            .expect("the create must finish without a caller")
+            .expect_err("the held value is dropped, never sent");
+
+        let leftovers: Vec<_> = std::fs::read_dir(&data_root)
+            .expect("read data root")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a create nobody waited for must still clean up; found {:?}",
+            leftovers
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// While a create runs, the row already says `running`. Reads must say
+    /// `starting` instead, and the mark must go away when the create ends.
+    #[tokio::test]
+    async fn a_create_in_progress_reads_as_starting_until_it_ends() {
+        let data_root = unique_data_root("create-starting");
+        std::fs::create_dir_all(&data_root).expect("data root");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::settings::Model>::new()])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+
+        let mut provider = FakeProvider::new();
+        provider.fail_create = true;
+        provider.create_delay = Some(Duration::from_millis(300));
+        let (service, _) = build_service(db, provider, data_root.clone());
+
+        let (held, hold) = tokio::sync::oneshot::channel::<()>();
+        let _waiting = service.spawn_create(1, CreateSandboxRequest::default(), held);
+        let creating = {
+            let mut found = None;
+            for _ in 0..100 {
+                if let Some(id) = service.creates_in_progress.set().iter().next().cloned() {
+                    found = Some(id);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            found.expect("the create should be marked in progress")
+        };
+        let mut summaries = [
+            SandboxSummary::from(&row(&creating, None)),
+            SandboxSummary::from(&row(PUBLIC_ID, None)),
+        ];
+        service.mark_creates_in_progress(&mut summaries);
+        assert_eq!(summaries[0].status, "starting");
+        assert_eq!(
+            summaries[1].status, "running",
+            "other sandboxes keep their status"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), hold)
+            .await
+            .expect("the create must finish")
+            .expect_err("the held value is dropped, never sent");
+        assert!(
+            !service.creates_in_progress.contains(&creating),
+            "the mark must be cleared when the create ends, even when it fails"
+        );
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// Exec and filesystem calls on a sandbox still being created get a
+    /// clear 409 instead of a wake attempt on a container that does not exist.
+    #[tokio::test]
+    async fn resolve_id_refuses_a_sandbox_whose_create_is_still_running() {
+        let data_root = unique_data_root("resolve-starting");
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row(PUBLIC_ID, None)]])
+            .into_connection();
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let _mark = service.creates_in_progress.begin(PUBLIC_ID);
+
+        let error = service
+            .resolve_id(PUBLIC_ID, 1)
+            .await
+            .expect_err("a sandbox being created cannot run commands yet");
+        match error {
+            SandboxError::InvalidState {
+                sandbox_id, state, ..
+            } => {
+                assert_eq!(sandbox_id, PUBLIC_ID);
+                assert_eq!(state, "starting");
+            }
+            other => panic!("expected InvalidState(starting), got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
     /// The costly one: seeding runs after the clone, so by the time it fails
     /// the directory can hold an entire repository, and the row is already
     /// destroyed so no later `destroy_sandbox` can reach it.
@@ -10261,6 +11366,7 @@ mod storage_cleanup_tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: std::time::Duration::from_secs(3600),
@@ -10565,5 +11671,39 @@ mod storage_cleanup_tests {
             "got {error:?}"
         );
         let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    /// The control plane offers every selectable backend, says which it can
+    /// run, and names the setup step for each one it cannot, so the console
+    /// can show the choice instead of hiding it.
+    #[test]
+    fn the_control_plane_lists_its_backends_with_the_fix_for_missing_ones() {
+        let mut provider = FakeProvider::new();
+        provider.backends = Some(vec![SandboxBackend::Docker]);
+        let (service, _) = build_service(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+            provider,
+            unique_data_root("cp-backends"),
+        );
+
+        let backends = service.control_plane_backends();
+
+        let offered: Vec<_> = backends.iter().map(|b| b.backend).collect();
+        assert_eq!(
+            offered,
+            temps_agents::sandbox::SELECTABLE_SANDBOX_BACKENDS.to_vec()
+        );
+        let docker = &backends[0];
+        assert!(docker.available && docker.reason.is_none(), "{docker:?}");
+        let firecracker = &backends[1];
+        assert!(!firecracker.available);
+        assert!(
+            firecracker
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("temps firecracker setup")),
+            "an unavailable backend says how to provision it: {firecracker:?}"
+        );
+        assert!(!backends[2].available && backends[2].reason.is_some());
     }
 }

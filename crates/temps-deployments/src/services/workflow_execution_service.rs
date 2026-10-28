@@ -48,6 +48,14 @@ fn retained_cleanup_retry_status() -> String {
     retained_cleanup_retry_status_at(chrono::Utc::now())
 }
 
+/// How a registered container is torn down.
+enum TeardownPath {
+    /// Started through the workload plane: retired by deleting its workload.
+    Plane(crate::services::plane_deployer::ReplicaWorkload),
+    /// A legacy container: stopped and removed by its node's deployer.
+    Deployer(Arc<dyn ContainerDeployer>),
+}
+
 fn retained_cleanup_retry_status_at(at: chrono::DateTime<chrono::Utc>) -> String {
     format!(
         "{RETAINED_CLEANUP_RETRY_PREFIX}{}",
@@ -463,6 +471,11 @@ pub struct WorkflowExecutionService {
     docker_handle: Arc<DockerHandle>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
+    /// ADR-055 Phase 5: the unified scheduler's inputs, for `shadow` and
+    /// `enforce` environments.
+    workload_placement: OnceCell<Arc<crate::services::WorkloadPlacementService>>,
+    /// The workload plane `enforce` environments start replicas through.
+    workload_plane: OnceCell<Arc<temps_workload_plane::WorkloadPlane>>,
     encryption_service: OnceCell<Arc<temps_core::EncryptionService>>,
     file_store: OnceCell<Arc<dyn temps_file_store::FileStore>>,
     /// Anonymous product telemetry reporter (late-bound, optional). Set via
@@ -515,6 +528,8 @@ impl WorkflowExecutionService {
             docker_handle,
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
+            workload_placement: OnceCell::new(),
+            workload_plane: OnceCell::new(),
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
@@ -553,6 +568,19 @@ impl WorkflowExecutionService {
     /// Set the node scheduler for multi-node deployments
     pub fn set_node_scheduler(&self, scheduler: Arc<crate::services::NodeScheduler>) {
         let _ = self.node_scheduler.set(scheduler);
+    }
+
+    /// Set the placement service `shadow`/`enforce` deployments use.
+    pub fn set_workload_placement(
+        &self,
+        placement: Arc<crate::services::WorkloadPlacementService>,
+    ) {
+        let _ = self.workload_placement.set(placement);
+    }
+
+    /// Set the workload plane `enforce` deployments start replicas through.
+    pub fn set_workload_plane(&self, plane: Arc<temps_workload_plane::WorkloadPlane>) {
+        let _ = self.workload_plane.set(plane);
     }
 
     /// Set the encryption service for decrypting node tokens during remote deployments
@@ -1919,6 +1947,96 @@ impl WorkflowExecutionService {
                     });
                 builder = builder.anti_affinity(anti_affinity);
 
+                // ADR-055: the environment's workload mode. `legacy` gets
+                // nothing extra, so its deploy path is exactly today's.
+                let workload_mode = environment.workload_mode;
+                let workload_plane = match (workload_mode, self.workload_placement.get()) {
+                    (
+                        temps_entities::environment_workload_mode::EnvironmentWorkloadMode::Legacy,
+                        _,
+                    )
+                    | (_, None) => None,
+                    (_, Some(placement)) => Some(crate::jobs::WorkloadPlaneDeploy {
+                        placement: placement.clone(),
+                        plane: self.workload_plane.get().cloned(),
+                    }),
+                };
+                builder = builder.workload_mode(workload_mode, workload_plane);
+                // ADR-055 Phase 10: only `enforce` runs replicas through the
+                // plane, so only it honours the isolation setting. `legacy`
+                // does not even read it.
+                let reads_isolation = workload_mode
+                    != temps_entities::environment_workload_mode::EnvironmentWorkloadMode::Legacy;
+                if let Some(placement) = self.workload_placement.get().filter(|_| reads_isolation) {
+                    let isolation = placement
+                        .environment_workload_isolation(environment.id)
+                        .await
+                        .map_err(|e| {
+                            WorkflowExecutionError::InvalidJobConfig(format!(
+                                "Deployment {}: cannot read the workload isolation of \
+                                 environment {}: {e}",
+                                deployment.id, environment.id
+                            ))
+                        })?;
+                    if workload_mode
+                        == temps_entities::environment_workload_mode::EnvironmentWorkloadMode::Enforce
+                    {
+                        builder = builder.workload_isolation(
+                            crate::services::workload_placement::isolation_for(isolation),
+                        );
+                    } else if isolation
+                        != temps_entities::environment_workload_isolation::EnvironmentWorkloadIsolation::Process
+                    {
+                        info!(
+                            deployment_id = deployment.id,
+                            environment_id = environment.id,
+                            workload_isolation = isolation.as_str(),
+                            workload_mode = workload_mode.as_str(),
+                            "workload isolation is ignored outside workload_mode enforce; \
+                             deploying a container"
+                        );
+                    }
+                }
+
+                // ADR-055 Phase 9: the environment's attached volumes. One
+                // indexed query; empty for every environment without one,
+                // which then deploys exactly as before. Unreadable volumes
+                // fail the deploy: a replica must never start without its
+                // data.
+                let volume_owner =
+                    crate::services::workload_volumes::environment_volume_owner(environment.id);
+                let volume_records = temps_workload_plane::VolumeStore::new(self.db.clone())
+                    .all_of(&volume_owner)
+                    .await
+                    .map_err(|e| {
+                        WorkflowExecutionError::JobCreationFailed(format!(
+                            "reading the volumes of environment {} for deployment {}: {e}",
+                            environment.id, deployment.id
+                        ))
+                    })?;
+                let volume_mounts: Vec<temps_workload::VolumeMount> = volume_records
+                    .iter()
+                    .filter_map(temps_workload_plane::VolumeRecord::mount)
+                    .collect();
+                if !volume_mounts.is_empty() {
+                    let pin = temps_workload_plane::volumes::pin_for(
+                        temps_workload::WorkloadRef::new(
+                            temps_workload::WorkloadKind::Deployment,
+                            i64::from(deployment.id),
+                        ),
+                        &volume_mounts,
+                        &volume_records,
+                        None,
+                    )
+                    .map_err(|e| {
+                        WorkflowExecutionError::JobCreationFailed(format!(
+                            "the volumes of environment {} cannot be mounted by deployment {}: {e}",
+                            environment.id, deployment.id
+                        ))
+                    })?;
+                    builder = builder.volume_mounts(volume_mounts, pin);
+                }
+
                 // Rolling update awareness: query existing containers for this
                 // environment so the scheduler can avoid placing new replicas on
                 // nodes that still host outgoing containers.
@@ -2168,7 +2286,9 @@ impl WorkflowExecutionService {
                     .log_service(self.log_service.clone())
                     .container_deployer(self.container_deployer.clone())
                     .queue(self.queue.clone())
-                    .config_service(self.config_service.clone());
+                    .config_service(self.config_service.clone())
+                    // Superseded `enforce` replicas are retired through it.
+                    .workload_plane(self.workload_plane.get().cloned());
 
                 if let Some(enc_service) = self.encryption_service.get() {
                     builder = builder.encryption_service(enc_service.clone());
@@ -3023,6 +3143,7 @@ impl WorkflowExecutionService {
                     .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())
+                    .workload_mode(environment.workload_mode)
                     .host(compose_host)
                     .vacate_host(compose_vacate_host)
                     .pin_home(!placement_plan.pinned)
@@ -4084,8 +4205,27 @@ impl WorkflowExecutionService {
             || original_status
                 .as_deref()
                 .is_some_and(|status| status.starts_with("retained:"));
-        let deployer = match self.teardown_deployer_for_node(container.node_id).await {
-            Ok(deployer) => deployer,
+        // A replica an `enforce` deployment started through the workload
+        // plane is retired by deleting its workload: the plane removes the
+        // instance (a container or a microVM Docker cannot see). Removing
+        // only the container would leave the workload running or restarted,
+        // and a microVM's 404 must never count as "already removed".
+        let resolved = match crate::services::plane_deployer::deployment_replica_workload(
+            self.db.as_ref(),
+            container.deployment_id,
+            &container_id,
+        )
+        .await
+        {
+            Ok(Some(workload)) => Ok(TeardownPath::Plane(workload)),
+            Ok(None) => self
+                .teardown_deployer_for_node(container.node_id)
+                .await
+                .map(TeardownPath::Deployer),
+            Err(error) => Err(WorkflowExecutionError::ReplicaRetire(error)),
+        };
+        let teardown = match resolved {
+            Ok(teardown) => teardown,
             Err(error) if rotate_retry => {
                 if let Err(rotation_error) = self
                     .rotate_retained_cleanup_retry(&container, &container_id, None)
@@ -4133,15 +4273,33 @@ impl WorkflowExecutionService {
             return Ok(None);
         }
 
-        if let Err(error) = deployer.stop_container(&container_id).await {
-            warn!(
-                "Failed to stop container {} on node {:?}: {}",
-                container_id, container.node_id, error
-            );
-        }
+        let removal: Result<(), String> = match teardown {
+            TeardownPath::Plane(workload) => {
+                crate::services::plane_deployer::retire_replica_workload(
+                    self.workload_plane.get().map(Arc::as_ref),
+                    container.deployment_id,
+                    &container_id,
+                    workload,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+            TeardownPath::Deployer(deployer) => {
+                if let Err(error) = deployer.stop_container(&container_id).await {
+                    warn!(
+                        "Failed to stop container {} on node {:?}: {}",
+                        container_id, container.node_id, error
+                    );
+                }
+                match deployer.remove_container(&container_id).await {
+                    Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                }
+            }
+        };
 
-        match deployer.remove_container(&container_id).await {
-            Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+        match removal {
+            Ok(()) => {}
             Err(error) => {
                 // Never hide a still-live container from later cleanup attempts.
                 // Retained failures receive a timestamped, lexically-last state,
@@ -4649,6 +4807,9 @@ pub enum WorkflowExecutionError {
         reason: String,
     },
 
+    /// Finding or retiring a replica the workload plane started.
+    #[error(transparent)]
+    ReplicaRetire(#[from] crate::services::plane_deployer::ReplicaRetireError),
     /// Where a Compose stack lives could not be decided, or its home cannot
     /// take this deployment (see `services::compose_placement`).
     #[error("Deployment {deployment_id}: {source}")]
@@ -4709,7 +4870,8 @@ impl WorkflowExecutionError {
             | Self::MissingJobConfig(_)
             | Self::InvalidJobConfig(_)
             | Self::UnsupportedJobType(_)
-            | Self::JobCreationFailed(_) => false,
+            | Self::JobCreationFailed(_)
+            | Self::ReplicaRetire(_) => false,
         }
     }
 }
@@ -6972,6 +7134,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

@@ -879,6 +879,7 @@ fn attach_failure_problem(
         | AgentError::SandboxProviderUnavailable { .. }
         | AgentError::SandboxNodeUnavailable { .. }
         | AgentError::SandboxConflictOnNode { .. }
+        | AgentError::SandboxEgressPolicyUnsupported { .. }
         | AgentError::Validation { .. }
         | AgentError::ImmutableSandboxImageRebuild { .. }
         | AgentError::SnapshotSizeLimitExceeded { .. }

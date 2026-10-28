@@ -26,6 +26,7 @@ impl LocalSandboxProvider {
 impl SandboxProvider for LocalSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Local)?;
+        config.refuse_restricted_egress(super::SandboxBackend::Local)?;
         let sandbox_name = format!("local-sandbox-{}", config.run_id);
         tracing::debug!(
             "LocalSandboxProvider: creating sandbox {} at {:?}",
@@ -40,6 +41,7 @@ impl SandboxProvider for LocalSandboxProvider {
             work_dir: config.host_work_dir,
             backend: super::SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         })
     }
 
@@ -257,6 +259,7 @@ impl SandboxProvider for LocalSandboxProvider {
                 work_dir: autopilot_dir,
                 backend: super::SandboxBackend::Local,
                 image: String::new(),
+                conditions: Vec::new(),
             }));
         }
 
@@ -269,6 +272,7 @@ impl SandboxProvider for LocalSandboxProvider {
                 work_dir: autofixer_dir,
                 backend: super::SandboxBackend::Local,
                 image: String::new(),
+                conditions: Vec::new(),
             }));
         }
 
@@ -316,6 +320,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(3600),
@@ -377,6 +382,7 @@ mod tests {
             work_dir: std::env::temp_dir(),
             backend: crate::sandbox::SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         };
 
         let result = provider.exec(&handle, vec![], HashMap::new(), None).await;
@@ -396,6 +402,7 @@ mod tests {
             work_dir: work_dir.clone(),
             backend: crate::sandbox::SandboxBackend::Local,
             image: String::new(),
+            conditions: Vec::new(),
         };
 
         assert!(provider.is_alive(&handle).await.unwrap());

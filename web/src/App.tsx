@@ -309,6 +309,9 @@ const AuditLogs = lazy(() =>
 const CliLogin = lazy(() =>
   import('./pages/CliLogin').then((m) => ({ default: m.CliLogin }))
 )
+const IngressLogin = lazy(() =>
+  import('./pages/IngressLogin').then((m) => ({ default: m.IngressLogin }))
+)
 const ProxyLogs = lazy(() => import('./pages/ProxyLogs'))
 const ProxyMetrics = lazy(() => import('./pages/ProxyMetrics'))
 const ProxyLogDetail = lazy(() => import('./pages/ProxyLogDetail'))
@@ -436,6 +439,11 @@ const McpServerPage = lazy(() =>
 const TelemetrySettingsPage = lazy(() =>
   import('./pages/settings/TelemetrySettingsPage').then((m) => ({
     default: m.TelemetrySettingsPage,
+  }))
+)
+const NetworkPolicyPage = lazy(() =>
+  import('./pages/settings/NetworkPolicyPage').then((m) => ({
+    default: m.NetworkPolicyPage,
   }))
 )
 const IngressSetupPage = lazy(() =>
@@ -814,6 +822,12 @@ const FullAppRoutes = () => {
                     visitors get bounced through /login and the
                     captureReturnTo() infrastructure brings them back. */}
                         <Route path="/cli-login" element={<CliLogin />} />
+                        {/* Temps login hand-off for environments that require
+                    it (ADR-055 §11); protected for the same reason. */}
+                        <Route
+                          path="/ingress/login"
+                          element={<IngressLogin />}
+                        />
                         <Route
                           path="/cli-login/:userCode"
                           element={<CliLogin />}
@@ -932,6 +946,10 @@ const FullAppRoutes = () => {
                             path="nodes/:nodeId"
                             element={<NodeDetailPage />}
                           />
+                          <Route
+                            path="nodes/:nodeId/:section"
+                            element={<NodeDetailPage />}
+                          />
                           <Route path="plugins" element={<PluginsPage />} />
                           <Route
                             path="plugins/install"
@@ -944,6 +962,10 @@ const FullAppRoutes = () => {
                           <Route
                             path="traefik-discovery"
                             element={<TraefikDiscoveryPage />}
+                          />
+                          <Route
+                            path="network-policy"
+                            element={<NetworkPolicyPage />}
                           />
                           <Route
                             path="mcp-server"

@@ -2043,6 +2043,13 @@ export type AppSettings = {
      */
     console_version?: string | null;
     container_logs?: ContainerLogSettings;
+    /**
+     * The control plane's (node 0's) scheduling settings, the counterpart
+     * of `nodes.resource_policy` / `nodes.system_reserved` on worker rows
+     * (ADR-055 §5). Stored here because node 0 is not a `nodes` row; changed
+     * through `PUT /nodes/0/resources`.
+     */
+    control_plane_resources?: ControlPlaneResourceSettings;
     disk_space_alert?: DiskSpaceAlertSettings;
     dns_provider?: DnsProviderSettings;
     docker_registry?: DockerRegistrySettings;
@@ -2686,6 +2693,11 @@ export type Assessment = {
 export type AssignRoleRequest = {
     role_type: string;
     user_id: number;
+};
+
+export type AttachEnvironmentVolumeRequest = {
+    mount_path: string;
+    read_only?: boolean;
 };
 
 /**
@@ -5208,6 +5220,13 @@ export type ClusterDnsSettings = {
      * `*.temps.local` FQDNs resolve inside containers.
      */
     enabled?: boolean;
+    /**
+     * Whether an operator has ever changed `enabled` themselves. Until then,
+     * the control plane turns cluster DNS on when the first worker joins,
+     * since cross-node links need `*.temps.local`. Set by the server when a
+     * save changes `enabled`; a client cannot clear it.
+     */
+    operator_chosen?: boolean;
 };
 
 /**
@@ -5221,6 +5240,24 @@ export type ClusterDnsStatusResponse = {
      * Some(false)` (or `None` if a node has never reported).
      */
     cluster_dns_enabled: boolean;
+    /**
+     * Applications whose running containers were created without the
+     * cluster resolver, so they cannot resolve `*.temps.local` names until
+     * redeployed: a container's nameservers are fixed when it is created.
+     * Empty while cluster DNS is off. Databases are not listed; they do not
+     * look up other services by name.
+     */
+    deployments_without_resolver: Array<DeploymentWithoutResolver>;
+    /**
+     * Set when the list above could not be computed; the rest of the
+     * response is still accurate.
+     */
+    deployments_without_resolver_error?: string | null;
+    /**
+     * Names refused because another owner holds them. Empty on a healthy
+     * cluster; each entry needs one side renamed or removed.
+     */
+    name_conflicts: Array<DnsNameConflictEntry>;
     nodes: Array<NodeDnsStatusEntry>;
     /**
      * Total `*.temps.local` records currently registered across the whole
@@ -6854,6 +6891,30 @@ export type ControlApplicationWorkspaceRequest = {
 };
 
 /**
+ * The control plane's scheduling settings (ADR-055 §5).
+ *
+ * `None` reserves take the §5 default for the control plane, which depends
+ * on whether its PostgreSQL runs on the same host (0.5 vCPU / 1 GB) or not
+ * (0.25 vCPU / 512 MB). Those defaults are estimates.
+ */
+export type ControlPlaneResourceSettings = {
+    /**
+     * `true` = `enforced`: refuse a placement on the control plane whose
+     * reservations exceed its capacity minus the reserve. `false` (the
+     * default) = `best_effort`.
+     */
+    enforce_reservations?: boolean;
+    /**
+     * CPU kept for Temps itself, in millicores. `None` = the default.
+     */
+    system_reserved_cpu_millis?: number | null;
+    /**
+     * Memory kept for Temps itself, in megabytes. `None` = the default.
+     */
+    system_reserved_memory_mb?: number | null;
+};
+
+/**
  * How much of the model's context the chat fills right now: the prompt size
  * of its latest request, which is the whole conversation, the system framing
  * and the tool definitions as the model last saw them.
@@ -7592,6 +7653,19 @@ export type CreateEnvironmentVariableRequest = {
     value: string;
 };
 
+export type CreateEnvironmentVolumeRequest = {
+    /**
+     * 2-64 characters of `[a-z0-9_.-]`, starting with a letter or digit;
+     * unique per environment.
+     */
+    name: string;
+    /**
+     * Keep the data when the volume is deleted.
+     */
+    retain_on_delete?: boolean;
+    size_mb?: number | null;
+};
+
 export type CreateExternalServiceRequest = {
     /**
      * Cluster member specifications for topology "cluster". Optional: when
@@ -7806,6 +7880,41 @@ export type CreateIncidentRequest = {
     title: string;
 };
 
+/**
+ * The proxy's signed login request, as the `/ingress/login` page received
+ * it in its query string.
+ */
+export type CreateIngressLoginGrantRequest = {
+    /**
+     * The hostname, without a port.
+     */
+    host: string;
+    /**
+     * Path on the host to return to.
+     */
+    next?: string | null;
+    owner_id: number;
+    /**
+     * `environment` or `sandbox` (a sandbox preview host).
+     */
+    owner_kind: string;
+    /**
+     * The port the visitor reached the host on, when the proxy's request
+     * carries one (it leaves out the scheme's default). Pass it through
+     * unchanged: it is part of the signature.
+     */
+    port?: number | null;
+    /**
+     * `http` or `https`: how the visitor reached the host.
+     */
+    scheme: string;
+    sig: string;
+    /**
+     * Unix seconds the proxy signed the request at.
+     */
+    ts: number;
+};
+
 export type CreateIntegrationBody = {
     /**
      * Registered provider name, e.g. "stripe".
@@ -7911,6 +8020,42 @@ export type CreateMonitorRequest = {
     environment_id: number;
     monitor_type: string;
     name: string;
+};
+
+export type CreateNetworkPolicyRuleRequest = {
+    /**
+     * `allow` or `deny`.
+     */
+    action: string;
+    description?: string | null;
+    /**
+     * `egress` or `ingress`.
+     */
+    direction: string;
+    /**
+     * `service` (by id), `workload` (`<kind>/<id>`) or `cidr`. `host`
+     * parses but is refused with 409 until a node runs the shared egress
+     * proxy that enforces hostname rules.
+     */
+    peer_kind: string;
+    peer_ref: string;
+    port_end?: number | null;
+    /**
+     * Omit both ports for every port (80/443 for a `host` rule).
+     */
+    port_start?: number | null;
+    /**
+     * `tcp` (default), `udp` or `any`.
+     */
+    protocol?: string | null;
+    /**
+     * Environment id for `deployment`; the row id for the other kinds.
+     */
+    subject_id: number;
+    /**
+     * `deployment` (an environment), `sandbox`, `service`, `function` or `job`.
+     */
+    subject_kind: string;
 };
 
 /**
@@ -8437,6 +8582,17 @@ export type CreateSandboxBody = {
      */
     disk_size_mb?: number | null;
     /**
+     * Which outside destinations the sandbox may reach (temps-native).
+     * Omit for `{"mode": "internet"}`: any public destination on ports 80
+     * and 443. `{"mode": "restricted", "rules": [...]}` allows only the
+     * listed hosts (`api.example.com`, or `*.example.com` for subdomains)
+     * and CIDR blocks, each on its `ports` (default 80 and 443). Private,
+     * loopback, link-local and metadata addresses are never reachable.
+     * A restricted policy needs the docker backend; elsewhere the create
+     * fails with 422. Change it later with `PUT /v1/sandboxes/{id}/egress-policy`.
+     */
+    egress_policy?: SandboxEgressPolicy;
+    /**
      * Extra env vars baked into the container on create.
      */
     env?: {
@@ -8521,6 +8677,21 @@ export type CreateSandboxBody = {
      * Idle timeout in seconds (temps-native). Clamped to `[60, 86400]`.
      */
     timeout_secs?: number | null;
+};
+
+/**
+ * The console asking to frame a sandbox's preview page.
+ */
+export type CreateSandboxPreviewSessionRequest = {
+    /**
+     * The sandbox's public id (`sbx_<hex>`).
+     */
+    sandbox_id: string;
+    /**
+     * The preview page to open, as the console would frame it:
+     * `http(s)://ws-<hex>-<port>.<preview domain>[:port]/path?query`.
+     */
+    url: string;
 };
 
 export type CreateShieldEntryRequest = {
@@ -8680,25 +8851,83 @@ export type CreatedShieldTokenResponse = ShieldTokenResponse & {
 };
 
 export type CronExecutionInfo = {
+    /**
+     * Attempts made (1 + retries).
+     */
+    attempt?: number | null;
     cron_id: number;
     error_message?: string | null;
     executed_at: string;
+    /**
+     * Exit code of the run's last attempt.
+     */
+    exit_code?: number | null;
+    /**
+     * When a `job` run finished, ISO 8601 UTC.
+     */
+    finished_at?: string | null;
     headers: string;
     id: number;
+    /**
+     * The last lines of the run's output, with secret values redacted.
+     */
+    output_tail?: string | null;
     response_time_ms: number;
+    /**
+     * `running | succeeded | failed | skipped` for a `job` run; absent
+     * for an `http` call, whose outcome is `status_code`.
+     */
+    state?: string | null;
     status_code: number;
     url: string;
+    /**
+     * The workload the `job` run executed as.
+     */
+    workload_id?: number | null;
 };
 
 export type CronInfo = {
+    /**
+     * The argv a `job` cron runs. Absent for `http`.
+     */
+    command?: Array<string> | null;
+    /**
+     * `allow | forbid | replace`: what a `job` run does while the previous
+     * one is still active.
+     */
+    concurrency_policy: string;
     created_at: string;
     deleted_at?: string | null;
     environment_id: number;
     id: number;
+    /**
+     * `http` (a GET to `path` on the running deployment) or `job`
+     * (`command` run in the environment's image until it exits). For a
+     * `job`, `path` is the cron's key, `job:<name>`.
+     */
+    mode: string;
     next_run?: string | null;
     path: string;
     project_id: number;
+    /**
+     * Attempts after the first when a `job` run fails.
+     */
+    retry_limit: number;
     schedule: string;
+    /**
+     * A `job` run that cannot start within this many seconds of its
+     * scheduled time is skipped.
+     */
+    starting_deadline_seconds?: number | null;
+    /**
+     * Maximum run time of a `job` run; absent takes the default (3600).
+     */
+    timeout_seconds?: number | null;
+    /**
+     * How long a finished `job` run's container is kept; absent takes the
+     * default (600).
+     */
+    ttl_seconds_after_finished?: number | null;
     updated_at: string;
 };
 
@@ -9264,6 +9493,18 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeletedEnvironmentVolumeResponse = {
+    /**
+     * Why the data was kept, when it was.
+     */
+    backing_kept_reason?: string | null;
+    /**
+     * The Docker volume (and its data) was removed.
+     */
+    backing_removed: boolean;
+    volume: EnvironmentVolumeResponse;
 };
 
 export type DeliveryCapabilityResponse = {
@@ -10074,6 +10315,23 @@ export type DeploymentTokenResponse = {
 };
 
 /**
+ * An application whose running containers were created without the
+ * cluster resolver. Redeploying it gives the new containers the resolver.
+ */
+export type DeploymentWithoutResolver = {
+    deployment_id: number;
+    environment_id: number;
+    environment_name: string;
+    /**
+     * Hosts running one of its containers without the resolver.
+     */
+    hosts: Array<ResolverCoverageHost>;
+    project_id: number;
+    project_name: string;
+    project_slug: string;
+};
+
+/**
  * The typed detector definition stored (as jsonb) in
  * `metric_alert_rules.detection_config`.
  *
@@ -10496,6 +10754,32 @@ export type DnsLookupResponse = {
      * List of A record IP addresses
      */
     records: Array<string>;
+};
+
+/**
+ * An internal DNS name two owners publish (ADR-055 §10). The holder's
+ * records are served; the other owner's publishes are refused, and any
+ * records it had before the conflict was found stay in the zone untouched.
+ * Part of `GET /api/cluster/dns/status`.
+ */
+export type DnsNameConflictEntry = {
+    first_seen_at: string;
+    /**
+     * The contested name, normalised (lower case, no trailing dot).
+     */
+    fqdn: string;
+    holder_id: number;
+    /**
+     * Owner that holds the name.
+     */
+    holder_kind: string;
+    last_seen_at: string;
+    owner_id: number;
+    /**
+     * Owner whose publish is refused: `environment`, `service_role`,
+     * `service_member`, `node` or `static`.
+     */
+    owner_kind: string;
 };
 
 /**
@@ -11416,6 +11700,55 @@ export type EffectiveLimits = {
     max_requests_per_minute_source: LimitSource;
 };
 
+export type EffectivePolicyResponse = {
+    enforced: boolean;
+    /**
+     * Nodes whose mode is `enforce`. Empty: the policy is shown but not
+     * enforced anywhere yet (every node is `legacy` or `shadow`).
+     */
+    enforcing_nodes: Array<number>;
+    /**
+     * Link rules of other workloads that name this one; they are accepted
+     * even when this workload's ingress is restricted.
+     */
+    inbound_links: Array<NetworkPolicyRuleResponse>;
+    profile: ProfileResponse;
+    /**
+     * Rules whose subject is this workload.
+     */
+    rules: Array<NetworkPolicyRuleResponse>;
+    subject_id: number;
+    subject_kind: string;
+};
+
+/**
+ * How a sandbox may reach the outside world.
+ */
+export type EgressMode = 'internet' | 'restricted';
+
+/**
+ * One allowed destination. Exactly one of `host` or `cidr` is set.
+ */
+export type EgressRule = {
+    /**
+     * An IPv4 or IPv6 address or CIDR block (`198.51.100.7`,
+     * `2606:4700::/32`), matched against a literal IP the sandbox asked for
+     * or the address a hostname resolved to.
+     */
+    cidr?: string | null;
+    /**
+     * A hostname, matched case-insensitively against the name the sandbox
+     * asked for (`api.example.com`). A leading `*.` matches subdomains only:
+     * `*.example.com` matches `a.example.com` and `a.b.example.com`, never
+     * `example.com` itself.
+     */
+    host?: string | null;
+    /**
+     * Destination ports this rule permits, 1-65535. Empty means 80 and 443.
+     */
+    ports?: Array<number>;
+};
+
 export type EligibleGitRepositoryResponse = {
     accountName: string;
     connectionId: number;
@@ -12129,6 +12462,8 @@ export type EnvironmentInfo = {
     name: string;
 };
 
+export type EnvironmentIngressMode = 'legacy' | 'shadow' | 'enforce';
+
 /**
  * Everything about one environment's addresses.
  */
@@ -12285,6 +12620,69 @@ export type EnvironmentVariableValueResponse = {
      */
     value: string;
 };
+
+export type EnvironmentVolumeListResponse = {
+    page: number;
+    page_size: number;
+    total: number;
+    /**
+     * Newest first.
+     */
+    volumes: Array<EnvironmentVolumeResponse>;
+};
+
+export type EnvironmentVolumeResponse = {
+    attachment?: VolumeAttachmentDto | null;
+    /**
+     * `named` (a Docker named volume).
+     */
+    backing: string;
+    /**
+     * ISO 8601, UTC.
+     */
+    created_at: string;
+    environment_id: number;
+    id: number;
+    name: string;
+    /**
+     * The node holding the data: `null` until first created, `0` for the
+     * control plane. A replica that mounts it is pinned there.
+     */
+    node_id?: number | null;
+    /**
+     * The pin the console shows, e.g. "pinned to node 0 by volume `data`".
+     */
+    pin_reason?: string | null;
+    retain_on_delete: boolean;
+    size_mb?: number | null;
+    updated_at: string;
+};
+
+export type EnvironmentVolumeStatusResponse = {
+    /**
+     * Whether the next deploy mounts them.
+     */
+    active: boolean;
+    /**
+     * Attached volumes.
+     */
+    attached: number;
+    environment_id: number;
+    /**
+     * Why they would not be mounted (the next deploy fails with it).
+     */
+    reason?: string | null;
+    replicas: number;
+    /**
+     * Console path that fixes it.
+     */
+    setup_path?: string | null;
+    workload_mode: EnvironmentWorkloadMode;
+};
+
+export type EnvironmentWorkloadIsolation = 'process' | 'micro_vm';
+
+export type EnvironmentWorkloadMode = 'legacy' | 'shadow' | 'enforce';
 
 export type ErrorDashboardStatsQuery = {
     compare_to_previous?: boolean | null;
@@ -15608,6 +16006,13 @@ export type HeartbeatApiRequest = {
      */
     containers?: Array<ContainerInventoryItem> | null;
     /**
+     * Deployment ids with a container on this node created without the
+     * node's cluster resolver, so it cannot resolve `*.temps.local` until
+     * redeployed. Empty while cluster DNS is off; absent from older agents,
+     * which leaves the stored value untouched.
+     */
+    deployments_without_resolver?: Array<number> | null;
+    /**
      * Software RAID and drive SMART health read by the agent
      * (`temps_metrics::collector::disk_health::DiskHealthReport`). Kept as raw
      * JSON here and parsed after the heartbeat is recorded, so a malformed
@@ -15630,6 +16035,16 @@ export type HeartbeatApiRequest = {
      */
     docker_socket_projects?: Array<string> | null;
     /**
+     * What the node runtime observed of the workload instances assigned to
+     * this node (ADR-055 §7), only those that changed since its last
+     * accepted heartbeat. Sent by agents that advertise the `state_stream`
+     * capability; absent from older agents. A report this control plane
+     * cannot read is dropped (and logged), never the heartbeat.
+     */
+    instances?: Array<{
+        [key: string]: unknown;
+    }> | null;
+    /**
      * Updated node labels for scheduling (allows runtime label changes).
      */
     labels?: unknown;
@@ -15638,10 +16053,24 @@ export type HeartbeatApiRequest = {
      */
     occupied_ranges?: Array<OccupiedRangeReport> | null;
     overlay?: OverlayHeartbeat | null;
+    /**
+     * The overlay address of each running Temps container on the node, sent
+     * when the set changes. Absent from older agents.
+     */
+    overlay_addresses?: Array<OverlayAddressReport> | null;
     public_ingress?: PublicIngressHeartbeat | null;
 };
 
 export type HeartbeatResponse = {
+    /**
+     * Whether the instance reports in this heartbeat (ADR-055 §7) were
+     * recorded. `false` when it carried none, when recording them failed,
+     * or when this process runs no node state stream: the node must keep
+     * resending them until a heartbeat answers `true`. The heartbeat itself
+     * still succeeds, so a failed ingest never costs the node its liveness.
+     * Absent from older servers, which agents read as `false`.
+     */
+    instances_accepted: boolean;
     message: string;
     status: string;
 };
@@ -16612,12 +17041,50 @@ export type IngestErrorsResponse = {
     errors: Array<IngestErrorSummary>;
 };
 
+export type IngressLoginGrantResponse = {
+    /**
+     * When the session this grant can start expires.
+     * ISO 8601, UTC.
+     */
+    expires_at: string;
+    grant_id: number;
+    /**
+     * Where the browser goes next: the host's exchange path with a
+     * short-lived grant. Contains a credential; do not store it.
+     */
+    redirect_url: string;
+};
+
 /**
  * What a worker lets its control plane do with public ingress. Set on the
  * worker only (`temps join --ingress`, `temps agent ingress`): opening ports
  * on a machine is its owner's decision, whoever runs the control plane.
  */
 export type IngressMode = 'off' | 'fixed' | 'delegated' | 'private';
+
+export type IngressSettingsResponse = {
+    environment_id: number;
+    /**
+     * Whether the proxy asks for the login right now: only in `enforce`.
+     */
+    login_enforced: boolean;
+    /**
+     * The console permission a visitor needs, when a login is required.
+     */
+    login_permission?: string | null;
+    /**
+     * `legacy`: the existing access chain decides. `shadow`: it still
+     * decides, and the compiled endpoint is evaluated alongside and every
+     * disagreement counted (`proxy.ingress_shadow_mismatches`). `enforce`:
+     * the compiled endpoint decides.
+     */
+    mode: EnvironmentIngressMode;
+    project_id: number;
+    /**
+     * Whether visitors must sign in to Temps.
+     */
+    require_login: boolean;
+};
 
 export type InheritedEnvVarResponse = {
     /**
@@ -19310,6 +19777,42 @@ export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
 };
 
+export type NetworkPolicyRuleListResponse = {
+    items: Array<NetworkPolicyRuleResponse>;
+    page: number;
+    page_size: number;
+    total: number;
+};
+
+export type NetworkPolicyRuleResponse = {
+    action: string;
+    created_at: string;
+    created_by?: number | null;
+    description?: string | null;
+    direction: string;
+    /**
+     * False for a `host` rule: hostname rules are enforced only by the
+     * shared egress proxy, which no node runs yet, so such a rule (stored
+     * before new ones were refused) is shown but never enforced.
+     */
+    enforceable: boolean;
+    id: number;
+    link_id?: number | null;
+    link_table?: string | null;
+    /**
+     * `link` rules are removed by unlinking, not deleted directly.
+     */
+    origin: string;
+    peer_kind: string;
+    peer_ref: string;
+    port_end?: number | null;
+    port_start?: number | null;
+    protocol: string;
+    subject_id: number;
+    subject_kind: string;
+    updated_at: string;
+};
+
 /**
  * Cluster-wide pool which every node must use. This is intentionally sent
  * alongside the local allocation so operators and agents can detect stale or
@@ -19371,6 +19874,18 @@ export type NixpacksPresetConfig = {
  * providers.
  */
 export type NixpacksProvider = '...' | 'node' | 'python' | 'rust' | 'go' | 'java' | 'php' | 'ruby' | 'deno' | 'elixir' | 'csharp' | 'fsharp' | 'dart' | 'swift' | 'zig' | 'scala' | 'haskell' | 'clojure' | 'crystal' | 'cobol' | 'gleam' | 'lunatic' | 'scheme' | 'static';
+
+/**
+ * Whether one node can run sandboxes on one backend.
+ */
+export type NodeBackend = {
+    available: boolean;
+    backend: SandboxBackend;
+    /**
+     * Why the node cannot run it, and how to fix that when it can be fixed.
+     */
+    reason?: string | null;
+};
 
 /**
  * Whether this installation can run a workload anywhere, and if not, why.
@@ -19611,6 +20126,20 @@ export type NodeEvictionResponse = {
     node: PlacementNode;
 };
 
+export type NodeExclusionDto = {
+    /**
+     * `false` when the node was kept with a warning.
+     */
+    excluded: boolean;
+    message: string;
+    node_id: number;
+    node_name: string;
+    /**
+     * The `Scheduled` condition reason, e.g. `NodeDraining`.
+     */
+    reason: string;
+};
+
 export type NodeInfoResponse = {
     address: string;
     /**
@@ -19698,6 +20227,37 @@ export type NodeMetricsReportingStatus = {
     state: string;
 };
 
+export type NodeNetworkPolicyModeListResponse = {
+    nodes: Array<NodeNetworkPolicyModeResponse>;
+};
+
+export type NodeNetworkPolicyModeResponse = {
+    /**
+     * Why `shadow`/`enforce` is unavailable, when `supports_enforcement`
+     * is false.
+     */
+    enforcement_unavailable_reason?: string | null;
+    /**
+     * `legacy` (today's behaviour), `shadow` (computed and logged, not
+     * applied) or `enforce`.
+     */
+    mode: string;
+    name: string;
+    /**
+     * 0 is the control plane.
+     */
+    node_id: number;
+    role: string;
+    status: string;
+    /**
+     * Whether this node can run `shadow` or `enforce`: always on the
+     * control plane, on a worker while its agent reports an enforcer. A
+     * stored non-legacy mode on a node without one is never counted as
+     * enforcing.
+     */
+    supports_enforcement: boolean;
+};
+
 export type NodePairingListResponse = {
     pairings: Array<NodePairingResponse>;
 };
@@ -19760,6 +20320,32 @@ export type NodePlacementReference = {
      * an update.
      */
     target_nodes: Array<number>;
+};
+
+export type NodeRecommendationDto = {
+    node_id: number;
+    node_name: string;
+    reasons: Array<string>;
+    score: number;
+};
+
+/**
+ * Whether the scheduler counts reservations against a node's capacity.
+ */
+export type NodeResourcePolicy = 'best_effort' | 'enforced';
+
+export type NodeResourcesResponse = {
+    /**
+     * `0` is the control plane.
+     */
+    node_id: number;
+    resource_policy: NodeResourcePolicy;
+    system_reserved: SystemReserved;
+    /**
+     * Whether `system_reserved` is the default for the node's role. The
+     * defaults are ADR-055 §5 estimates, not measurements.
+     */
+    system_reserved_is_default: boolean;
 };
 
 /**
@@ -19972,6 +20558,28 @@ export type NodeSshHostKeyResponse = {
      * `SHA256:…`, as `ssh-keygen -l` prints it.
      */
     fingerprint: string;
+};
+
+/**
+ * The stream's state and metrics.
+ */
+export type NodeStateStatusResponse = {
+    /**
+     * Whether the workload plane (and so the stream) runs in this process.
+     */
+    configured: boolean;
+    full_snapshots: number;
+    markers_swept: number;
+    reads: number;
+    /**
+     * Why not, when `configured` is false.
+     */
+    reason?: string | null;
+    /**
+     * How far the visibility watermark lags behind the oldest marker it
+     * holds back, in milliseconds (an old open transaction holds it).
+     */
+    watermark_lag_ms: number;
 };
 
 /**
@@ -20683,6 +21291,14 @@ export type OutlierParams = {
      * Sensitivity; higher tolerates larger spread before flagging.
      */
     tolerance?: number;
+};
+
+/**
+ * One running container's overlay address, from a heartbeat.
+ */
+export type OverlayAddressReport = {
+    container_name: string;
+    ip: string;
 };
 
 /**
@@ -21450,6 +22066,34 @@ export type PendingActionResponse = {
     summary: string;
 };
 
+/**
+ * What recreating a database's container from its workload spec would
+ * change, listed before anything is changed. A recreate is only accepted
+ * with this response's `fingerprint`, so what the administrator confirmed
+ * is what is applied.
+ */
+export type PendingChanges = {
+    changes: Array<WorkloadChange>;
+    computed_at: string;
+    /**
+     * Whether the database's container exists to compare against.
+     */
+    container_found: boolean;
+    container_name?: string | null;
+    /**
+     * Identifies `changes`: pass it back to confirm a recreate.
+     */
+    fingerprint: string;
+    mode: ServiceWorkloadMode;
+    /**
+     * `None`: the control plane.
+     */
+    node_id?: number | null;
+    service_id: number;
+    service_name: string;
+    support: WorkloadSupport;
+};
+
 export type PerformanceMetricsQuery = SpeedSegmentFilters & {
     deployment_id?: number | null;
     /**
@@ -21637,6 +22281,26 @@ export type PgUpgradeResponse = {
     to_version: string;
 };
 
+export type PinningRecommendationResponse = {
+    changes_placement: boolean;
+    current_nodes: Array<number>;
+    environment_id: number;
+    /**
+     * Unpinned and moved between nodes: show the recommendation.
+     */
+    moved_between_nodes: boolean;
+    /**
+     * Distinct nodes the environment ran on in the window.
+     */
+    nodes_used: Array<number>;
+    reasons: Array<string>;
+    /**
+     * The recommended `target_nodes`. Recommended, never applied.
+     */
+    recommended_nodes: Array<number>;
+    window_days: number;
+};
+
 /**
  * One `(timestamp, value)` sample in a pipeline series.
  */
@@ -21747,6 +22411,28 @@ export type PipelineStatsResponse = {
     stats: PipelineStats;
 };
 
+export type PlacementExplanationResponse = {
+    environment_id: number;
+    excluded: Array<NodeExclusionDto>;
+    /**
+     * Why the environment is pinned by its volumes, e.g. "pinned to node 0
+     * by volume `data`" (ADR-055 §12). `null` without attached volumes.
+     */
+    pinned_by?: string | null;
+    /**
+     * Where the unified scheduler would put each replica now (`0` = the
+     * control plane).
+     */
+    placement?: Array<number> | null;
+    /**
+     * Eligible nodes, best first.
+     */
+    recommended: Array<NodeRecommendationDto>;
+    unschedulable?: string | null;
+    unschedulable_reason?: string | null;
+    warnings: Array<string>;
+};
+
 /**
  * One row of `GET /sandboxes/placement`.
  */
@@ -21755,6 +22441,12 @@ export type PlacementNode = {
      * Allowed by the operator's sandbox placement settings.
      */
     allowed: boolean;
+    /**
+     * Every backend a sandbox can ask for, and whether this node can run
+     * it. A node that cannot says why, so a client can show the choice and
+     * its fix rather than hide it.
+     */
+    backends?: Array<NodeBackend>;
     /**
      * Labelled `temps.sh/role=dedicated`: automatic placement never picks
      * it, but a sandbox that requests it by id or name may still run there
@@ -22219,6 +22911,25 @@ export type PresetResponse = {
     slug: string;
 };
 
+/**
+ * A sandbox's preview access settings.
+ */
+export type PreviewAccessResponse = {
+    /**
+     * Sandbox public id (`sbx_...`).
+     */
+    id: string;
+    preview_access: SandboxPreviewAccess;
+    /**
+     * Normalised CIDRs. Empty = any client address.
+     */
+    preview_allowed_cidrs: Array<string>;
+    /**
+     * Last 4 characters of the preview password, when one is set.
+     */
+    preview_password_hint?: string | null;
+};
+
 export type PreviewDomainDeliveryBindingRequest = {
     delivery_profile_id?: number | null;
     dns_provider_id: number;
@@ -22477,6 +23188,16 @@ export type ProblemDetails = {
      * A URI reference that identifies the problem type
      */
     type?: string | null;
+};
+
+export type ProfileResponse = {
+    egress: string;
+    /**
+     * `default` (the kind's) or `override`.
+     */
+    egress_source: string;
+    ingress: string;
+    ingress_source: string;
 };
 
 export type ProjectAccessResponse = {
@@ -24848,6 +25569,28 @@ export type RecoveryTarget = {
     name: string;
 };
 
+export type RecreateFromWorkloadSpecRequest = {
+    /**
+     * The `fingerprint` of the pending changes being confirmed. Leave out
+     * to only list them: nothing is recreated without it.
+     */
+    confirmed_fingerprint?: string | null;
+};
+
+export type RecreateFromWorkloadSpecResponse = {
+    /**
+     * The changes to confirm, or the changes that were applied.
+     */
+    pending_changes: PendingChanges;
+    remaining_changes?: PendingChanges | null;
+    status: RecreateStatus;
+};
+
+/**
+ * What a recreate request did.
+ */
+export type RecreateStatus = 'confirmation_required' | 'recreated';
+
 export type ReferrerCount = {
     count: number;
     percentage: number;
@@ -25512,6 +26255,17 @@ export type ResolvedEnvVarSource = {
 } | {
     service: EnvVarIntegrationInfo;
     type: 'integration';
+};
+
+/**
+ * Where a stale deployment runs: the control plane or a worker.
+ */
+export type ResolverCoverageHost = {
+    /**
+     * `None` for the control plane, which has no node row.
+     */
+    node_id?: number | null;
+    node_name: string;
 };
 
 /**
@@ -26490,6 +27244,15 @@ export type S3SourceResponse = {
 };
 
 /**
+ * Which isolation backend a sandbox runs on (ADR-029, ADR-050). Docker
+ * containers, Firecracker microVMs and microsandbox (libkrun) microVMs
+ * coexist on the same host behind the same `SandboxProvider` seam;
+ * `routing::RoutingSandboxProvider` dispatches between them. `Local` is the
+ * dev-only fork-exec fallback.
+ */
+export type SandboxBackend = 'docker' | 'firecracker' | 'microsandbox' | 'local';
+
+/**
  * The Git changes of every repository found under the work directory.
  */
 export type SandboxChanges = {
@@ -26553,6 +27316,19 @@ export type SandboxDirectory = {
 
 export type SandboxDomainResponse = {
     url: string;
+};
+
+/**
+ * A sandbox's egress policy. Build it from untrusted input with
+ * [`SandboxEgressPolicy::normalized`], which validates it and puts it in its
+ * canonical form; only a normalized policy is stored or enforced.
+ */
+export type SandboxEgressPolicy = {
+    mode?: EgressMode;
+    /**
+     * Allowed destinations, in `restricted` mode. At most 100.
+     */
+    rules?: Array<EgressRule>;
 };
 
 /**
@@ -26678,6 +27454,10 @@ export type SandboxInner = {
      * the default.
      */
     disk_size_mb?: number | null;
+    /**
+     * Which outside destinations the sandbox may reach (temps-native).
+     */
+    egress_policy: SandboxEgressPolicy;
     id: string;
     image?: string | null;
     /**
@@ -26697,6 +27477,17 @@ export type SandboxInner = {
      * sandboxes.
      */
     node_name: string;
+    /**
+     * Who may open the preview URLs: `temps_login` (a signed-in Temps user
+     * who may read this sandbox; the default), `password` (whoever knows the
+     * preview password) or `public` (anyone).
+     */
+    preview_access: SandboxPreviewAccess;
+    /**
+     * Client networks allowed to open the preview URLs, as normalised
+     * CIDRs. Checked before `preview_access`; empty = any address.
+     */
+    preview_allowed_cidrs: Array<string>;
     preview_password_hint?: string | null;
     preview_url_template: string;
     /**
@@ -26754,6 +27545,16 @@ export type SandboxPlacementResponse = {
      */
     nodes: Array<PlacementNode>;
 };
+
+/**
+ * Who may open a sandbox's preview URLs (ADR-055 §11: sandboxes default to
+ * `TempsLogin`, never anonymous by default).
+ *
+ * Stored on the sandbox row (`sandboxes.preview_access`). The sandbox's IP
+ * allow-list (`sandboxes.preview_allowed_cidrs`) is checked before any of
+ * these, so `Public` plus an allow-list means "anyone from these networks".
+ */
+export type SandboxPreviewAccess = 'temps_login' | 'password' | 'public';
 
 /**
  * `@vercel/sandbox` wraps every single-sandbox response as
@@ -28315,6 +29116,33 @@ export type ServiceUpdateAlertRuleRequest = {
     threshold?: number | null;
 };
 
+export type ServiceWorkloadMode = 'legacy' | 'shadow' | 'enforce';
+
+/**
+ * A database's workload mode.
+ */
+export type ServiceWorkloadModeResponse = {
+    /**
+     * `legacy`: the engine (or the worker's agent) builds its own
+     * container request. `shadow`: the same, and a background pass logs
+     * where the running container differs from its workload spec.
+     * `enforce`: the container is created from its admitted spec through
+     * the Docker driver, the next time it is created or recreated.
+     */
+    mode: ServiceWorkloadMode;
+    /**
+     * `None`: the database runs on the control plane.
+     */
+    node_id?: number | null;
+    service_id: number;
+    service_name: string;
+    service_type: string;
+    /**
+     * Whether the database can leave `legacy`, and why not.
+     */
+    support: WorkloadSupport;
+};
+
 export type SesCredentialsRequest = {
     access_key_id: string;
     secret_access_key: SecretString;
@@ -28642,6 +29470,10 @@ export type SetManagedRecordRequest = {
     ttl?: number | null;
 };
 
+export type SetNodeNetworkPolicyModeRequest = {
+    mode: string;
+};
+
 export type SetNodePublicIngressRequest = {
     enabled: boolean;
 };
@@ -28649,6 +29481,11 @@ export type SetNodePublicIngressRequest = {
 export type SetNodePublicIngressResponse = {
     enabled: boolean;
     node_id: number;
+};
+
+export type SetNodeResourcesRequest = {
+    resource_policy?: NodeResourcePolicy | null;
+    system_reserved?: SystemReserved | null;
 };
 
 export type SetPreviewPasswordBody = {
@@ -28666,6 +29503,14 @@ export type SetPreviewPasswordResponse = {
      * users can confirm which password is live without re-entering it.
      */
     preview_password_hint: string;
+};
+
+export type SetProfileRequest = {
+    /**
+     * `open`, `restricted`, `none`, or omitted for the kind's default.
+     */
+    egress?: string | null;
+    ingress?: string | null;
 };
 
 /**
@@ -28759,6 +29604,25 @@ export type SetResponse = {
  */
 export type SetWireguardMeshHubRequest = {
     hub: WireguardMeshHubTarget;
+};
+
+export type SetWorkloadIsolationRequest = {
+    /**
+     * `process` (a container, the default and the rollback) or `micro_vm`
+     * (a Firecracker microVM; placed only on a node whose runtime provides
+     * it, refused with the scheduler's reason otherwise). Honoured only
+     * when the environment's `workload_mode` is `enforce`.
+     */
+    workload_isolation: EnvironmentWorkloadIsolation;
+};
+
+export type SetWorkloadModeRequest = {
+    /**
+     * `legacy` (today's deploy path), `shadow` (legacy, plus a logged
+     * unified-scheduler comparison) or `enforce` (control-plane replicas run
+     * through the workload plane). `legacy` is the rollback.
+     */
+    workload_mode: EnvironmentWorkloadMode;
 };
 
 /**
@@ -30577,6 +31441,15 @@ export type SyntaxResult = {
     username?: string | null;
 };
 
+/**
+ * The capacity Temps keeps for itself on a node: a scheduling deduction,
+ * not a CPU priority (ADR-055 §5).
+ */
+export type SystemReserved = {
+    cpu_millis: number;
+    memory_mb: number;
+};
+
 export type TagInfo = {
     commit_sha: string;
     name: string;
@@ -31567,7 +32440,8 @@ export type ToggleServiceMetricsRequest = {
 
 export type TokenCheckRequest = {
     /**
-     * The token, as pasted. Used for this check only; not stored.
+     * The token, as pasted. Used for this check only; not stored. A
+     * secret field, so the AI assistant takes it through a secret slot.
      */
     token: SecretString;
     /**
@@ -33063,6 +33937,14 @@ export type UpdateIncidentUpdateVisibilityRequest = {
     is_public: boolean;
 };
 
+export type UpdateIngressSettingsRequest = {
+    mode?: EnvironmentIngressMode | null;
+    /**
+     * Leave out to keep the current setting.
+     */
+    require_login?: boolean | null;
+};
+
 /**
  * Request to update an IP access control rule
  */
@@ -33236,6 +34118,26 @@ export type UpdatePermissionModeRequest = {
 
 export type UpdatePreferencesRequest = {
     preferences: NotificationPreferencesResponse;
+};
+
+/**
+ * Request body for `PUT /v1/sandboxes/{id}/preview-access`. Both members
+ * are required: the call replaces the whole setting, so an omitted
+ * allow-list can never be read as "clear it".
+ */
+export type UpdatePreviewAccessBody = {
+    /**
+     * `temps_login` | `password` | `public`. `password` is refused while
+     * the sandbox has no preview password (set one with
+     * `PUT /v1/sandboxes/{id}/preview-password`, which also selects it).
+     */
+    access: SandboxPreviewAccess;
+    /**
+     * IPv4/IPv6 addresses or CIDRs allowed to open the preview URLs, at
+     * most 50. A single address is stored as a `/32` or `/128`; a CIDR as
+     * its network address. Empty = any client address.
+     */
+    allowed_cidrs: Array<string>;
 };
 
 /**
@@ -33710,6 +34612,10 @@ export type UpdateWebhookRequestBody = {
      * Target URL for webhook delivery
      */
     url?: string | null;
+};
+
+export type UpdateWorkloadModeRequest = {
+    mode: ServiceWorkloadMode;
 };
 
 export type UpgradeExternalServiceRequest = {
@@ -34545,6 +35451,14 @@ export type VisitorsResponse = {
     visitors: Array<VisitorInfo>;
 };
 
+export type VolumeAttachmentDto = {
+    /**
+     * Absolute path inside every replica.
+     */
+    mount_path: string;
+    read_only: boolean;
+};
+
 /**
  * Volume mount in deployment
  */
@@ -34993,6 +35907,25 @@ export type WorkflowDryRunRequest = {
 };
 
 /**
+ * One thing a recreate from the spec would change.
+ */
+export type WorkloadChange = {
+    /**
+     * What the container will have once recreated from its spec.
+     */
+    after_recreate: string;
+    /**
+     * What the running container has. Secrets are shown as `***`.
+     */
+    current: string;
+    /**
+     * `labels`, `restart_policy`, `pids_limit`, `no_new_privileges`,
+     * `healthcheck`, `log_config`, ...
+     */
+    field: string;
+};
+
+/**
  * Brief descriptor for discovered workloads (used in listing)
  */
 export type WorkloadDescriptor = {
@@ -35033,10 +35966,42 @@ export type WorkloadDescriptor = {
  */
 export type WorkloadId = string;
 
+export type WorkloadIsolationResponse = {
+    /**
+     * Whether the setting takes effect: only `enforce` deployments run
+     * through the plane, so `legacy` and `shadow` keep a container.
+     */
+    applies: boolean;
+    environment_id: number;
+    workload_isolation: EnvironmentWorkloadIsolation;
+};
+
+export type WorkloadModeChangeResponse = {
+    pending_changes?: PendingChanges | null;
+    previous_mode: ServiceWorkloadMode;
+    workload: ServiceWorkloadModeResponse;
+};
+
+export type WorkloadModeResponse = {
+    environment_id: number;
+    workload_mode: EnvironmentWorkloadMode;
+};
+
 /**
  * Workload status in source system
  */
 export type WorkloadStatus = 'running' | 'paused' | 'stopped' | 'exited' | 'failed' | 'deployed' | 'building' | 'unknown';
+
+/**
+ * Whether a database can leave `legacy`, and why not.
+ */
+export type WorkloadSupport = {
+    /**
+     * Why the database stays on its engine's own path, when unsupported.
+     */
+    reason?: string | null;
+    supported: boolean;
+};
 
 /**
  * Workload type
@@ -51434,6 +52399,190 @@ export type GetPostgresWalHealthResponses = {
 
 export type GetPostgresWalHealthResponse = GetPostgresWalHealthResponses[keyof GetPostgresWalHealthResponses];
 
+export type GetWorkloadModeData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/workload-mode';
+};
+
+export type GetWorkloadModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrator required
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetWorkloadModeError = GetWorkloadModeErrors[keyof GetWorkloadModeErrors];
+
+export type GetWorkloadModeResponses = {
+    /**
+     * The database's workload mode
+     */
+    200: ServiceWorkloadModeResponse;
+};
+
+export type GetWorkloadModeResponse = GetWorkloadModeResponses[keyof GetWorkloadModeResponses];
+
+export type UpdateWorkloadModeData = {
+    body: UpdateWorkloadModeRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/workload-mode';
+};
+
+export type UpdateWorkloadModeErrors = {
+    /**
+     * The database cannot use this mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrator required
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateWorkloadModeError = UpdateWorkloadModeErrors[keyof UpdateWorkloadModeErrors];
+
+export type UpdateWorkloadModeResponses = {
+    /**
+     * Mode changed; nothing running changed
+     */
+    200: WorkloadModeChangeResponse;
+};
+
+export type UpdateWorkloadModeResponse = UpdateWorkloadModeResponses[keyof UpdateWorkloadModeResponses];
+
+export type GetWorkloadPendingChangesData = {
+    body?: never;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/workload-mode/pending-changes';
+};
+
+export type GetWorkloadPendingChangesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrator required
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * The node's agent must be upgraded
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetWorkloadPendingChangesError = GetWorkloadPendingChangesErrors[keyof GetWorkloadPendingChangesErrors];
+
+export type GetWorkloadPendingChangesResponses = {
+    /**
+     * What a recreate from the workload spec would change
+     */
+    200: PendingChanges;
+};
+
+export type GetWorkloadPendingChangesResponse = GetWorkloadPendingChangesResponses[keyof GetWorkloadPendingChangesResponses];
+
+export type RecreateFromWorkloadSpecData = {
+    body: RecreateFromWorkloadSpecRequest;
+    path: {
+        /**
+         * External service ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/external-services/{id}/workload-mode/recreate';
+};
+
+export type RecreateFromWorkloadSpecErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrator required
+     */
+    403: ProblemDetails;
+    /**
+     * Service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Not in enforce mode, or the pending changes changed since they were shown
+     */
+    409: ProblemDetails;
+    /**
+     * The workload spec was refused at admission
+     */
+    422: ProblemDetails;
+    /**
+     * The recreate failed; the original container was kept
+     */
+    500: ProblemDetails;
+};
+
+export type RecreateFromWorkloadSpecError = RecreateFromWorkloadSpecErrors[keyof RecreateFromWorkloadSpecErrors];
+
+export type RecreateFromWorkloadSpecResponses = {
+    /**
+     * The changes to confirm, or the recreate's result
+     */
+    200: RecreateFromWorkloadSpecResponse;
+};
+
+export type RecreateFromWorkloadSpecResponse2 = RecreateFromWorkloadSpecResponses[keyof RecreateFromWorkloadSpecResponses];
+
 export type ExternalServiceEnablePgStatStatementsData = {
     body?: never;
     path: {
@@ -54899,6 +56048,51 @@ export type SetIngressHostnameChoiceResponses = {
 
 export type SetIngressHostnameChoiceResponse = SetIngressHostnameChoiceResponses[keyof SetIngressHostnameChoiceResponses];
 
+export type CreateIngressLoginGrantData = {
+    body: CreateIngressLoginGrantRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/login-grants';
+};
+
+export type CreateIngressLoginGrantErrors = {
+    /**
+     * Malformed login request
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Not a browser session, a bad or expired signature, or insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment or sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The environment or sandbox preview does not require a Temps login
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateIngressLoginGrantError = CreateIngressLoginGrantErrors[keyof CreateIngressLoginGrantErrors];
+
+export type CreateIngressLoginGrantResponses = {
+    /**
+     * Grant issued; send the browser to redirect_url
+     */
+    201: IngressLoginGrantResponse;
+};
+
+export type CreateIngressLoginGrantResponse = CreateIngressLoginGrantResponses[keyof CreateIngressLoginGrantResponses];
+
 export type ListIngressProvidersData = {
     body?: never;
     path?: never;
@@ -54911,6 +56105,51 @@ export type ListIngressProvidersResponses = {
 };
 
 export type ListIngressProvidersResponse = ListIngressProvidersResponses[keyof ListIngressProvidersResponses];
+
+export type CreateSandboxPreviewSessionData = {
+    body: CreateSandboxPreviewSessionRequest;
+    path?: never;
+    query?: never;
+    url: '/ingress/sandbox-preview-sessions';
+};
+
+export type CreateSandboxPreviewSessionErrors = {
+    /**
+     * The URL is not one of the sandbox's preview pages
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Not a browser session, not the sandbox's owner, or insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * The sandbox's preview does not ask for a Temps login (it is public or password-protected): load the URL as it is, or use a preview link
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateSandboxPreviewSessionError = CreateSandboxPreviewSessionErrors[keyof CreateSandboxPreviewSessionErrors];
+
+export type CreateSandboxPreviewSessionResponses = {
+    /**
+     * Grant issued; load redirect_url in the frame (or tab) that shows the preview. It signs the browser in to that preview host and lands on the requested page
+     */
+    201: IngressLoginGrantResponse;
+};
+
+export type CreateSandboxPreviewSessionResponse = CreateSandboxPreviewSessionResponses[keyof CreateSandboxPreviewSessionResponses];
 
 export type ListInstantiationsData = {
     body?: never;
@@ -55237,6 +56476,536 @@ export type CompleteCiBuildResponses = {
 };
 
 export type CompleteCiBuildResponse = CompleteCiBuildResponses[keyof CompleteCiBuildResponses];
+
+export type AdminExplainEnvironmentPlacementData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/placement/explain';
+};
+
+export type AdminExplainEnvironmentPlacementErrors = {
+    /**
+     * Invalid placement settings
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminExplainEnvironmentPlacementError = AdminExplainEnvironmentPlacementErrors[keyof AdminExplainEnvironmentPlacementErrors];
+
+export type AdminExplainEnvironmentPlacementResponses = {
+    200: PlacementExplanationResponse;
+};
+
+export type AdminExplainEnvironmentPlacementResponse = AdminExplainEnvironmentPlacementResponses[keyof AdminExplainEnvironmentPlacementResponses];
+
+export type AdminEnvironmentPinningRecommendationData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: {
+        /**
+         * History window in days (1-90, default 7).
+         */
+        window_days?: number | null;
+    };
+    url: '/internal/environments/{environment_id}/placement/recommendation';
+};
+
+export type AdminEnvironmentPinningRecommendationErrors = {
+    /**
+     * Invalid window
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminEnvironmentPinningRecommendationError = AdminEnvironmentPinningRecommendationErrors[keyof AdminEnvironmentPinningRecommendationErrors];
+
+export type AdminEnvironmentPinningRecommendationResponses = {
+    200: PinningRecommendationResponse;
+};
+
+export type AdminEnvironmentPinningRecommendationResponse = AdminEnvironmentPinningRecommendationResponses[keyof AdminEnvironmentPinningRecommendationResponses];
+
+export type AdminListEnvironmentVolumesData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: {
+        /**
+         * 1-based page (default 1).
+         */
+        page?: number | null;
+        /**
+         * Default 20, at most 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/internal/environments/{environment_id}/volumes';
+};
+
+export type AdminListEnvironmentVolumesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminListEnvironmentVolumesError = AdminListEnvironmentVolumesErrors[keyof AdminListEnvironmentVolumesErrors];
+
+export type AdminListEnvironmentVolumesResponses = {
+    200: EnvironmentVolumeListResponse;
+};
+
+export type AdminListEnvironmentVolumesResponse = AdminListEnvironmentVolumesResponses[keyof AdminListEnvironmentVolumesResponses];
+
+export type AdminCreateEnvironmentVolumeData = {
+    body: CreateEnvironmentVolumeRequest;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/volumes';
+};
+
+export type AdminCreateEnvironmentVolumeErrors = {
+    /**
+     * Invalid volume
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Name taken
+     */
+    409: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminCreateEnvironmentVolumeError = AdminCreateEnvironmentVolumeErrors[keyof AdminCreateEnvironmentVolumeErrors];
+
+export type AdminCreateEnvironmentVolumeResponses = {
+    201: EnvironmentVolumeResponse;
+};
+
+export type AdminCreateEnvironmentVolumeResponse = AdminCreateEnvironmentVolumeResponses[keyof AdminCreateEnvironmentVolumeResponses];
+
+export type AdminEnvironmentVolumeStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/volumes/status';
+};
+
+export type AdminEnvironmentVolumeStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminEnvironmentVolumeStatusError = AdminEnvironmentVolumeStatusErrors[keyof AdminEnvironmentVolumeStatusErrors];
+
+export type AdminEnvironmentVolumeStatusResponses = {
+    200: EnvironmentVolumeStatusResponse;
+};
+
+export type AdminEnvironmentVolumeStatusResponse = AdminEnvironmentVolumeStatusResponses[keyof AdminEnvironmentVolumeStatusResponses];
+
+export type AdminDeleteEnvironmentVolumeData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Volume ID
+         */
+        volume_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/volumes/{volume_id}';
+};
+
+export type AdminDeleteEnvironmentVolumeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Volume not found
+     */
+    404: ProblemDetails;
+    /**
+     * Volume still mounted
+     */
+    409: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminDeleteEnvironmentVolumeError = AdminDeleteEnvironmentVolumeErrors[keyof AdminDeleteEnvironmentVolumeErrors];
+
+export type AdminDeleteEnvironmentVolumeResponses = {
+    200: DeletedEnvironmentVolumeResponse;
+};
+
+export type AdminDeleteEnvironmentVolumeResponse = AdminDeleteEnvironmentVolumeResponses[keyof AdminDeleteEnvironmentVolumeResponses];
+
+export type AdminDetachEnvironmentVolumeData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Volume ID
+         */
+        volume_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/volumes/{volume_id}/attachment';
+};
+
+export type AdminDetachEnvironmentVolumeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Volume not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminDetachEnvironmentVolumeError = AdminDetachEnvironmentVolumeErrors[keyof AdminDetachEnvironmentVolumeErrors];
+
+export type AdminDetachEnvironmentVolumeResponses = {
+    200: EnvironmentVolumeResponse;
+};
+
+export type AdminDetachEnvironmentVolumeResponse = AdminDetachEnvironmentVolumeResponses[keyof AdminDetachEnvironmentVolumeResponses];
+
+export type AdminAttachEnvironmentVolumeData = {
+    body: AttachEnvironmentVolumeRequest;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+        /**
+         * Volume ID
+         */
+        volume_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/volumes/{volume_id}/attachment';
+};
+
+export type AdminAttachEnvironmentVolumeErrors = {
+    /**
+     * Invalid mount path
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment or volume not found
+     */
+    404: ProblemDetails;
+    /**
+     * Mount path taken
+     */
+    409: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminAttachEnvironmentVolumeError = AdminAttachEnvironmentVolumeErrors[keyof AdminAttachEnvironmentVolumeErrors];
+
+export type AdminAttachEnvironmentVolumeResponses = {
+    200: EnvironmentVolumeResponse;
+};
+
+export type AdminAttachEnvironmentVolumeResponse = AdminAttachEnvironmentVolumeResponses[keyof AdminAttachEnvironmentVolumeResponses];
+
+export type AdminGetEnvironmentWorkloadIsolationData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/workload-isolation';
+};
+
+export type AdminGetEnvironmentWorkloadIsolationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminGetEnvironmentWorkloadIsolationError = AdminGetEnvironmentWorkloadIsolationErrors[keyof AdminGetEnvironmentWorkloadIsolationErrors];
+
+export type AdminGetEnvironmentWorkloadIsolationResponses = {
+    200: WorkloadIsolationResponse;
+};
+
+export type AdminGetEnvironmentWorkloadIsolationResponse = AdminGetEnvironmentWorkloadIsolationResponses[keyof AdminGetEnvironmentWorkloadIsolationResponses];
+
+export type AdminSetEnvironmentWorkloadIsolationData = {
+    body: SetWorkloadIsolationRequest;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/workload-isolation';
+};
+
+export type AdminSetEnvironmentWorkloadIsolationErrors = {
+    /**
+     * Invalid isolation
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminSetEnvironmentWorkloadIsolationError = AdminSetEnvironmentWorkloadIsolationErrors[keyof AdminSetEnvironmentWorkloadIsolationErrors];
+
+export type AdminSetEnvironmentWorkloadIsolationResponses = {
+    200: WorkloadIsolationResponse;
+};
+
+export type AdminSetEnvironmentWorkloadIsolationResponse = AdminSetEnvironmentWorkloadIsolationResponses[keyof AdminSetEnvironmentWorkloadIsolationResponses];
+
+export type AdminGetEnvironmentWorkloadModeData = {
+    body?: never;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/workload-mode';
+};
+
+export type AdminGetEnvironmentWorkloadModeErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminGetEnvironmentWorkloadModeError = AdminGetEnvironmentWorkloadModeErrors[keyof AdminGetEnvironmentWorkloadModeErrors];
+
+export type AdminGetEnvironmentWorkloadModeResponses = {
+    200: WorkloadModeResponse;
+};
+
+export type AdminGetEnvironmentWorkloadModeResponse = AdminGetEnvironmentWorkloadModeResponses[keyof AdminGetEnvironmentWorkloadModeResponses];
+
+export type AdminSetEnvironmentWorkloadModeData = {
+    body: SetWorkloadModeRequest;
+    path: {
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/internal/environments/{environment_id}/workload-mode';
+};
+
+export type AdminSetEnvironmentWorkloadModeErrors = {
+    /**
+     * Invalid mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminSetEnvironmentWorkloadModeError = AdminSetEnvironmentWorkloadModeErrors[keyof AdminSetEnvironmentWorkloadModeErrors];
+
+export type AdminSetEnvironmentWorkloadModeResponses = {
+    200: WorkloadModeResponse;
+};
+
+export type AdminSetEnvironmentWorkloadModeResponse = AdminSetEnvironmentWorkloadModeResponses[keyof AdminSetEnvironmentWorkloadModeResponses];
 
 export type AdminListNodesData = {
     body?: never;
@@ -55760,6 +57529,52 @@ export type NodeHeartbeatResponses = {
 
 export type NodeHeartbeatResponse = NodeHeartbeatResponses[keyof NodeHeartbeatResponses];
 
+export type NodeInstanceEnvData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID
+         */
+        node_id: number;
+        /**
+         * Workload instance ID
+         */
+        instance_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/instances/{instance_id}/env';
+};
+
+export type NodeInstanceEnvErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Not an unfinished instance of this node
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The workload plane is not running
+     */
+    503: unknown;
+};
+
+export type NodeInstanceEnvResponses = {
+    /**
+     * The instance's environment (not cacheable)
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type NodeInstanceEnvResponse = NodeInstanceEnvResponses[keyof NodeInstanceEnvResponses];
+
 export type ListPeersData = {
     body?: never;
     path: {
@@ -55981,6 +57796,88 @@ export type AdminUpdateNodePublicIngressSettingsResponses = {
 
 export type AdminUpdateNodePublicIngressSettingsResponse = AdminUpdateNodePublicIngressSettingsResponses[keyof AdminUpdateNodePublicIngressSettingsResponses];
 
+export type AdminGetNodeResourcesData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID; 0 is the control plane
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/resources';
+};
+
+export type AdminGetNodeResourcesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Node not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminGetNodeResourcesError = AdminGetNodeResourcesErrors[keyof AdminGetNodeResourcesErrors];
+
+export type AdminGetNodeResourcesResponses = {
+    200: NodeResourcesResponse;
+};
+
+export type AdminGetNodeResourcesResponse = AdminGetNodeResourcesResponses[keyof AdminGetNodeResourcesResponses];
+
+export type AdminSetNodeResourcesData = {
+    body: SetNodeResourcesRequest;
+    path: {
+        /**
+         * Node ID; 0 is the control plane
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/resources';
+};
+
+export type AdminSetNodeResourcesErrors = {
+    /**
+     * Invalid reserve
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance admin required
+     */
+    403: ProblemDetails;
+    /**
+     * Node not found
+     */
+    404: ProblemDetails;
+    /**
+     * Storage failed
+     */
+    500: ProblemDetails;
+};
+
+export type AdminSetNodeResourcesError = AdminSetNodeResourcesErrors[keyof AdminSetNodeResourcesErrors];
+
+export type AdminSetNodeResourcesResponses = {
+    200: NodeResourcesResponse;
+};
+
+export type AdminSetNodeResourcesResponse = AdminSetNodeResourcesResponses[keyof AdminSetNodeResourcesResponses];
+
 export type GetS3CredentialsData = {
     body?: never;
     path: {
@@ -56020,6 +57917,107 @@ export type GetS3CredentialsResponses = {
 };
 
 export type GetS3CredentialsResponse = GetS3CredentialsResponses[keyof GetS3CredentialsResponses];
+
+export type ReadNodeStateData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID
+         */
+        node_id: number;
+    };
+    query?: {
+        /**
+         * The cursor of the last answer applied (`0` or absent: the whole view).
+         */
+        since?: string | null;
+        /**
+         * How long to wait for a change, in seconds (at most 25).
+         */
+        wait_secs?: number | null;
+    };
+    url: '/internal/nodes/{node_id}/state';
+};
+
+export type ReadNodeStateErrors = {
+    /**
+     * Invalid cursor
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The workload plane is not running
+     */
+    503: unknown;
+};
+
+export type ReadNodeStateResponses = {
+    /**
+     * Changes since the cursor, or the whole view
+     */
+    200: {
+        [key: string]: unknown;
+    };
+};
+
+export type ReadNodeStateResponse = ReadNodeStateResponses[keyof ReadNodeStateResponses];
+
+export type AckNodeStateData = {
+    body: {
+        [key: string]: unknown;
+    };
+    path: {
+        /**
+         * Node ID
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/internal/nodes/{node_id}/state/ack';
+};
+
+export type AckNodeStateErrors = {
+    /**
+     * Invalid cursor
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Node not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The workload plane is not running
+     */
+    503: unknown;
+};
+
+export type AckNodeStateResponses = {
+    /**
+     * Recorded
+     */
+    204: void;
+};
+
+export type AckNodeStateResponse = AckNodeStateResponses[keyof AckNodeStateResponses];
 
 export type ListIpAccessControlData = {
     body?: never;
@@ -57678,6 +59676,381 @@ export type GetUptimeHistoryResponses = {
 };
 
 export type GetUptimeHistoryResponse = GetUptimeHistoryResponses[keyof GetUptimeHistoryResponses];
+
+export type ListNodeModesData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/network-policy/nodes';
+};
+
+export type ListNodeModesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListNodeModesError = ListNodeModesErrors[keyof ListNodeModesErrors];
+
+export type ListNodeModesResponses = {
+    /**
+     * Every node's mode; node 0 is the control plane
+     */
+    200: NodeNetworkPolicyModeListResponse;
+};
+
+export type ListNodeModesResponse = ListNodeModesResponses[keyof ListNodeModesResponses];
+
+export type SetNodeModeData = {
+    body: SetNodeNetworkPolicyModeRequest;
+    path: {
+        /**
+         * Node id; 0 is the control plane
+         */
+        node_id: number;
+    };
+    query?: never;
+    url: '/network-policy/nodes/{node_id}';
+};
+
+export type SetNodeModeErrors = {
+    /**
+     * Unknown mode
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrators only
+     */
+    403: ProblemDetails;
+    /**
+     * No such node
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type SetNodeModeError = SetNodeModeErrors[keyof SetNodeModeErrors];
+
+export type SetNodeModeResponses = {
+    /**
+     * The node's mode now
+     */
+    200: NodeNetworkPolicyModeResponse;
+};
+
+export type SetNodeModeResponse = SetNodeModeResponses[keyof SetNodeModeResponses];
+
+export type ListRulesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        subject_kind?: string | null;
+        subject_id?: number | null;
+        /**
+         * `link`, `operator` or `system`.
+         */
+        origin?: string | null;
+        /**
+         * Default 1.
+         */
+        page?: number | null;
+        /**
+         * Default 20, max 100.
+         */
+        page_size?: number | null;
+    };
+    url: '/network-policy/rules';
+};
+
+export type ListRulesErrors = {
+    /**
+     * Invalid filter
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListRulesError = ListRulesErrors[keyof ListRulesErrors];
+
+export type ListRulesResponses = {
+    /**
+     * Rules, newest first
+     */
+    200: NetworkPolicyRuleListResponse;
+};
+
+export type ListRulesResponse = ListRulesResponses[keyof ListRulesResponses];
+
+export type CreateRuleData = {
+    body: CreateNetworkPolicyRuleRequest;
+    path?: never;
+    query?: never;
+    url: '/network-policy/rules';
+};
+
+export type CreateRuleErrors = {
+    /**
+     * Invalid rule
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrators only
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateRuleError = CreateRuleErrors[keyof CreateRuleErrors];
+
+export type CreateRuleResponses = {
+    /**
+     * Rule created
+     */
+    201: NetworkPolicyRuleResponse;
+};
+
+export type CreateRuleResponse = CreateRuleResponses[keyof CreateRuleResponses];
+
+export type DeleteRuleData = {
+    body?: never;
+    path: {
+        /**
+         * Rule id
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/network-policy/rules/{rule_id}';
+};
+
+export type DeleteRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrators only
+     */
+    403: ProblemDetails;
+    /**
+     * No such rule
+     */
+    404: ProblemDetails;
+    /**
+     * The rule belongs to a link; unlink instead
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type DeleteRuleError = DeleteRuleErrors[keyof DeleteRuleErrors];
+
+export type DeleteRuleResponses = {
+    /**
+     * Rule deleted
+     */
+    204: void;
+};
+
+export type DeleteRuleResponse = DeleteRuleResponses[keyof DeleteRuleResponses];
+
+export type GetRuleData = {
+    body?: never;
+    path: {
+        /**
+         * Rule id
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/network-policy/rules/{rule_id}';
+};
+
+export type GetRuleErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No such rule
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetRuleError = GetRuleErrors[keyof GetRuleErrors];
+
+export type GetRuleResponses = {
+    /**
+     * The rule
+     */
+    200: NetworkPolicyRuleResponse;
+};
+
+export type GetRuleResponse = GetRuleResponses[keyof GetRuleResponses];
+
+export type GetEffectivePolicyData = {
+    body?: never;
+    path: {
+        /**
+         * deployment, sandbox, service, function or job
+         */
+        subject_kind: string;
+        /**
+         * Environment id for deployments; row id otherwise
+         */
+        subject_id: number;
+    };
+    query?: never;
+    url: '/network-policy/subjects/{subject_kind}/{subject_id}';
+};
+
+export type GetEffectivePolicyErrors = {
+    /**
+     * Unknown kind or missing workload
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetEffectivePolicyError = GetEffectivePolicyErrors[keyof GetEffectivePolicyErrors];
+
+export type GetEffectivePolicyResponses = {
+    /**
+     * What this workload may reach, and where it is enforced
+     */
+    200: EffectivePolicyResponse;
+};
+
+export type GetEffectivePolicyResponse = GetEffectivePolicyResponses[keyof GetEffectivePolicyResponses];
+
+export type SetProfileData = {
+    body: SetProfileRequest;
+    path: {
+        /**
+         * deployment, sandbox, service, function or job
+         */
+        subject_kind: string;
+        /**
+         * Environment id for deployments; row id otherwise
+         */
+        subject_id: number;
+    };
+    query?: never;
+    url: '/network-policy/subjects/{subject_kind}/{subject_id}/profile';
+};
+
+export type SetProfileErrors = {
+    /**
+     * Invalid profile or missing workload
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Instance administrators only
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type SetProfileError = SetProfileErrors[keyof SetProfileErrors];
+
+export type SetProfileResponses = {
+    /**
+     * The profile now in effect
+     */
+    200: ProfileResponse;
+};
+
+export type SetProfileResponse = SetProfileResponses[keyof SetProfileResponses];
+
+export type NodeStateStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/node-state/status';
+};
+
+export type NodeStateStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type NodeStateStatusResponses = {
+    /**
+     * Stream status
+     */
+    200: NodeStateStatusResponse;
+};
+
+export type NodeStateStatusResponse2 = NodeStateStatusResponses[keyof NodeStateStatusResponses];
 
 export type NodeCapabilityGetData = {
     body?: never;
@@ -70225,6 +72598,98 @@ export type DeleteEnvironmentDomainResponses = {
 };
 
 export type DeleteEnvironmentDomainResponse = DeleteEnvironmentDomainResponses[keyof DeleteEnvironmentDomainResponses];
+
+export type GetIngressSettingsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        env_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{env_id}/ingress';
+};
+
+export type GetIngressSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetIngressSettingsError = GetIngressSettingsErrors[keyof GetIngressSettingsErrors];
+
+export type GetIngressSettingsResponses = {
+    /**
+     * Ingress settings
+     */
+    200: IngressSettingsResponse;
+};
+
+export type GetIngressSettingsResponse = GetIngressSettingsResponses[keyof GetIngressSettingsResponses];
+
+export type UpdateIngressSettingsData = {
+    body: UpdateIngressSettingsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        env_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{env_id}/ingress';
+};
+
+export type UpdateIngressSettingsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateIngressSettingsError = UpdateIngressSettingsErrors[keyof UpdateIngressSettingsErrors];
+
+export type UpdateIngressSettingsResponses = {
+    /**
+     * Ingress settings updated
+     */
+    200: IngressSettingsResponse;
+};
+
+export type UpdateIngressSettingsResponse = UpdateIngressSettingsResponses[keyof UpdateIngressSettingsResponses];
 
 export type UpdateEnvironmentSettingsData = {
     body: UpdateEnvironmentSettingsRequest;
@@ -84942,6 +87407,60 @@ export type DomainResponses = {
 
 export type DomainResponse2 = DomainResponses[keyof DomainResponses];
 
+export type SetEgressPolicyData = {
+    body: SandboxEgressPolicy;
+    path: {
+        /**
+         * Sandbox id (`sbx_...`)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/egress-policy';
+};
+
+export type SetEgressPolicyErrors = {
+    /**
+     * Invalid policy (the detail names the rule and value)
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Sandbox is not running or stopped, or belongs to an agent run
+     */
+    409: ProblemDetails;
+    /**
+     * The sandbox's backend cannot enforce a restricted policy
+     */
+    422: ProblemDetails;
+    /**
+     * The sandbox's backend or node is unavailable
+     */
+    503: ProblemDetails;
+};
+
+export type SetEgressPolicyError = SetEgressPolicyErrors[keyof SetEgressPolicyErrors];
+
+export type SetEgressPolicyResponses = {
+    /**
+     * Policy applied and stored
+     */
+    200: SandboxResponse;
+};
+
+export type SetEgressPolicyResponse = SetEgressPolicyResponses[keyof SetEgressPolicyResponses];
+
 export type ListEventsData = {
     body?: never;
     path: {
@@ -85366,6 +87885,50 @@ export type PauseSandboxResponses = {
 
 export type PauseSandboxResponse = PauseSandboxResponses[keyof PauseSandboxResponses];
 
+export type UpdatePreviewAccessData = {
+    body: UpdatePreviewAccessBody;
+    path: {
+        /**
+         * Sandbox public id (`sbx_...`)
+         */
+        id: string;
+    };
+    query?: never;
+    url: '/v1/sandboxes/{id}/preview-access';
+};
+
+export type UpdatePreviewAccessErrors = {
+    /**
+     * Invalid CIDR, more than 50 networks, or `password` without a preview password
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Sandbox not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdatePreviewAccessResponses = {
+    /**
+     * Preview access updated
+     */
+    200: PreviewAccessResponse;
+};
+
+export type UpdatePreviewAccessResponse = UpdatePreviewAccessResponses[keyof UpdatePreviewAccessResponses];
+
 export type SandboxCreatePreviewLinkData = {
     body: PreviewShareLinkBody;
     path: {
@@ -85421,7 +87984,7 @@ export type ClearPreviewPasswordErrors = {
 
 export type ClearPreviewPasswordResponses = {
     /**
-     * Preview password removed (sandbox is now URL-only protected)
+     * Preview password removed; a sandbox in `password` access returns to `temps_login`
      */
     204: void;
 };

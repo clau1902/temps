@@ -12,11 +12,14 @@
 //! The wire types live here (not in the worker crate) so both ends compile
 //! against one definition.
 //!
-//! Phase-1 limits, each surfaced as an explicit
-//! [`AgentError::SandboxUnsupportedOnNode`] instead of a silent fallback:
-//! interactive terminals, the retained agent runtime, snapshots, disk resize,
-//! workspace volumes, the Firecracker backend and application networks are
-//! not available for sandboxes on worker nodes yet.
+//! Limits, each surfaced as an explicit
+//! [`AgentError::SandboxUnsupportedOnNode`] instead of a silent fallback.
+//! The terminal, the agent runtime and preview ports travel over a
+//! byte-channel WebSocket; disk resize, image identity, the runtime check and
+//! harness recovery are forwarded, and the node's own driver then decides (a
+//! Docker node still cannot resize a disk). Snapshots and restore, workspace
+//! volumes, the Firecracker backend, application networks, the model/git/MCP
+//! relays and image rebuilds are refused.
 //!
 //! Exec output: an exec with a line callback (`exec_streamed`, and the other
 //! exec variants when given a callback) goes through
@@ -109,6 +112,14 @@ pub const WORKER_EXEC_LINE_LIMIT: usize = 64 * 1024;
 /// `\u00XX`, 6 bytes) plus the truncation marker and the JSON frame.
 const EXEC_FRAME_CAP: usize = 6 * WORKER_EXEC_LINE_LIMIT + 4 * 1024;
 
+/// Largest byte-channel frame either side accepts (terminal and agent
+/// runtime frames are small; this bounds what one frame can make a side
+/// buffer).
+pub const BYTE_CHANNEL_MAX_FRAME: usize = 1024 * 1024;
+
+/// Bytes the control plane reads from a byte channel's caller per frame.
+const BYTE_CHANNEL_BUFFER: usize = 64 * 1024;
+
 /// Longest worker-written message kept in an error. Same bound the sandbox
 /// service applies to eviction reasons.
 pub const MAX_WORKER_MESSAGE_CHARS: usize = 512;
@@ -160,6 +171,9 @@ pub struct RemoteCreateRequest {
     pub pids_limit: Option<i64>,
     pub disk_size_mb: Option<u64>,
     pub network_mode: Option<String>,
+    /// Which destinations the sandbox may reach. Absent = `internet`.
+    #[serde(default)]
+    pub egress_policy: super::SandboxEgressPolicy,
     pub env_vars: HashMap<String, String>,
     pub idle_timeout_secs: u64,
     pub backend: Option<SandboxBackend>,
@@ -397,6 +411,111 @@ pub struct RemoteErrorBody {
     pub error: String,
 }
 
+// ── ADR-055 phase 6: driver operations forwarded to the node ────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteResizeDiskRequest {
+    pub handle: SandboxHandle,
+    pub new_size_mb: u64,
+}
+
+/// `POST /agent/sandboxes/egress-policy` — replace a sandbox's egress
+/// policy on the node.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteEgressPolicyRequest {
+    pub handle: SandboxHandle,
+    pub policy: super::SandboxEgressPolicy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteImageIdentityResponse {
+    pub image: String,
+}
+
+/// [`RuntimeCompatibility`] on the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RemoteRuntimeCompatibility {
+    Compatible,
+    Unavailable { reason: String },
+    Incompatible { reason: String },
+}
+
+impl From<RuntimeCompatibility> for RemoteRuntimeCompatibility {
+    fn from(value: RuntimeCompatibility) -> Self {
+        match value {
+            RuntimeCompatibility::Compatible => Self::Compatible,
+            RuntimeCompatibility::Unavailable { reason } => Self::Unavailable { reason },
+            RuntimeCompatibility::Incompatible { reason } => Self::Incompatible { reason },
+        }
+    }
+}
+
+impl RemoteRuntimeCompatibility {
+    /// Back to the provider type, with worker-written reasons sanitised.
+    fn into_local(self) -> RuntimeCompatibility {
+        match self {
+            Self::Compatible => RuntimeCompatibility::Compatible,
+            Self::Unavailable { reason } => RuntimeCompatibility::Unavailable {
+                reason: sanitize_worker_message(&reason),
+            },
+            Self::Incompatible { reason } => RuntimeCompatibility::Incompatible {
+                reason: sanitize_worker_message(&reason),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteRecoverHarnessRequest {
+    pub handle: SandboxHandle,
+    pub epoch: u64,
+}
+
+/// Which byte channel `GET /agent/sandboxes/byte-channel` opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteByteChannel {
+    /// The interactive terminal's PTY agent (`attach_pty`).
+    Terminal,
+    /// The retained agent runtime's daemon (`connect_agent_runtime`).
+    AgentRuntime,
+    /// TCP `port` on the sandbox's loopback (`connect_port`): a preview URL
+    /// of a sandbox on this node, relayed by the control plane's ingress.
+    Port,
+}
+
+impl RemoteByteChannel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::AgentRuntime => "agent_runtime",
+            Self::Port => "port",
+        }
+    }
+}
+
+/// Query of `GET /agent/sandboxes/byte-channel`. Only the sandbox *name*
+/// travels; the worker resolves the container itself.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RemoteByteChannelQuery {
+    /// Sandbox container name (`temps-sandbox-<label>`).
+    pub sandbox: String,
+    pub channel: RemoteByteChannel,
+    /// The sandbox port a `port` channel connects to; required for it and
+    /// ignored by the other channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+}
+
+/// The one text frame a node sends on a byte channel: the guest side failed,
+/// and the channel ends after it.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct RemoteByteChannelError {
+    pub error: String,
+}
+
 /// Container-name prefix every sandbox container carries. The worker only
 /// operates on handles whose name has this prefix *and* whose container
 /// carries [`super::docker::SANDBOX_CONTAINER_LABEL`], so the sandbox API can
@@ -458,6 +577,10 @@ pub struct RemoteSandboxProvider {
     defaults: RemoteSandboxDefaults,
     /// See [`EXEC_STREAM_IDLE_TIMEOUT`]; shortened by tests.
     exec_stream_idle_timeout: Duration,
+    /// TLS for byte-channel WebSockets: the same cluster CA and
+    /// control-plane identity as `client`. `None` for `http://` agents
+    /// (tests) — sandbox calls to a real node are always `https://`.
+    ws_connector: Option<tokio_tungstenite::Connector>,
 }
 
 /// Control-plane sandbox defaults applied when a create request leaves them
@@ -605,12 +728,188 @@ impl RemoteSandboxProvider {
             client,
             defaults: RemoteSandboxDefaults::default(),
             exec_stream_idle_timeout: EXEC_STREAM_IDLE_TIMEOUT,
+            ws_connector: None,
         }
     }
 
     pub fn with_defaults(mut self, defaults: RemoteSandboxDefaults) -> Self {
         self.defaults = defaults;
         self
+    }
+
+    /// TLS for byte-channel WebSockets to an `https://` agent.
+    pub fn with_ws_connector(mut self, connector: Option<tokio_tungstenite::Connector>) -> Self {
+        self.ws_connector = connector;
+        self
+    }
+
+    /// Open a byte channel (terminal or agent runtime) through
+    /// `GET /agent/sandboxes/byte-channel`. The node attaches before it
+    /// upgrades, so a missing sandbox or a failed attach comes back as an
+    /// HTTP status mapped like every other call.
+    async fn open_byte_channel(
+        &self,
+        handle: &SandboxHandle,
+        channel: RemoteByteChannel,
+        port: Option<u16>,
+        operation: &'static str,
+    ) -> Result<PtyAttachment, AgentError> {
+        use futures::{SinkExt, StreamExt};
+        use tokio::io::AsyncReadExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
+        use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
+
+        // The name goes into the query unencoded; sandbox names are
+        // `[A-Za-z0-9_-]` by construction, anything else is refused here.
+        if !is_sandbox_handle(handle) {
+            return Err(AgentError::Validation {
+                message: format!(
+                    "'{}' is not a sandbox container on worker node '{}'",
+                    handle.sandbox_name, self.node_name
+                ),
+            });
+        }
+        let base = if let Some(rest) = self.agent_url.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = self.agent_url.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            return Err(self.unavailable(format!(
+                "the node's agent address is not an http(s) URL ({operation})"
+            )));
+        };
+        let mut url = format!(
+            "{base}/agent/sandboxes/byte-channel?sandbox={}&channel={}",
+            handle.sandbox_name,
+            channel.as_str()
+        );
+        if let Some(port) = port {
+            url.push_str(&format!("&port={port}"));
+        }
+        let mut request = url.into_client_request().map_err(|e| {
+            tracing::warn!(node_id = self.node_id, error = %e, "Invalid byte-channel URL");
+            self.unavailable(format!("the node's agent address is invalid ({operation})"))
+        })?;
+        let authorization = format!("Bearer {}", self.token).parse().map_err(|_| {
+            self.unavailable(format!(
+                "the node's agent token is not a valid header ({operation})"
+            ))
+        })?;
+        request.headers_mut().insert(AUTHORIZATION, authorization);
+        let config = WebSocketConfig::default().max_message_size(Some(BYTE_CHANNEL_MAX_FRAME));
+
+        let connected = tokio::time::timeout(
+            SHORT_TIMEOUT,
+            tokio_tungstenite::connect_async_tls_with_config(
+                request,
+                Some(config),
+                false,
+                self.ws_connector.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| {
+            self.unavailable(format!(
+                "no answer within {}s ({operation})",
+                SHORT_TIMEOUT.as_secs()
+            ))
+        })?;
+        let (socket, _) = match connected {
+            Ok(connection) => connection,
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                let status = reqwest::StatusCode::from_u16(response.status().as_u16())
+                    .unwrap_or(reqwest::StatusCode::BAD_GATEWAY);
+                let message = response
+                    .body()
+                    .as_deref()
+                    .filter(|body| body.len() <= ERROR_BODY_CAP)
+                    .and_then(|body| serde_json::from_slice::<RemoteErrorBody>(body).ok())
+                    .map(|body| sanitize_worker_message(&body.error));
+                return Err(self.status_error(status, message, Some(handle), operation));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    node_id = self.node_id,
+                    node_name = %self.node_name,
+                    operation,
+                    error = %error,
+                    "Sandbox byte channel to worker node failed to connect"
+                );
+                return Err(self.unavailable(format!("connection failed ({operation})")));
+            }
+        };
+        tracing::info!(
+            node_id = self.node_id,
+            sandbox = %handle.sandbox_name,
+            channel = channel.as_str(),
+            "Opened a sandbox byte channel on a worker node"
+        );
+
+        let (mut sink, stream) = socket.split();
+        let node_name = self.node_name.clone();
+        let sandbox = handle.sandbox_name.clone();
+        let output = futures::stream::unfold(Some(stream), move |state| {
+            let node_name = node_name.clone();
+            let sandbox = sandbox.clone();
+            async move {
+                let mut stream = state?;
+                loop {
+                    let failed = |reason: String| AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox.clone(),
+                        reason: format!(
+                            "{operation} on worker node '{node_name}' failed: {reason}"
+                        ),
+                    };
+                    match stream.next().await {
+                        None | Some(Ok(Message::Close(_))) => return None,
+                        Some(Ok(Message::Binary(bytes))) => return Some((Ok(bytes), Some(stream))),
+                        Some(Ok(Message::Text(text))) => {
+                            let reason = serde_json::from_str::<RemoteByteChannelError>(&text)
+                                .map(|frame| sanitize_worker_message(&frame.error))
+                                .unwrap_or_else(|_| {
+                                    "the node sent an invalid channel frame".into()
+                                });
+                            return Some((Err(failed(reason)), None));
+                        }
+                        Some(Ok(Message::Ping(_)))
+                        | Some(Ok(Message::Pong(_)))
+                        | Some(Ok(Message::Frame(_))) => continue,
+                        Some(Err(error)) => {
+                            return Some((
+                                Err(failed(format!("the channel broke: {error}"))),
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+        });
+
+        // Bytes written to `input` travel as binary frames; dropping it
+        // closes the socket, which shuts the guest side's stdin.
+        let (input, mut from_caller) = tokio::io::duplex(BYTE_CHANNEL_BUFFER);
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; BYTE_CHANNEL_BUFFER];
+            loop {
+                match from_caller.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let frame = Message::Binary(bytes::Bytes::copy_from_slice(&buf[..n]));
+                        if sink.send(frame).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+            let _ = sink.send(Message::Close(None)).await;
+        });
+
+        Ok(PtyAttachment {
+            output: Box::pin(output),
+            input: Box::pin(input),
+        })
     }
 
     #[cfg(test)]
@@ -853,6 +1152,27 @@ impl RemoteSandboxProvider {
                     handle.map(|h| h.sandbox_name.as_str()).unwrap_or_default(),
                     operation,
                 )
+            }
+            // The sandbox's backend on the worker cannot enforce a restricted
+            // egress policy.
+            (reqwest::StatusCode::NOT_IMPLEMENTED, message) => {
+                tracing::debug!(
+                    node_id = self.node_id,
+                    node_name = %self.node_name,
+                    operation,
+                    message = message.as_deref().unwrap_or_default(),
+                    "Worker node cannot enforce a restricted egress policy"
+                );
+                AgentError::SandboxEgressPolicyUnsupported {
+                    sandbox: format!(
+                        "{} on worker node '{}'",
+                        handle.map(|h| h.sandbox_name.as_str()).unwrap_or("sandbox"),
+                        self.node_name
+                    ),
+                    backend: handle
+                        .map(|h| h.backend.to_string())
+                        .unwrap_or_else(|| "worker's".to_string()),
+                }
             }
             (_, Some(message)) => self.failed(handle, operation, message),
             // A worker agent older than ADR-048 has no sandbox routes, so
@@ -1166,6 +1486,13 @@ impl SandboxProvider for RemoteSandboxProvider {
         if config.backend == Some(SandboxBackend::Firecracker) {
             return Err(self.unsupported(&label, "The firecracker backend"));
         }
+        let egress_policy =
+            config
+                .egress_policy
+                .normalized()
+                .map_err(|e| AgentError::Validation {
+                    message: format!("sandbox '{}': {}", label, e),
+                })?;
         let body = RemoteCreateRequest {
             run_id: config.run_id,
             label,
@@ -1183,6 +1510,7 @@ impl SandboxProvider for RemoteSandboxProvider {
             network_mode: config
                 .network_mode
                 .or_else(|| self.defaults.network_mode.clone()),
+            egress_policy: egress_policy.clone(),
             env_vars: config.env_vars,
             idle_timeout_secs: config.idle_timeout.as_secs(),
             backend: config.backend,
@@ -1205,29 +1533,87 @@ impl SandboxProvider for RemoteSandboxProvider {
                 },
                 other => other,
             })?;
-        Ok(self.stamp(handle))
+        let handle = self.stamp(handle);
+        if egress_policy.is_restricted() {
+            // A node running an older temps drops the field it does not know
+            // and would start the sandbox with open egress. Re-applying the
+            // policy through the operation that must exist on a node that
+            // understands it fails closed instead.
+            if let Err(e) = self.set_egress_policy(&handle, &egress_policy).await {
+                if let Err(cleanup) = self.destroy(&handle, true).await {
+                    tracing::warn!(
+                        node_id = self.node_id,
+                        node_name = %self.node_name,
+                        sandbox = %handle.sandbox_name,
+                        error = %cleanup,
+                        "Failed to remove a sandbox whose egress policy the node did not confirm"
+                    );
+                }
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: format!("{} (node '{}')", REMOTE_PROVIDER_NAME, self.node_name),
+                    reason: format!(
+                        "the node did not confirm the sandbox's restricted egress policy, \
+                         so the sandbox was removed: {}",
+                        e
+                    ),
+                });
+            }
+        }
+        Ok(handle)
     }
 
     async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
-        Err(self.unsupported(
-            &handle.sandbox_name,
-            "Runtime updates (immutable image identity)",
-        ))
+        let response: RemoteImageIdentityResponse = self
+            .call(
+                "/agent/sandboxes/image-identity",
+                &RemoteHandleRequest {
+                    handle: Self::local_handle(handle),
+                },
+                SHORT_TIMEOUT,
+                Some(handle),
+                "image identity",
+                SMALL_RESPONSE_CAP,
+            )
+            .await?;
+        Ok(sanitize_worker_message(&response.image))
     }
 
     async fn check_agent_runtime(
         &self,
         handle: &SandboxHandle,
     ) -> Result<RuntimeCompatibility, AgentError> {
-        Err(self.unsupported(&handle.sandbox_name, "The retained agent runtime"))
+        let response: RemoteRuntimeCompatibility = self
+            .call(
+                "/agent/sandboxes/agent-runtime-check",
+                &RemoteHandleRequest {
+                    handle: Self::local_handle(handle),
+                },
+                SHORT_TIMEOUT,
+                Some(handle),
+                "agent runtime check",
+                SMALL_RESPONSE_CAP,
+            )
+            .await?;
+        Ok(response.into_local())
     }
 
     async fn recover_agent_harness(
         &self,
         handle: &SandboxHandle,
-        _epoch: u64,
+        epoch: u64,
     ) -> Result<(), AgentError> {
-        Err(self.unsupported(&handle.sandbox_name, "Agent harness recovery"))
+        self.call_ok(
+            "/agent/sandboxes/recover-agent-harness",
+            &RemoteRecoverHarnessRequest {
+                handle: Self::local_handle(handle),
+                epoch,
+            },
+            LIFECYCLE_TIMEOUT,
+            handle,
+            "agent harness recovery",
+        )
+        .await
     }
 
     async fn exec(
@@ -1503,11 +1889,12 @@ impl SandboxProvider for RemoteSandboxProvider {
     }
 
     fn supports_backend(&self, backend: SandboxBackend) -> bool {
-        backend == SandboxBackend::Docker
+        super::WORKER_SANDBOX_BACKENDS.contains(&backend)
     }
 
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
-        Err(self.unsupported(&handle.sandbox_name, "The interactive terminal"))
+        self.open_byte_channel(handle, RemoteByteChannel::Terminal, None, "terminal attach")
+            .await
     }
 
     async fn take_snapshot(
@@ -1572,15 +1959,58 @@ impl SandboxProvider for RemoteSandboxProvider {
         &self,
         handle: &SandboxHandle,
     ) -> Result<PtyAttachment, AgentError> {
-        Err(self.unsupported(&handle.sandbox_name, "The retained agent runtime"))
+        self.open_byte_channel(
+            handle,
+            RemoteByteChannel::AgentRuntime,
+            None,
+            "agent runtime connect",
+        )
+        .await
+    }
+
+    async fn connect_port(
+        &self,
+        handle: &SandboxHandle,
+        port: u16,
+    ) -> Result<PtyAttachment, AgentError> {
+        self.open_byte_channel(handle, RemoteByteChannel::Port, Some(port), "port connect")
+            .await
     }
 
     async fn resize_disk(
         &self,
         handle: &SandboxHandle,
-        _new_size_mb: u64,
+        new_size_mb: u64,
     ) -> Result<(), AgentError> {
-        Err(self.unsupported(&handle.sandbox_name, "Disk resize"))
+        self.call_ok(
+            "/agent/sandboxes/resize-disk",
+            &RemoteResizeDiskRequest {
+                handle: Self::local_handle(handle),
+                new_size_mb,
+            },
+            LIFECYCLE_TIMEOUT,
+            handle,
+            "disk resize",
+        )
+        .await
+    }
+
+    async fn set_egress_policy(
+        &self,
+        handle: &SandboxHandle,
+        policy: &super::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        self.call_ok(
+            "/agent/sandboxes/egress-policy",
+            &RemoteEgressPolicyRequest {
+                handle: Self::local_handle(handle),
+                policy: policy.clone(),
+            },
+            LIFECYCLE_TIMEOUT,
+            handle,
+            "egress policy update",
+        )
+        .await
     }
 
     fn name(&self) -> &str {
@@ -1635,6 +2065,7 @@ mod tests {
             work_dir: "/workspace".into(),
             backend: SandboxBackend::Docker,
             image: String::new(),
+            conditions: Vec::new(),
         }
     }
 
@@ -1869,6 +2300,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: Default::default(),
             idle_timeout: Duration::from_secs(60),
@@ -2125,28 +2557,7 @@ mod tests {
     async fn unsupported_features_are_named_errors_without_calling_the_node() {
         let (url, seen) = fake_agent(200, Some(serde_json::json!({"ok": true}))).await;
         let provider = provider_at(&url);
-        let h = remote_handle();
 
-        assert_unsupported(
-            provider.attach_pty(&h).await.err().unwrap(),
-            "interactive terminal",
-        );
-        assert_unsupported(
-            provider.check_agent_runtime(&h).await.unwrap_err(),
-            "retained agent runtime",
-        );
-        assert_unsupported(
-            provider.recover_agent_harness(&h, 1).await.unwrap_err(),
-            "harness recovery",
-        );
-        assert_unsupported(
-            provider.image_identity(&h).await.unwrap_err(),
-            "image identity",
-        );
-        assert_unsupported(
-            provider.resize_disk(&h, 1024).await.unwrap_err(),
-            "Disk resize",
-        );
         assert_unsupported(provider.rebuild_image().await.unwrap_err(), "sandbox image");
 
         let mut with_volume = create_config();
@@ -2163,6 +2574,530 @@ mod tests {
         );
 
         assert!(seen.lock().await.is_none(), "no request reached the node");
+    }
+
+    // ── Driver operations forwarded to the node ─────────────────────────
+
+    /// A fake worker serving the phase-6 routes, recording `(path, body)`.
+    async fn fake_driver_agent() -> (
+        String,
+        std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        use axum::{extract::State, http::Uri, Json};
+        type Calls = std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+        let calls: Calls = Default::default();
+        let app = axum::Router::new()
+            .fallback(
+                |State(calls): State<Calls>, uri: Uri, Json(req): Json<serde_json::Value>| async move {
+                    let path = uri.path().to_string();
+                    calls.lock().await.push((path.clone(), req));
+                    match path.as_str() {
+                        "/agent/sandboxes/image-identity" => {
+                            Json(serde_json::json!({"image": "sha256:0123abcd"}))
+                        }
+                        "/agent/sandboxes/agent-runtime-check" => Json(serde_json::json!({
+                            "status": "unavailable",
+                            "reason": "daemon\u{1b}[31m not running"
+                        })),
+                        _ => Json(serde_json::json!({"ok": true})),
+                    }
+                },
+            )
+            .with_state(calls.clone());
+        (serve(app).await, calls)
+    }
+
+    #[tokio::test]
+    async fn resize_identity_runtime_check_and_harness_recovery_are_forwarded() {
+        let (url, calls) = fake_driver_agent().await;
+        let provider = provider_at(&url);
+        let h = remote_handle();
+
+        provider
+            .resize_disk(&h, 4096)
+            .await
+            .expect("resize forwarded");
+        assert_eq!(
+            provider.image_identity(&h).await.expect("identity"),
+            "sha256:0123abcd"
+        );
+        match provider
+            .check_agent_runtime(&h)
+            .await
+            .expect("runtime check")
+        {
+            RuntimeCompatibility::Unavailable { reason } => {
+                assert!(
+                    !reason.contains('\u{1b}'),
+                    "worker text is sanitised: {reason}"
+                );
+                assert!(reason.contains("not running"), "{reason}");
+            }
+            other => panic!("expected unavailable, got {other:?}"),
+        }
+        provider
+            .recover_agent_harness(&h, 7)
+            .await
+            .expect("harness recovery forwarded");
+
+        let calls = calls.lock().await;
+        let paths: Vec<&str> = calls.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/agent/sandboxes/resize-disk",
+                "/agent/sandboxes/image-identity",
+                "/agent/sandboxes/agent-runtime-check",
+                "/agent/sandboxes/recover-agent-harness",
+            ]
+        );
+        assert_eq!(calls[0].1["new_size_mb"], 4096);
+        assert_eq!(calls[3].1["epoch"], 7);
+        for (path, body) in calls.iter() {
+            // The node's sandbox is local there: no routing stamp travels.
+            assert!(
+                body["handle"]["node_id"].is_null(),
+                "{path} sent a stamped handle: {body}"
+            );
+            assert_eq!(
+                body["handle"]["sandbox_name"], "temps-sandbox-abc",
+                "{path}"
+            );
+        }
+    }
+
+    fn restricted_policy() -> crate::sandbox::SandboxEgressPolicy {
+        crate::sandbox::SandboxEgressPolicy::restricted(vec![crate::sandbox::EgressRule::host(
+            "api.example.com",
+            &[443],
+        )])
+    }
+
+    type EgressReply = std::sync::Arc<(u16, Option<serde_json::Value>)>;
+
+    /// A fake worker that creates `temps-sandbox-<label>` and answers the
+    /// egress-policy route with `egress_status` (a bare status when the body
+    /// is `None`, like a node whose agent predates the route).
+    async fn fake_create_agent(
+        egress_status: u16,
+        egress_body: Option<serde_json::Value>,
+    ) -> (
+        String,
+        std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+    ) {
+        use axum::{extract::State, http::StatusCode, http::Uri, response::IntoResponse, Json};
+        type Calls = std::sync::Arc<tokio::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+        let calls: Calls = Default::default();
+        let egress: EgressReply = std::sync::Arc::new((egress_status, egress_body));
+        let app = axum::Router::new()
+            .fallback(
+                |State((calls, egress)): State<(Calls, EgressReply)>,
+                 uri: Uri,
+                 Json(req): Json<serde_json::Value>| async move {
+                    let path = uri.path().to_string();
+                    calls.lock().await.push((path.clone(), req.clone()));
+                    match path.as_str() {
+                        "/agent/sandboxes" => {
+                            let label = req["label"].as_str().unwrap_or_default();
+                            let created = handle(&format!("temps-sandbox-{label}"));
+                            Json(serde_json::to_value(created).unwrap()).into_response()
+                        }
+                        "/agent/sandboxes/egress-policy" => {
+                            let status = StatusCode::from_u16(egress.0).unwrap();
+                            match &egress.1 {
+                                Some(body) => (status, Json(body.clone())).into_response(),
+                                None => status.into_response(),
+                            }
+                        }
+                        _ => Json(serde_json::json!({"ok": true})).into_response(),
+                    }
+                },
+            )
+            .with_state((calls.clone(), egress));
+        (serve(app).await, calls)
+    }
+
+    #[tokio::test]
+    async fn a_restricted_create_sends_the_policy_and_has_the_node_confirm_it() {
+        let (url, calls) = fake_create_agent(200, Some(serde_json::json!({"ok": true}))).await;
+        let provider = provider_at(&url);
+        let mut config = create_config();
+        config.egress_policy = crate::sandbox::SandboxEgressPolicy::restricted(vec![
+            crate::sandbox::EgressRule::host("API.example.com.", &[443]),
+        ]);
+        let handle = provider.create(config).await.unwrap();
+        assert_eq!(handle.node_id, Some(2));
+        let calls = calls.lock().await;
+        let paths: Vec<&str> = calls.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["/agent/sandboxes", "/agent/sandboxes/egress-policy"]
+        );
+        // Normalized before it leaves the control plane.
+        let sent = &calls[0].1["egress_policy"];
+        assert_eq!(sent["mode"], "restricted");
+        assert_eq!(sent["rules"][0]["host"], "api.example.com");
+        assert_eq!(calls[1].1["policy"], *sent);
+        assert!(calls[1].1["handle"]["node_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn an_internet_create_needs_no_confirmation() {
+        let (url, calls) = fake_create_agent(500, None).await;
+        let provider = provider_at(&url);
+        provider.create(create_config()).await.unwrap();
+        let calls = calls.lock().await;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["egress_policy"]["mode"], "internet");
+    }
+
+    #[tokio::test]
+    async fn a_node_that_cannot_confirm_a_restricted_policy_gets_its_sandbox_removed() {
+        // An agent without the route: axum's bare 404.
+        let (url, calls) = fake_create_agent(404, None).await;
+        let provider = provider_at(&url);
+        let mut config = create_config();
+        config.egress_policy = restricted_policy();
+        let err = provider.create(config).await.unwrap_err();
+        assert!(
+            matches!(err, AgentError::SandboxCreationFailed { .. }),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(text.contains("did not confirm"), "{text}");
+        assert!(text.contains("worker-2"), "{text}");
+        let calls = calls.lock().await;
+        let paths: Vec<&str> = calls.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/agent/sandboxes",
+                "/agent/sandboxes/egress-policy",
+                "/agent/sandboxes/destroy"
+            ]
+        );
+        assert_eq!(calls[2].1["handle"]["sandbox_name"], "temps-sandbox-abc");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_policy_never_reaches_the_node() {
+        let (url, calls) = fake_create_agent(200, None).await;
+        let provider = provider_at(&url);
+        let mut config = create_config();
+        config.egress_policy = crate::sandbox::SandboxEgressPolicy::restricted(vec![
+            crate::sandbox::EgressRule::host("a.*.example.com", &[]),
+        ]);
+        let err = provider.create(config).await.unwrap_err();
+        assert!(matches!(err, AgentError::Validation { .. }), "{err:?}");
+        assert!(err.to_string().contains("a.*.example.com"), "{err}");
+        assert!(calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_egress_policy_is_forwarded_and_a_501_is_the_typed_refusal() {
+        let (url, calls) = fake_driver_agent().await;
+        let provider = provider_at(&url);
+        let policy = restricted_policy().normalized().unwrap();
+        provider
+            .set_egress_policy(&remote_handle(), &policy)
+            .await
+            .unwrap();
+        let calls = calls.lock().await;
+        assert_eq!(calls[0].0, "/agent/sandboxes/egress-policy");
+        assert_eq!(
+            calls[0].1["policy"]["rules"][0]["ports"],
+            serde_json::json!([443])
+        );
+        assert!(calls[0].1["handle"]["node_id"].is_null());
+
+        let (url, _) = fake_agent(
+            501,
+            Some(serde_json::json!({"error": "cannot enforce a restricted egress policy"})),
+        )
+        .await;
+        let err = provider_at(&url)
+            .set_egress_policy(&remote_handle(), &policy)
+            .await
+            .unwrap_err();
+        match &err {
+            AgentError::SandboxEgressPolicyUnsupported { sandbox, backend } => {
+                assert!(sandbox.contains("temps-sandbox-abc"), "{sandbox}");
+                assert!(sandbox.contains("worker-2"), "{sandbox}");
+                assert_eq!(backend, "docker");
+            }
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_node_driver_refusal_maps_like_any_worker_failure() {
+        // A Docker node cannot resize a disk: its driver's refusal comes back
+        // as the worker's error, naming the node, not as a silent success.
+        let (url, _seen) = fake_agent(
+            500,
+            Some(serde_json::json!({
+                "error": "resize_disk is not supported by sandbox provider 'docker'"
+            })),
+        )
+        .await;
+        let provider = provider_at(&url);
+        let err = provider
+            .resize_disk(&remote_handle(), 2048)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("worker-2"), "{text}");
+        assert!(
+            text.contains("not supported by sandbox provider 'docker'"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn what_no_node_serves_is_refused_without_calling_it() {
+        let (url, seen) = fake_agent(200, Some(serde_json::json!({"ok": true}))).await;
+        let provider = provider_at(&url);
+        let h = remote_handle();
+        assert_unsupported(
+            provider.take_snapshot(&h, None, 1024).await.unwrap_err(),
+            "Snapshots",
+        );
+        assert_unsupported(
+            provider
+                .configure_application_network(&h, "app-net", &[])
+                .await
+                .unwrap_err(),
+            "Application service networking",
+        );
+        assert_unsupported(
+            provider
+                .git_relay_base_url(&h, "https://cp.example.test")
+                .await
+                .unwrap_err(),
+            "git relay",
+        );
+        assert_unsupported(
+            provider
+                .model_relay_base_url(&h, "https://cp.example.test")
+                .await
+                .unwrap_err(),
+            "model relay",
+        );
+        assert_unsupported(
+            provider
+                .harness_mcp_url(&h, "https://cp.example.test", "https://cp.example.test/mcp")
+                .await
+                .unwrap_err(),
+            "harness MCP relay",
+        );
+        assert_unsupported(provider.rebuild_image().await.unwrap_err(), "sandbox image");
+        let mut with_volume = create_config();
+        with_volume.workspace_volume = Some("vol".into());
+        assert_unsupported(
+            provider.create(with_volume).await.unwrap_err(),
+            "Workspace volumes",
+        );
+        assert!(seen.lock().await.is_none(), "no request reached the node");
+    }
+
+    /// A fake worker whose byte channel echoes each binary frame back as
+    /// `echo:<bytes>`, then answers an `fail` frame with the error frame.
+    async fn fake_byte_channel_agent(
+        missing: bool,
+    ) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>) {
+        use axum::extract::ws::{Message, WebSocketUpgrade};
+        use axum::extract::{Query, State};
+        use axum::response::IntoResponse;
+        use futures::{SinkExt, StreamExt};
+        type Queries = std::sync::Arc<tokio::sync::Mutex<Vec<String>>>;
+        let queries: Queries = Default::default();
+        let app = axum::Router::new()
+            .route(
+                "/agent/sandboxes/byte-channel",
+                axum::routing::get(
+                    move |State(queries): State<Queries>,
+                          headers: axum::http::HeaderMap,
+                          Query(query): Query<RemoteByteChannelQuery>,
+                          ws: WebSocketUpgrade| async move {
+                        let auth = headers
+                            .get(axum::http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        let port = query.port.map(|p| format!(" port={p}")).unwrap_or_default();
+                        queries.lock().await.push(format!(
+                            "{} {}{} {}",
+                            query.sandbox,
+                            query.channel.as_str(),
+                            port,
+                            auth
+                        ));
+                        if missing {
+                            return (
+                                axum::http::StatusCode::NOT_FOUND,
+                                axum::Json(serde_json::json!({
+                                    "error": "sandbox container 'temps-sandbox-abc' does not exist on this node"
+                                })),
+                            )
+                                .into_response();
+                        }
+                        ws.on_upgrade(|socket| async move {
+                            let (mut tx, mut rx) = socket.split();
+                            while let Some(Ok(message)) = rx.next().await {
+                                match message {
+                                    Message::Binary(bytes) if bytes.as_ref() == b"fail" => {
+                                        let _ = tx
+                                            .send(Message::Text(
+                                                r#"{"error":"PTY agent relay error: gone"}"#.into(),
+                                            ))
+                                            .await;
+                                        return;
+                                    }
+                                    Message::Binary(bytes) => {
+                                        let mut echo = b"echo:".to_vec();
+                                        echo.extend_from_slice(&bytes);
+                                        if tx.send(Message::Binary(echo.into())).await.is_err() {
+                                            return;
+                                        }
+                                    }
+                                    Message::Close(_) => return,
+                                    _ => {}
+                                }
+                            }
+                        })
+                        .into_response()
+                    },
+                ),
+            )
+            .with_state(queries.clone());
+        (serve(app).await, queries)
+    }
+
+    #[tokio::test]
+    async fn the_terminal_is_tunnelled_over_a_byte_channel() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let (url, queries) = fake_byte_channel_agent(false).await;
+        let provider = provider_at(&url);
+        let mut pty = provider
+            .attach_pty(&remote_handle())
+            .await
+            .expect("terminal attached");
+        pty.input.write_all(b"ls\n").await.expect("write");
+        pty.input.flush().await.expect("flush");
+        let echoed = tokio::time::timeout(Duration::from_secs(10), pty.output.next())
+            .await
+            .expect("an answer in time")
+            .expect("a frame")
+            .expect("bytes");
+        assert_eq!(echoed.as_ref(), b"echo:ls\n");
+
+        // A guest-side failure arrives as the error frame and ends the stream.
+        pty.input.write_all(b"fail").await.expect("write");
+        pty.input.flush().await.expect("flush");
+        let failed = tokio::time::timeout(Duration::from_secs(10), pty.output.next())
+            .await
+            .expect("an answer in time")
+            .expect("a frame");
+        let text = failed.unwrap_err().to_string();
+        assert!(text.contains("worker-2"), "{text}");
+        assert!(text.contains("PTY agent relay error: gone"), "{text}");
+        assert!(pty.output.next().await.is_none(), "the channel ends");
+
+        assert_eq!(
+            *queries.lock().await,
+            vec!["temps-sandbox-abc terminal Bearer tok".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_agent_runtime_opens_over_the_same_channel() {
+        let (url, queries) = fake_byte_channel_agent(false).await;
+        let provider = provider_at(&url);
+        provider
+            .connect_agent_runtime(&remote_handle())
+            .await
+            .expect("runtime connected");
+        assert_eq!(
+            *queries.lock().await,
+            vec!["temps-sandbox-abc agent_runtime Bearer tok".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_preview_port_is_relayed_over_the_same_channel() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+        let (url, queries) = fake_byte_channel_agent(false).await;
+        let provider = provider_at(&url);
+        let mut channel = provider
+            .connect_port(&remote_handle(), 3000)
+            .await
+            .expect("port connected");
+        channel
+            .input
+            .write_all(b"GET / HTTP/1.1\r\n\r\n")
+            .await
+            .expect("write");
+        channel.input.flush().await.expect("flush");
+        let echoed = tokio::time::timeout(Duration::from_secs(10), channel.output.next())
+            .await
+            .expect("an answer in time")
+            .expect("a frame")
+            .expect("bytes");
+        assert_eq!(echoed.as_ref(), b"echo:GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(
+            *queries.lock().await,
+            vec!["temps-sandbox-abc port port=3000 Bearer tok".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_byte_channel_to_a_missing_sandbox_is_not_found() {
+        let (url, _queries) = fake_byte_channel_agent(true).await;
+        let provider = provider_at(&url);
+        match provider.attach_pty(&remote_handle()).await {
+            Err(AgentError::SandboxNotFound { sandbox, .. }) => {
+                assert!(sandbox.contains("worker-2"), "{sandbox}");
+            }
+            Err(other) => panic!("expected not found, got {other:?}"),
+            Ok(_) => panic!("expected not found, got a channel"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_byte_channel_is_never_opened_for_a_non_sandbox_name() {
+        let (url, queries) = fake_byte_channel_agent(false).await;
+        let provider = provider_at(&url);
+        let mut h = remote_handle();
+        h.sandbox_name = "temps-sandbox-abc&channel=agent_runtime".into();
+        assert!(matches!(
+            provider.attach_pty(&h).await,
+            Err(AgentError::Validation { .. })
+        ));
+        assert!(
+            queries.lock().await.is_empty(),
+            "no request reached the node"
+        );
+    }
+
+    #[test]
+    fn runtime_compatibility_round_trips_on_the_wire() {
+        for value in [
+            RuntimeCompatibility::Compatible,
+            RuntimeCompatibility::Unavailable {
+                reason: "daemon not running".into(),
+            },
+            RuntimeCompatibility::Incompatible {
+                reason: "protocol 1 < 2".into(),
+            },
+        ] {
+            let wire = RemoteRuntimeCompatibility::from(value.clone());
+            let json = serde_json::to_string(&wire).expect("serializes");
+            let back: RemoteRuntimeCompatibility =
+                serde_json::from_str(&json).expect("deserializes");
+            assert_eq!(back.into_local(), value, "{json}");
+        }
     }
 
     // ── Streamed exec ──────────────────────────────────────────────────

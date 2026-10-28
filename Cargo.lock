@@ -176,7 +176,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -187,7 +187,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -481,6 +481,12 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "assert_matches"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
 
 [[package]]
 name = "astral-tokio-tar"
@@ -1341,6 +1347,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "aya"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66e644424fada9fff4fdc63848db1732fb69b626e8328202ef55c03df1f4d939"
+dependencies = [
+ "assert_matches",
+ "aya-obj",
+ "bitflags 2.13.2",
+ "hashbrown 0.17.1",
+ "libc",
+ "log",
+ "object 0.39.1",
+ "once_cell",
+ "scopeguard",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "aya-obj"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077"
+dependencies = [
+ "bytes",
+ "log",
+ "object 0.39.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1924,7 +1960,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1941,7 +1977,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
  "winx",
 ]
 
@@ -2307,7 +2343,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3365,7 +3401,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3787,7 +3823,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6330,7 +6366,7 @@ dependencies = [
  "microsandbox-utils",
  "nix 0.31.3",
  "notify",
- "object",
+ "object 0.40.0",
  "rand 0.10.3",
  "rayon",
  "reqwest 0.13.4",
@@ -7362,7 +7398,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7506,7 +7542,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http 1.5.0",
@@ -7584,6 +7620,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7216bd11cbda54ccabcab84d523dc93b858ec75ecfb3a7d89513fa22464da396"
 dependencies = [
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "object"
+version = "0.39.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
+dependencies = [
+ "crc32fast",
+ "hashbrown 0.17.1",
+ "indexmap 2.14.0",
+ "memchr",
 ]
 
 [[package]]
@@ -8646,7 +8694,7 @@ dependencies = [
  "arrayvec",
  "async-channel",
  "flurry",
- "hashbrown 0.12.3",
+ "hashbrown 0.17.1",
  "log",
  "parking_lot",
  "rand 0.8.7",
@@ -9147,7 +9195,7 @@ version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "itertools 0.14.0",
  "log",
  "multimap",
@@ -9217,9 +9265,9 @@ dependencies = [
 
 [[package]]
 name = "pulldown-cmark"
-version = "0.13.4"
+version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e"
+checksum = "278e9268c93b9e498a2da46c34d90ba93a3255eb99009646398f34bc73ab36eb"
 dependencies = [
  "bitflags 2.13.2",
  "getopts",
@@ -10272,7 +10320,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10350,7 +10398,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11478,7 +11526,7 @@ version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
 dependencies = [
- "heck 0.4.1",
+ "heck 0.5.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -11491,7 +11539,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12314,7 +12362,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -12356,6 +12404,8 @@ dependencies = [
  "temps-core",
  "temps-deployer",
  "temps-dns-resolver",
+ "temps-docker-capture",
+ "temps-entities",
  "temps-external-plugins",
  "temps-metrics",
  "temps-network",
@@ -12364,6 +12414,10 @@ dependencies = [
  "temps-shield",
  "temps-vulnerability-scanner",
  "temps-wireguard",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-netpol",
+ "temps-workload-node",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
@@ -12431,13 +12485,17 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-deployments",
+ "temps-docker-capture",
  "temps-entities",
  "temps-error-tracking",
  "temps-git",
  "temps-notifications",
  "temps-vm-agent",
+ "temps-workload",
+ "temps-workload-netpol",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-tungstenite 0.30.0",
  "tracing",
  "utoipa",
  "walkdir",
@@ -12902,6 +12960,11 @@ dependencies = [
  "temps-monitoring",
  "temps-notifications",
  "temps-providers",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-env",
+ "temps-workload-plane",
+ "temps-workload-volumes",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -13080,6 +13143,7 @@ dependencies = [
  "temps-migrations",
  "temps-monitoring",
  "temps-network",
+ "temps-network-policy",
  "temps-notifications",
  "temps-observability",
  "temps-otel",
@@ -13100,6 +13164,9 @@ dependencies = [
  "temps-vulnerability-scanner",
  "temps-webhooks",
  "temps-wireguard",
+ "temps-workload",
+ "temps-workload-activator",
+ "temps-workload-plane",
  "thiserror 2.0.21",
  "tikv-jemallocator",
  "tokio",
@@ -13369,6 +13436,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "shlex",
  "sysinfo",
  "tar",
  "tempfile",
@@ -13376,12 +13444,16 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-dns",
+ "temps-dns-resolver",
+ "temps-docker-capture",
  "temps-entities",
  "temps-file-store",
  "temps-network",
  "temps-presets",
  "temps-routes",
  "temps-runtime-health",
+ "temps-workload",
+ "temps-workload-docker",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -13466,6 +13538,11 @@ dependencies = [
  "temps-screenshots",
  "temps-vulnerability-scanner",
  "temps-wireguard",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-env",
+ "temps-workload-plane",
+ "temps-workload-volumes",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -13489,6 +13566,7 @@ name = "temps-dns"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "axum",
  "axum-macros",
@@ -13505,6 +13583,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rsa 0.9.10",
  "sea-orm 1.1.20",
+ "sea-orm-migration 1.1.20",
  "serde",
  "serde_json",
  "serial_test",
@@ -13517,6 +13596,8 @@ dependencies = [
  "temps-entities",
  "temps-migrations",
  "temps-projects",
+ "temps-workload",
+ "temps-workload-netpol",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -13534,6 +13615,7 @@ name = "temps-dns-resolver"
 version = "0.1.0-beta.57"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
  "chrono",
  "hickory-proto",
@@ -13544,11 +13626,23 @@ dependencies = [
  "serde_json",
  "tempfile",
  "temps-core",
+ "temps-workload",
+ "temps-workload-netpol",
  "thiserror 2.0.21",
  "tokio",
  "tokio-test",
  "tracing",
  "wiremock",
+]
+
+[[package]]
+name = "temps-docker-capture"
+version = "0.1.0-beta.57"
+dependencies = [
+ "axum",
+ "bollard",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -13746,6 +13840,8 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-core",
+ "temps-workload",
+ "temps-workload-ingress",
  "thiserror 2.0.21",
  "utoipa",
  "uuid",
@@ -13775,9 +13871,11 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-shield",
+ "temps-workload-ingress",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "url",
  "utoipa",
 ]
 
@@ -14611,6 +14709,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-netpol-ebpf-common"
+version = "0.1.0"
+dependencies = [
+ "aya",
+]
+
+[[package]]
+name = "temps-netpol-probe"
+version = "0.1.0-beta.57"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bollard",
+ "futures",
+ "hickory-proto",
+ "hickory-server",
+ "serde",
+ "serde_json",
+ "temps-dns-resolver",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "temps-network"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -14641,6 +14767,32 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "temps-network-policy"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "bollard",
+ "chrono",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-routes",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]
@@ -14940,6 +15092,8 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-dns",
+ "temps-dns-resolver",
+ "temps-docker-capture",
  "temps-entities",
  "temps-logs",
  "temps-metrics",
@@ -14951,6 +15105,9 @@ dependencies = [
  "temps-query-postgres",
  "temps-query-redis",
  "temps-query-s3",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-plane",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -15028,6 +15185,8 @@ dependencies = [
  "temps-presets",
  "temps-routes",
  "temps-shield",
+ "temps-workload-activator",
+ "temps-workload-ingress",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -15218,6 +15377,7 @@ dependencies = [
  "flate2",
  "hex",
  "http 1.5.0",
+ "ipnetwork",
  "parking_lot",
  "reqwest 0.12.28",
  "rustls-pemfile",
@@ -15232,6 +15392,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-shield",
+ "temps-workload-ingress",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -15267,11 +15428,13 @@ dependencies = [
  "async-trait",
  "axum",
  "base64 0.23.1",
+ "bytes",
  "chrono",
  "flate2",
  "futures",
  "hex",
  "http 1.5.0",
+ "ipnetwork",
  "percent-encoding",
  "rand 0.10.3",
  "sea-orm 1.1.20",
@@ -15552,6 +15715,153 @@ dependencies = [
  "tokio",
  "tracing",
  "x25519-dalek",
+]
+
+[[package]]
+name = "temps-workload"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "utoipa",
+]
+
+[[package]]
+name = "temps-workload-activator"
+version = "0.1.0-beta.57"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-workload-docker"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-docker-capture",
+ "temps-workload",
+ "temps-workload-volumes",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-workload-env"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "temps-workload",
+ "thiserror 2.0.21",
+ "tokio",
+]
+
+[[package]]
+name = "temps-workload-ingress"
+version = "0.1.0-beta.57"
+dependencies = [
+ "base64 0.23.1",
+ "hmac 0.13.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "temps-workload",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "temps-workload-netpol"
+version = "0.1.0-beta.57"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "aya",
+ "bollard",
+ "bytes",
+ "crossbeam-queue",
+ "futures",
+ "httparse",
+ "libc",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "tar",
+ "temps-netpol-ebpf-common",
+ "temps-workload",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-workload-node"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-workload",
+ "temps-workload-env",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "temps-workload-plane"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "bytes",
+ "chrono",
+ "futures",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "temps-migrations",
+ "temps-workload",
+ "temps-workload-docker",
+ "temps-workload-env",
+ "temps-workload-volumes",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "temps-workload-volumes"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-trait",
+ "serde",
+ "serde_json",
+ "temps-workload",
+ "thiserror 2.0.21",
+ "tokio",
 ]
 
 [[package]]
@@ -17136,7 +17446,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -17522,7 +17832,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

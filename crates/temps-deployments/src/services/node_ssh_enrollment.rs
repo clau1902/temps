@@ -1271,7 +1271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unparseable_or_missing_configuration_reserves_nothing_from_it() {
+    async fn unparsable_or_missing_configuration_reserves_nothing_from_it() {
         let networks = networks_of(vec![network_config(true, "not-a-cidr", None)]).await;
         assert_eq!(
             networks.iter().map(|n| n.name).collect::<Vec<_>>(),

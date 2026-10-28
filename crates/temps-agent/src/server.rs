@@ -49,6 +49,10 @@ pub struct SharedNetwork {
     pub overlay_bridge_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
     pub overlay_peers: crate::network_sync::SharedPeers,
     pub host_bind_address: crate::network_sync::SharedBindAddress,
+    /// The network policy enforcer's DNS view, which the node resolver
+    /// answers restricted workloads from. The same slot must be given to
+    /// [`crate::network_policy::spawn_worker_enforcer`].
+    pub dns_policy: temps_dns_resolver::DnsPolicySlot,
 }
 
 /// Build the agent Axum router with authentication middleware.
@@ -199,6 +203,15 @@ pub fn build_router(
             get(service_handlers::service_status),
         )
         .route("/agent/services/exec", post(service_handlers::service_exec))
+        // ADR-055 Phase 4: databases created from their workload spec.
+        .route(
+            "/agent/services/workload",
+            post(service_handlers::create_service_workload),
+        )
+        .route(
+            "/agent/services/{name}/snapshot",
+            get(service_handlers::service_snapshot),
+        )
         .route(
             "/agent/services/runtime-env",
             post(service_handlers::runtime_env),
@@ -272,7 +285,7 @@ pub fn build_router(
 /// routes raise the body limit (to [`SANDBOX_UPLOAD_BODY_LIMIT`]) and only
 /// they take an upload slot ([`sandbox_handlers::limit_uploads`]); every
 /// other route keeps axum's 2 MiB default.
-fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
+pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
     let upload_slot =
         || middleware::from_fn_with_state(sandbox_state.clone(), sandbox_handlers::limit_uploads);
     Router::new()
@@ -337,6 +350,31 @@ fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) ->
             "/agent/sandboxes/status",
             post(sandbox_handlers::sandbox_status),
         )
+        // ADR-055 phase 6: driver operations the control plane forwards.
+        .route(
+            "/agent/sandboxes/resize-disk",
+            post(sandbox_handlers::resize_sandbox_disk),
+        )
+        .route(
+            "/agent/sandboxes/egress-policy",
+            post(sandbox_handlers::set_sandbox_egress_policy),
+        )
+        .route(
+            "/agent/sandboxes/image-identity",
+            post(sandbox_handlers::sandbox_image_identity),
+        )
+        .route(
+            "/agent/sandboxes/agent-runtime-check",
+            post(sandbox_handlers::check_sandbox_agent_runtime),
+        )
+        .route(
+            "/agent/sandboxes/recover-agent-harness",
+            post(sandbox_handlers::recover_sandbox_agent_harness),
+        )
+        .route(
+            "/agent/sandboxes/byte-channel",
+            get(sandbox_handlers::open_sandbox_byte_channel),
+        )
         .layer(middleware::from_fn_with_state(
             sandbox_state.clone(),
             sandbox_handlers::redact_host_paths,
@@ -381,12 +419,35 @@ fn spawn_sandbox_quarantine(
 
 /// Maximum number of consecutive heartbeat failures before escalating to error-level logging.
 const HEARTBEAT_MAX_RETRIES: u32 = 3;
+/// Beats (30s each) after which unchanged overlay addresses are sent again,
+/// in case the control plane could not apply them the last time.
+const OVERLAY_ADDRESSES_RESEND_BEATS: u32 = 20;
+/// The shortest gap between a heartbeat and an early one sent because an
+/// instance report changed (ADR-055 §7).
+const EARLY_BEAT_MIN_GAP: Duration = Duration::from_secs(2);
 
 /// Base delay for exponential backoff between heartbeat retries (doubled each attempt).
 const HEARTBEAT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
 
 /// Maximum backoff delay between heartbeat retries.
 const HEARTBEAT_RETRY_MAX_DELAY: Duration = Duration::from_secs(15);
+
+/// The part of the control plane's heartbeat response the agent acts on.
+#[derive(serde::Deserialize)]
+struct HeartbeatAck {
+    /// Absent from servers that predate it: read as "not recorded", so a
+    /// report is resent rather than silently dropped.
+    #[serde(default)]
+    instances_accepted: bool,
+}
+
+/// Whether a successful heartbeat's response says the instance reports it
+/// carried were recorded. Anything unreadable counts as not recorded.
+fn instance_reports_acknowledged(body: &[u8]) -> bool {
+    serde_json::from_slice::<HeartbeatAck>(body)
+        .map(|ack| ack.instances_accepted)
+        .unwrap_or(false)
+}
 
 /// Heartbeats between re-checks of an already-known container platform.
 ///
@@ -403,6 +464,7 @@ const PLATFORM_RECHECK_BEATS: u32 = 20;
 ///
 /// The first successful heartbeat includes a full container inventory so the control
 /// plane can reconcile stale DB records against actual Docker state (e.g., after a crash).
+#[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_loop(
     config: &AgentConfig,
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
@@ -410,8 +472,13 @@ fn spawn_heartbeat_loop(
     docker: Option<bollard::Docker>,
     health: crate::network_sync::HealthSlots,
     docker_socket_grant: DockerSocketGrant,
-    mesh_listener: crate::mesh_listener::SharedMeshListener,
+    wakers: HeartbeatWakers,
+    resolver_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
 ) {
+    let HeartbeatWakers {
+        mesh_listener,
+        node_runtime,
+    } = wakers;
     let control_plane_url = config.control_plane_url.clone();
     let heartbeat_client = crate::control_plane_client_builder(config);
     let node_id = config.node_id;
@@ -456,7 +523,15 @@ fn spawn_heartbeat_loop(
         // Occupied ranges the control plane acknowledged last (ADR 056):
         // they are sent only when they differ.
         let mut occupied_sent: Option<Vec<temps_network::occupied::OccupiedRange>> = None;
+        // Overlay addresses the control plane accepted last: sent when they
+        // change, and again every `OVERLAY_ADDRESSES_RESEND_BEATS` beats so a
+        // write the control plane failed to apply is retried.
+        let mut addresses_sent: Option<Vec<crate::overlay_addresses::OverlayAddress>> = None;
+        let mut beats_since_addresses_sent: u32 = 0;
         let mut capacity_sampler = CapacitySampler::new();
+        let mut resolver_coverage = temps_deployer::resolver_coverage::ResolverCoverage::new();
+
+        let mut last_beat: Option<tokio::time::Instant> = None;
 
         loop {
             tokio::select! {
@@ -471,7 +546,19 @@ fn spawn_heartbeat_loop(
                         "the agent API's mesh listener changed; sending a heartbeat now"
                     );
                 }
+                // ADR-055 §7: a changed instance report is sent early rather
+                // than up to 30 s late, but never more often than once per
+                // `EARLY_BEAT_MIN_GAP`.
+                _ = instance_reports_changed(node_runtime.as_deref()) => {
+                    if let Some(last) = last_beat {
+                        let gap = last.elapsed();
+                        if gap < EARLY_BEAT_MIN_GAP {
+                            tokio::time::sleep(EARLY_BEAT_MIN_GAP - gap).await;
+                        }
+                    }
+                }
             }
+            last_beat = Some(tokio::time::Instant::now());
 
             let mut capacity = capacity_sampler.sample().await;
             // Where the agent API is served on the WireGuard mesh: what lets
@@ -487,6 +574,16 @@ fn spawn_heartbeat_loop(
                     value,
                 );
             }
+            // The node runtime's reports: only those that changed since the
+            // last accepted beat.
+            let instance_reports = match &node_runtime {
+                Some(runtime) => {
+                    capacity["node_capabilities"] =
+                        serde_json::json!([crate::node_runtime::STATE_STREAM_CAPABILITY]);
+                    runtime.pending_reports().await
+                }
+                None => Vec::new(),
+            };
 
             // Platform discovery can fail at startup — the agent often boots
             // alongside the Docker daemon — so retry here until it answers.
@@ -557,6 +654,16 @@ fn spawn_heartbeat_loop(
             if let Some(ingress) = crate::public_ingress::health() {
                 body["public_ingress"] = serde_json::to_value(ingress).unwrap_or_default();
             }
+            if !instance_reports.is_empty() {
+                match serde_json::to_value(&instance_reports) {
+                    Ok(v) => body["instances"] = v,
+                    Err(e) => tracing::warn!(
+                        node_id = node_id,
+                        error = %e,
+                        "Failed to serialize instance reports for heartbeat"
+                    ),
+                }
+            }
 
             // DNS resolver health (ADR-024), published by the network-sync
             // loop on every tick. `None` until that loop has ticked at
@@ -573,6 +680,37 @@ fn spawn_heartbeat_loop(
                         error = %e,
                         "Failed to serialize DNS resolver health for heartbeat"
                     ),
+                }
+            }
+
+            // Deployments whose containers were created before this node's
+            // cluster resolver was up, and so cannot resolve
+            // `*.temps.local` until they are redeployed. Sent on every beat,
+            // empty while the resolver is down or cluster DNS is off, so the
+            // control plane never keeps a stale list.
+            if let Some(docker) = docker.as_ref() {
+                let resolver = resolver_address.read().ok().and_then(|slot| *slot);
+                let without = match resolver {
+                    Some(resolver) => {
+                        match resolver_coverage
+                            .deployments_without(docker, resolver)
+                            .await
+                        {
+                            Ok(ids) => Some(ids),
+                            Err(e) => {
+                                tracing::warn!(
+                                    node_id,
+                                    error = %e,
+                                    "Could not check which deployments have the cluster resolver"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    None => Some(Vec::new()),
+                };
+                if let Some(ids) = without {
+                    body["deployments_without_resolver"] = serde_json::json!(ids);
                 }
             }
 
@@ -607,6 +745,28 @@ fn spawn_heartbeat_loop(
                 .filter(|ranges| occupied_sent.as_ref() != Some(ranges));
             if let Some(ranges) = &occupied_to_send {
                 body["occupied_ranges"] = serde_json::json!(ranges);
+            }
+
+            // Container overlay addresses, which a Docker restart can change
+            // under the records the control plane holds.
+            beats_since_addresses_sent = beats_since_addresses_sent.saturating_add(1);
+            let mut addresses_to_send = None;
+            if let Some(docker) = docker.as_ref() {
+                match crate::overlay_addresses::collect(docker).await {
+                    Ok(addresses) => {
+                        if addresses_sent.as_ref() != Some(&addresses)
+                            || beats_since_addresses_sent >= OVERLAY_ADDRESSES_RESEND_BEATS
+                        {
+                            body["overlay_addresses"] = serde_json::json!(addresses);
+                            addresses_to_send = Some(addresses);
+                        }
+                    }
+                    Err(e) => tracing::warn!(
+                        node_id,
+                        error = %e,
+                        "Could not list container overlay addresses for the heartbeat"
+                    ),
+                }
             }
 
             // On the first heartbeat (agent startup/reconnect), include a full
@@ -672,8 +832,38 @@ fn spawn_heartbeat_loop(
                         if body.get("containers").is_some() {
                             inventory_sent = true;
                         }
+                        if let (Some(runtime), Some(_)) = (&node_runtime, body.get("instances")) {
+                            // The runtime suppresses a report it believes
+                            // delivered until it changes, so only a server
+                            // that says it recorded them makes them sent;
+                            // otherwise they ride the next beat again.
+                            let accepted = match response.bytes().await {
+                                Ok(bytes) => instance_reports_acknowledged(&bytes),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        node_id = node_id,
+                                        error = %e,
+                                        "Failed to read the heartbeat response; instance reports will be resent"
+                                    );
+                                    false
+                                }
+                            };
+                            if accepted {
+                                runtime.mark_sent(&instance_reports);
+                            } else {
+                                tracing::debug!(
+                                    node_id = node_id,
+                                    count = instance_reports.len(),
+                                    "Control plane did not acknowledge the instance reports; resending them next heartbeat"
+                                );
+                            }
+                        }
                         if let Some(ranges) = occupied_to_send.clone() {
                             occupied_sent = Some(ranges);
+                        }
+                        if let Some(addresses) = addresses_to_send.clone() {
+                            addresses_sent = Some(addresses);
+                            beats_since_addresses_sent = 0;
                         }
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
@@ -799,6 +989,24 @@ const CPU_MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Samples this host's CPU/memory/disk for the heartbeat `capacity` payload.
 ///
+/// What can send a heartbeat ahead of the 30-second interval.
+struct HeartbeatWakers {
+    /// The agent API's mesh listener; a change is reported at once.
+    mesh_listener: crate::mesh_listener::SharedMeshListener,
+    /// The node runtime (ADR-055 §7), when the state stream is enabled; a
+    /// changed instance report is sent early.
+    node_runtime: Option<Arc<temps_workload_node::NodeRuntime>>,
+}
+
+/// Resolves when the node runtime has a changed instance report to send;
+/// never, when this node has no runtime.
+async fn instance_reports_changed(runtime: Option<&temps_workload_node::NodeRuntime>) {
+    match runtime {
+        Some(runtime) => runtime.reports_changed.notified().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// CPU usage is a delta between two refreshes, so the `System` must outlive a
 /// single reading: the previous implementation built a fresh `System` per beat
 /// and refreshed once, which always reported ~0% and made any CPU alert
@@ -847,6 +1055,11 @@ impl CapacitySampler {
             "memory_total_bytes": self.sys.total_memory(),
             "disk_used_bytes": disk_used,
             "disk_total_bytes": disk_total,
+            // ADR-055 §5: the scheduler deducts `system_reserved`
+            // (millicores) from the node's CPU capacity, and an enforcing
+            // node counts reservations against it. Only the core count makes
+            // that possible.
+            "cpu_cores": self.sys.cpus().len(),
         })
     }
 }
@@ -876,6 +1089,21 @@ fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentErro
     Ok(())
 }
 
+/// Options of [`start_agent_server_with`] that older callers do not set.
+#[derive(Debug, Clone)]
+pub struct AgentServerOptions {
+    /// Run the node runtime and advertise the `state_stream` capability
+    /// (ADR-055 §7). Off, the agent is driven through `/agent/*` only, as
+    /// before; `temps agent --disable-state-stream` is the rollback.
+    pub state_stream: bool,
+}
+
+impl Default for AgentServerOptions {
+    fn default() -> Self {
+        Self { state_stream: true }
+    }
+}
+
 /// Start the agent server. This blocks until the server shuts down.
 pub async fn start_agent_server(
     container_deployer: Arc<dyn ContainerDeployer>,
@@ -884,6 +1112,28 @@ pub async fn start_agent_server(
     config: AgentConfig,
     network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
+) -> Result<(), crate::AgentError> {
+    start_agent_server_with(
+        container_deployer,
+        image_builder,
+        docker,
+        config,
+        network,
+        docker_socket_grant,
+        AgentServerOptions::default(),
+    )
+    .await
+}
+
+/// [`start_agent_server`] with [`AgentServerOptions`].
+pub async fn start_agent_server_with(
+    container_deployer: Arc<dyn ContainerDeployer>,
+    image_builder: Arc<dyn ImageBuilder>,
+    docker: Option<bollard::Docker>,
+    config: AgentConfig,
+    network: SharedNetwork,
+    docker_socket_grant: DockerSocketGrant,
+    options: AgentServerOptions,
 ) -> Result<(), crate::AgentError> {
     validate_agent_transport(&config)?;
 
@@ -934,6 +1184,43 @@ pub async fn start_agent_server(
         tokio::sync::watch::channel(crate::mesh_listener::MeshAddress::Unknown);
     let mesh_listener: crate::mesh_listener::SharedMeshListener = Arc::default();
 
+    // The node runtime (ADR-055 §7). Without it, or when it cannot start,
+    // the capability is not advertised and the control plane keeps using
+    // `/agent/*` for this node.
+    let node_runtime = match (&docker, options.state_stream) {
+        (Some(docker), true) => match crate::node_runtime::spawn(
+            &config,
+            docker.clone(),
+            network.host_bind_address.clone(),
+            network.overlay_bridge_address.clone(),
+            network.overlay_peers.clone(),
+        ) {
+            Ok(runtime) => Some(runtime),
+            Err(e) => {
+                tracing::warn!(
+                    node_id = config.node_id,
+                    "The node runtime did not start; this node is driven through /agent/* \
+                     only: {e}"
+                );
+                None
+            }
+        },
+        (None, true) => {
+            tracing::info!(
+                node_id = config.node_id,
+                "No Docker daemon; the node runtime is not started"
+            );
+            None
+        }
+        (_, false) => {
+            tracing::info!(
+                node_id = config.node_id,
+                "The state stream is disabled; this node is driven through /agent/* only"
+            );
+            None
+        }
+    };
+
     // Start heartbeat background loop (with deployer for container inventory on first beat)
     spawn_heartbeat_loop(
         &config,
@@ -942,7 +1229,11 @@ pub async fn start_agent_server(
         docker,
         health.clone(),
         docker_socket_grant,
-        mesh_listener.clone(),
+        HeartbeatWakers {
+            mesh_listener: mesh_listener.clone(),
+            node_runtime,
+        },
+        network.overlay_bridge_address.clone(),
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
@@ -958,6 +1249,7 @@ pub async fn start_agent_server(
         network.host_bind_address,
         container_deployer,
         mesh_address_tx,
+        network.dns_policy,
     );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
@@ -1138,6 +1430,24 @@ pub(crate) async fn serve_mtls(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn instance_reports_count_as_sent_only_when_the_server_recorded_them() {
+        assert!(instance_reports_acknowledged(
+            br#"{"status":"ok","message":"Heartbeat received","instances_accepted":true}"#
+        ));
+        // The server could not record them: resend.
+        assert!(!instance_reports_acknowledged(
+            br#"{"status":"ok","message":"Heartbeat received","instances_accepted":false}"#
+        ));
+        // A server that predates the acknowledgement: resend.
+        assert!(!instance_reports_acknowledged(
+            br#"{"status":"ok","message":"Heartbeat received"}"#
+        ));
+        // An unreadable body: resend.
+        assert!(!instance_reports_acknowledged(b"<html>bad gateway</html>"));
+        assert!(!instance_reports_acknowledged(b""));
+    }
 
     pub(crate) fn test_agent_config(require_mtls: bool) -> AgentConfig {
         AgentConfig {
@@ -1349,7 +1659,7 @@ pub(crate) mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 14] = [
+    const SANDBOX_ROUTES: [&str; 19] = [
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -1364,6 +1674,11 @@ pub(crate) mod tests {
         "/agent/sandboxes/recover",
         "/agent/sandboxes/release-orphaned",
         "/agent/sandboxes/status",
+        "/agent/sandboxes/resize-disk",
+        "/agent/sandboxes/egress-policy",
+        "/agent/sandboxes/image-identity",
+        "/agent/sandboxes/agent-runtime-check",
+        "/agent/sandboxes/recover-agent-harness",
     ];
     const UPLOAD_ROUTES: [&str; 2] = [
         "/agent/sandboxes/write-file",
@@ -1425,6 +1740,41 @@ pub(crate) mod tests {
                 response.status()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_byte_channel_route_is_registered_behind_agent_auth() {
+        use tower::ServiceExt;
+        let (app, _root) = sandbox_app();
+        let get = |token: Option<&str>| {
+            let mut request = axum::http::Request::get(
+                "/agent/sandboxes/byte-channel?sandbox=temps-sandbox-abc&channel=terminal",
+            );
+            if let Some(token) = token {
+                request =
+                    request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            request.body(axum::body::Body::empty()).unwrap()
+        };
+        for token in [None, Some("wrong")] {
+            let response = app.clone().oneshot(get(token)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::UNAUTHORIZED,
+                "byte channel with token {token:?}"
+            );
+        }
+        let response = app.clone().oneshot(get(Some("secret"))).await.unwrap();
+        assert!(
+            !matches!(
+                response.status(),
+                axum::http::StatusCode::NOT_FOUND
+                    | axum::http::StatusCode::METHOD_NOT_ALLOWED
+                    | axum::http::StatusCode::UNAUTHORIZED
+            ),
+            "byte channel answered {}",
+            response.status()
+        );
     }
 
     #[tokio::test]

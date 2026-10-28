@@ -30,7 +30,7 @@ use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
     preview_cookie_needs_refresh, preview_gateway_peer, preview_request_group_key, verify_argon2,
-    PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
+    PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewRequest, SandboxLookupCache,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::cookie_codec::{
@@ -1077,6 +1077,9 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
+    /// The previewed sandbox runs on a worker node: `upstream_peer` sends the
+    /// request to this process's worker preview relay instead of the gateway.
+    pub preview_on_worker: bool,
     /// The admin gate denied this request, so `upstream_peer` must send it to
     /// the listener that serves only the console's public routes (ADR-051)
     /// instead of resolving a peer. A non-allowlisted client can therefore
@@ -1161,6 +1164,9 @@ pub struct LoadBalancer {
     project_context_resolver: Arc<dyn ProjectContextResolver>,
     cookie_config: CookieConfig,
     crypto: Arc<temps_core::CookieCrypto>,
+    /// `TempsLogin` exchange grants already traded on this proxy, so each
+    /// is used once (ADR-055 §11). Taken once per sign-in, never per request.
+    consumed_exchanges: Arc<crate::ingress::ConsumedExchanges>,
     db: Arc<DbConnection>,
     config_service: Arc<temps_config::ConfigService>,
     ip_access_control_service: Arc<IpAccessControlService>,
@@ -1258,6 +1264,80 @@ pub struct LoadBalancer {
 /// Status recorded in proxy logs when the client disconnected before a
 /// response could be sent (the nginx convention).
 const CLIENT_CLOSED_REQUEST: u16 = 499;
+
+/// Answer a sandbox preview request the proxy refuses (an address outside
+/// the allow-list, a Temps login that cannot be completed, a password
+/// sandbox with no password): `status` with a plain-text `body` that says
+/// what is wrong and how to fix it. Never cached, never forwarded.
+async fn write_preview_refusal(
+    session: &mut PingoraSession,
+    ctx: &mut ProxyContext,
+    status: StatusCode,
+    body: String,
+    routing_status: &'static str,
+) -> Result<bool> {
+    let mut response = ResponseHeader::build(status, None)?;
+    response.insert_header("Cache-Control", "no-store")?;
+    response.insert_header("Referrer-Policy", "no-referrer")?;
+    response.insert_header("X-Request-ID", &ctx.request_id)?;
+    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+    session
+        .write_response_header(Box::new(response), false)
+        .await?;
+    session
+        .write_response_body(Some(Bytes::from(body)), true)
+        .await?;
+    ctx.routing_status = routing_status.to_string();
+    Ok(true)
+}
+
+/// Answer a request for a sandbox preview that does not exist.
+async fn write_preview_not_found(
+    session: &mut PingoraSession,
+    ctx: &mut ProxyContext,
+) -> Result<bool> {
+    write_preview_refusal(
+        session,
+        ctx,
+        StatusCode::NOT_FOUND,
+        "Sandbox preview not found\n".to_string(),
+        "preview_not_found",
+    )
+    .await
+}
+
+/// Send the visitor to `location` (a sanitised path on this host) with a
+/// 303, never cached.
+async fn write_preview_redirect(
+    session: &mut PingoraSession,
+    ctx: &mut ProxyContext,
+    location: &str,
+    routing_status: &'static str,
+) -> Result<bool> {
+    let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
+    response.insert_header("Location", location)?;
+    response.insert_header("Cache-Control", "no-store")?;
+    response.insert_header("Referrer-Policy", "no-referrer")?;
+    response.insert_header("X-Request-ID", &ctx.request_id)?;
+    session
+        .write_response_header(Box::new(response), true)
+        .await?;
+    ctx.routing_status = routing_status.to_string();
+    Ok(true)
+}
+
+/// The `next` query parameter of a preview request, sanitised to a path on
+/// this host.
+fn preview_next_from_query(query: Option<&str>) -> String {
+    let next = query
+        .and_then(|qs| {
+            url::form_urlencoded::parse(qs.as_bytes())
+                .find(|(k, _)| k == "next")
+                .map(|(_, v)| v.into_owned())
+        })
+        .unwrap_or_else(|| "/".to_string());
+    sanitize_next(&next)
+}
 
 /// When a request Shield would challenge but that cannot show the page (an
 /// API call, a POST) may retry (ADR 066, D7): by then the visitor may have
@@ -1376,6 +1456,7 @@ impl LoadBalancer {
             project_context_resolver,
             cookie_config: CookieConfig::default(),
             crypto,
+            consumed_exchanges: Arc::new(crate::ingress::ConsumedExchanges::default()),
             static_asset_lookup: Arc::new(
                 crate::service::static_asset_lookup::StaticAssetLookup::new(Arc::clone(&db)),
             ),
@@ -4591,7 +4672,1002 @@ fn ip_restriction_denies(
 static IP_DENY_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
     crate::ip_access::DenyLogLimiter::new(10, 20);
 
-fn legacy_ip_gate_denies(
+/// Caps "shadow evaluation disagrees" log lines at 20 per 10 seconds,
+/// process-wide. Every disagreement is counted in
+/// `proxy.ingress_shadow_mismatches`; only the log line is limited.
+static INGRESS_SHADOW_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
+    crate::ip_access::DenyLogLimiter::new(10, 20);
+
+/// Caps "enforcing environment has no compiled endpoint" log lines at 20
+/// per 10 seconds, process-wide: a missing snapshot refuses every request
+/// of every enforcing environment, which must not become a log flood.
+static INGRESS_UNAVAILABLE_LOG_LIMITER: crate::ip_access::DenyLogLimiter =
+    crate::ip_access::DenyLogLimiter::new(10, 20);
+
+/// The request facts [`LoadBalancer::decide_environment_access`] reads.
+/// Plain borrows of the request context.
+struct AccessRequest<'a> {
+    request: &'a RequestHeader,
+    host: &'a str,
+    path: &'a str,
+    tls_fingerprint: Option<&'a str>,
+    policy_decision: temps_core::RequestPolicyDecision,
+    ip_restricted: bool,
+    client_ip: Option<std::net::IpAddr>,
+    rate_limit: Option<crate::rate_limiter::ResolvedRateLimit<'a>>,
+    password: Option<crate::ingress::PasswordFacts>,
+}
+
+impl LoadBalancer {
+    /// The access decision for an environment request (ADR-055 §11).
+    ///
+    /// `legacy` runs the legacy chain. `enforce` runs the environment's
+    /// compiled endpoint, and refuses whenever the route snapshot cannot
+    /// provide it (never loaded, the endpoint did not compile, or no
+    /// endpoint covers the path): a stored policy such as a Temps login
+    /// lives only in the endpoint, so falling back to the legacy chain
+    /// would drop it. `shadow` decides with the legacy chain and also
+    /// evaluates the endpoint from the facts the chain recorded, counting
+    /// every disagreement.
+    ///
+    /// The endpoint stands in for the legacy chain only behind the default
+    /// request policy (`Continue`) and an IP gate that reads the
+    /// `project_ip_access_rules` table the endpoint's IP policy is derived
+    /// from; behind anything else the legacy chain decides.
+    ///
+    /// No lock, no I/O and no allocation beyond the legacy chain's own: one
+    /// snapshot refcount, the compiled policies, the shared rate-limit
+    /// counters and, only for a captcha, an in-memory clearance check.
+    async fn decide_environment_access(
+        &self,
+        project_ctx: &ProjectContext,
+        access: AccessRequest<'_>,
+    ) -> crate::ingress::AccessOutcome {
+        use crate::ingress::{
+            enforce_step, enforcing_endpoint, grant_host, legacy_access, legacy_after_captcha,
+            shadow_step, AccessOutcome, EndpointRequest, GrantFacts, LegacyFacts, LegacyRequest,
+            Step,
+        };
+        use temps_entities::ingress_mode::IngressMode;
+
+        let environment = &project_ctx.environment;
+        let environment_id = environment.id;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // The captcha's own assets and verification bypass attack mode.
+        let captcha_path = access.path.starts_with("/api/_temps/captcha")
+            || access.path.starts_with("/api/__temps/temps_captcha_wasm");
+        let has_tls_fingerprint = access.tls_fingerprint.is_some();
+        let mode = environment.ingress_mode;
+
+        let snapshot = if mode.compiles()
+            && matches!(
+                access.policy_decision,
+                temps_core::RequestPolicyDecision::Continue
+            )
+            && self.project_ip_gate.reads_project_ip_access_rules()
+        {
+            self.route_table
+                .as_ref()
+                .map(|table| table.ingress_snapshot())
+        } else {
+            None
+        };
+        // Shadow and enforce read the same endpoint: what enforcing would
+        // decide with, or why it would refuse.
+        let enforcing = snapshot
+            .as_deref()
+            .map(|snapshot| enforcing_endpoint(snapshot, environment_id, access.path));
+        let mut host_buffer = [0u8; 256];
+        let host = grant_host(access.host, &mut host_buffer);
+
+        if mode == IngressMode::Enforce {
+            if let (Some(snapshot), Some(enforcing)) = (snapshot.as_deref(), enforcing) {
+                let endpoint = match enforcing {
+                    Ok(endpoint) => endpoint,
+                    Err(missing) => {
+                        if let Some(suppressed) = INGRESS_UNAVAILABLE_LOG_LIMITER.admit(now_secs) {
+                            warn!(
+                                environment_id,
+                                project_id = project_ctx.project.id,
+                                reason = missing.label(),
+                                suppressed_since_last_log = suppressed,
+                                "Environment enforces an ingress endpoint the route snapshot cannot provide; refusing the request"
+                            );
+                        }
+                        return AccessOutcome::Unavailable;
+                    }
+                };
+                let request = EndpointRequest {
+                    request: access.request,
+                    environment_id,
+                    client_ip: access.client_ip,
+                    captcha_path,
+                    has_tls_fingerprint,
+                    password: access.password,
+                    grants: GrantFacts {
+                        master: self.crypto.ingress_grant_master_key(),
+                        revocations: snapshot.revocations(),
+                        host,
+                        now_secs,
+                    },
+                };
+                // A captcha step is Shield's to answer (ADR 066), after this
+                // decision: resume past it.
+                return match enforce_step(endpoint, &request, &self.rate_limiter, false, 0) {
+                    Step::Done(outcome) => outcome,
+                    Step::NeedsCaptcha { resume_at } => {
+                        match enforce_step(endpoint, &request, &self.rate_limiter, true, resume_at)
+                        {
+                            Step::Done(outcome) => outcome,
+                            Step::NeedsCaptcha { .. } => AccessOutcome::CaptchaChallenge,
+                        }
+                    }
+                };
+            }
+        }
+
+        let legacy = LegacyRequest {
+            client_ip: access.client_ip,
+            ip_restricted: access.ip_restricted,
+            rate_limit: access.rate_limit,
+            // Attack mode is a Shield mode (ADR 066), decided after this.
+            attack_mode: false,
+            captcha_path,
+            has_tls_fingerprint,
+            password: access.password,
+        };
+        let mut facts = LegacyFacts::default();
+        let outcome = match legacy_access(&legacy, &self.rate_limiter, now_secs, &mut facts) {
+            Step::Done(outcome) => outcome,
+            Step::NeedsCaptcha { .. } => legacy_after_captcha(&legacy, true, &mut facts),
+        };
+
+        if mode == IngressMode::Shadow {
+            let shadow = match (snapshot.as_deref(), enforcing) {
+                (Some(snapshot), Some(Ok(endpoint))) => {
+                    let request = EndpointRequest {
+                        request: access.request,
+                        environment_id,
+                        client_ip: access.client_ip,
+                        captcha_path,
+                        has_tls_fingerprint,
+                        password: access.password,
+                        grants: GrantFacts {
+                            master: self.crypto.ingress_grant_master_key(),
+                            revocations: snapshot.revocations(),
+                            host,
+                            now_secs,
+                        },
+                    };
+                    Some((endpoint.id, shadow_step(endpoint, &request, &facts)))
+                }
+                // Enforcing would refuse this request.
+                (Some(_), Some(Err(_))) => Some((0, AccessOutcome::Unavailable)),
+                // The snapshot is not consulted (a plugin request policy or
+                // IP gate decides): nothing to compare.
+                _ => None,
+            };
+            if let Some((endpoint_id, shadow)) = shadow {
+                let mismatch = shadow.response_class() != outcome.response_class();
+                self.proxy_metrics.record_ingress_shadow(mismatch);
+                if mismatch {
+                    if let Some(suppressed) = INGRESS_SHADOW_LOG_LIMITER.admit(now_secs) {
+                        warn!(
+                            environment_id,
+                            project_id = project_ctx.project.id,
+                            endpoint_id,
+                            legacy = outcome.label(),
+                            endpoint = shadow.label(),
+                            suppressed_since_last_log = suppressed,
+                            "Ingress shadow evaluation disagrees with the legacy access chain"
+                        );
+                    }
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Answers a `TempsLogin` exchange at
+    /// [`GRANT_EXCHANGE_PATH`](crate::ingress::GRANT_EXCHANGE_PATH): only
+    /// reached when the environment enforces a compiled endpoint that asked
+    /// for a login. Once per sign-in, so it may allocate.
+    fn exchange_ingress_grant(
+        &self,
+        environment_id: i32,
+        host: &str,
+        query: Option<&str>,
+        secure: bool,
+        cookie_path: Option<&str>,
+    ) -> Result<crate::ingress::SessionExchange, crate::ingress::ExchangeError> {
+        let owner = temps_workload_ingress::ProductRef {
+            kind: temps_workload_ingress::ProductKind::Environment,
+            id: i64::from(environment_id),
+        };
+        let snapshot = self
+            .route_table
+            .as_ref()
+            .map(|table| table.ingress_snapshot());
+        let endpoint = snapshot.as_deref().and_then(|snapshot| {
+            snapshot.environment_endpoint(environment_id, crate::ingress::GRANT_EXCHANGE_PATH)
+        });
+        let (Some(snapshot), Some(endpoint)) = (snapshot.as_deref(), endpoint) else {
+            return Err(crate::ingress::ExchangeError::NotLoginProtected { owner });
+        };
+        let mut host_buffer = [0u8; 256];
+        let grants = crate::ingress::GrantFacts {
+            master: self.crypto.ingress_grant_master_key(),
+            revocations: snapshot.revocations(),
+            host: crate::ingress::grant_host(host, &mut host_buffer),
+            now_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        crate::ingress::exchange_grant(
+            endpoint,
+            &grants,
+            &self.consumed_exchanges,
+            query,
+            secure,
+            cookie_path,
+        )
+    }
+
+    /// Serve a request for a sandbox preview host
+    /// (`ws-<hex>-<port>.<preview_domain>`): the password form and its
+    /// logout, the Temps-login exchange, then the access check. Returns
+    /// `true` when it wrote the response, `false` when the request is
+    /// admitted and continues to the preview gateway or worker relay.
+    async fn handle_preview_request(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        preview_host: PreviewHost,
+        settings: &temps_core::AppSettings,
+    ) -> Result<bool> {
+        // `None` when the proxy could not determine the address: an
+        // allow-list then refuses the request rather than guess.
+        let client_ip = ctx
+            .ip_address
+            .as_deref()
+            .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+
+        if ctx.path == PREVIEW_LOGIN_PATH && ctx.method == "POST" {
+            return self
+                .preview_password_login(session, ctx, &preview_host, settings, client_ip)
+                .await;
+        }
+        if ctx.path == PREVIEW_LOGIN_PATH && (ctx.method == "GET" || ctx.method == "HEAD") {
+            return self
+                .preview_login_form(session, ctx, &preview_host, settings, client_ip)
+                .await;
+        }
+        if ctx.path == PREVIEW_LOGOUT_PATH && ctx.method == "POST" {
+            let secure = self.is_tls_connection(session);
+            let set_cookie =
+                build_logout_cookie_sandbox(&preview_host.hex, &settings.preview_domain, secure);
+            let mut response = ResponseHeader::build(303, None)?;
+            response.insert_header("Location", "/")?;
+            response.append_header("Set-Cookie", &set_cookie)?;
+            // Sign out of a Temps-login session on this host as well, with
+            // the attributes it was set with (a partitioned cookie is only
+            // cleared by a partitioned `Set-Cookie`).
+            response.append_header(
+                "Set-Cookie",
+                format!(
+                    "{}=; Path=/; Max-Age=0; HttpOnly{}",
+                    crate::ingress::PREVIEW_LOGIN_COOKIE_NAME,
+                    crate::ingress::preview_login_cookie_scope(secure)
+                ),
+            )?;
+            response.insert_header("Cache-Control", "no-store")?;
+            response.insert_header("X-Request-ID", &ctx.request_id)?;
+            session
+                .write_response_header(Box::new(response), true)
+                .await?;
+            ctx.routing_status = "preview_logout".to_string();
+            return Ok(true);
+        }
+        if ctx.path == crate::ingress::GRANT_EXCHANGE_PATH {
+            return self
+                .preview_login_exchange(session, ctx, &preview_host, client_ip)
+                .await;
+        }
+
+        // ── Regular preview request: check access ─────────────────────
+        // HTTP/2 and some browser cookie stores may emit duplicate cookie
+        // names in separate Cookie header fields. Join every field so
+        // check_preview_auth can validate every candidate.
+        let cookie_values = session
+            .req_header()
+            .headers
+            .get_all("cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        let cookie_header = combine_cookie_header_values(cookie_values);
+
+        // Revocations of Temps-login grants come from the route snapshot:
+        // one lock-free load, no I/O.
+        let snapshot = self
+            .route_table
+            .as_ref()
+            .map(|table| table.ingress_snapshot());
+        let no_revocations = temps_workload_ingress::grant::Revocations::default();
+        let revocations = snapshot
+            .as_deref()
+            .map(|snapshot| snapshot.revocations())
+            .unwrap_or(&no_revocations);
+        let mut host_buffer = [0u8; 256];
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let request = PreviewRequest {
+            client_ip,
+            cookie_header: cookie_header.as_deref(),
+            grants: crate::ingress::GrantFacts {
+                master: self.crypto.ingress_grant_master_key(),
+                revocations,
+                host: crate::ingress::grant_host(&ctx.host, &mut host_buffer),
+                now_secs,
+            },
+        };
+
+        let outcome = check_preview_auth(
+            &self.sandbox_lookup_cache,
+            &self.crypto,
+            &self.preview_auth_limiter,
+            preview_host,
+            &request,
+        )
+        .await;
+
+        match outcome {
+            PreviewAuthOutcome::Allow { host, on_worker } => {
+                info!(
+                    target = %host.label(),
+                    port = host.port,
+                    "preview-auth: allowed"
+                );
+                ctx.preview_on_worker = on_worker;
+                ctx.preview_route = Some(host);
+                ctx.routing_status = "preview".to_string();
+
+                // Strip any Authorization header before forwarding so the
+                // dev server inside the sandbox never sees upstream secrets
+                // that happen to be present.
+                let _ = session.req_header_mut().remove_header("authorization");
+
+                // The Temps-login session grant is a credential for this
+                // preview: the sandbox never needs it, so it never sees it.
+                if let Some(stripped) = cookie_header.as_deref().and_then(|header| {
+                    crate::preview_auth::cookie_header_without(
+                        header,
+                        crate::ingress::PREVIEW_LOGIN_COOKIE_NAME,
+                    )
+                }) {
+                    let _ = session.req_header_mut().remove_header("cookie");
+                    if !stripped.is_empty() {
+                        session.req_header_mut().insert_header("cookie", stripped)?;
+                    }
+                }
+
+                // Inject the token of whichever peer serves the sandbox, so
+                // it accepts us: the worker preview relay's, or the
+                // gateway's shared secret, read at request time to allow
+                // live rotation.
+                if ctx.preview_on_worker {
+                    if let Some(relay) = temps_core::sandbox_preview_relay::worker_preview_relay() {
+                        session
+                            .req_header_mut()
+                            .insert_header("X-Temps-Preview-Token", &relay.token)?;
+                    }
+                } else if let Ok(secret) = std::env::var("PREVIEW_GATEWAY_SHARED_SECRET") {
+                    if !secret.is_empty() {
+                        session
+                            .req_header_mut()
+                            .insert_header("X-Temps-Preview-Token", &secret)?;
+                    }
+                }
+                // The gateway strips its bearer token once, at the TCP
+                // connection boundary. Non-upgrade HTTP traffic must
+                // therefore close after this request so neither side can
+                // place another token-bearing request on the same
+                // authenticated connection. WebSocket upgrades are a single
+                // HTTP request followed by non-HTTP frames.
+                if !ctx.is_websocket {
+                    session
+                        .req_header_mut()
+                        .insert_header("Connection", "close")?;
+                }
+                // Continue — upstream_peer will route to the gateway.
+                Ok(false)
+            }
+            PreviewAuthOutcome::LoginRequired { host } => {
+                debug!(
+                    target = %host.label(),
+                    "preview-auth: redirecting to the password form"
+                );
+                // Build the original path + query to stash as `next`.
+                let original = match ctx.query_string.as_deref() {
+                    Some(qs) if !qs.is_empty() => format!("{}?{}", ctx.path, qs),
+                    _ => ctx.path.clone(),
+                };
+                let next = sanitize_next(&original);
+                let location = format!(
+                    "{}?next={}",
+                    PREVIEW_LOGIN_PATH,
+                    url::form_urlencoded::byte_serialize(next.as_bytes()).collect::<String>()
+                );
+                write_preview_redirect(session, ctx, &location, "preview_login_required").await
+            }
+            PreviewAuthOutcome::RateLimited { host } => {
+                warn!(
+                    target = %host.label(),
+                    client_ip = ?client_ip,
+                    "preview-auth: rate limited"
+                );
+                let mut response = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                response.insert_header("Retry-After", "60")?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(
+                        Some(Bytes::from_static(b"Too many failed attempts\n")),
+                        true,
+                    )
+                    .await?;
+                ctx.routing_status = "preview_rate_limited".to_string();
+                Ok(true)
+            }
+            PreviewAuthOutcome::NotFound { host } => {
+                debug!(target = %host.label(), "preview-auth: sandbox not found");
+                write_preview_not_found(session, ctx).await
+            }
+            PreviewAuthOutcome::IpDenied { host, client_ip } => {
+                info!(
+                    target = %host.label(),
+                    client_ip = ?client_ip,
+                    "preview-auth: client address is outside the sandbox's preview allow-list"
+                );
+                write_preview_refusal(
+                    session,
+                    ctx,
+                    StatusCode::FORBIDDEN,
+                    crate::preview_auth::ip_denied_message(&host.hex, client_ip),
+                    "preview_ip_denied",
+                )
+                .await
+            }
+            PreviewAuthOutcome::PasswordMissing { host } => {
+                warn!(
+                    target = %host.label(),
+                    "preview-auth: sandbox is in password access with no password stored; refusing"
+                );
+                write_preview_refusal(
+                    session,
+                    ctx,
+                    StatusCode::FORBIDDEN,
+                    crate::preview_auth::password_missing_message(&host.hex),
+                    "preview_password_missing",
+                )
+                .await
+            }
+            PreviewAuthOutcome::TempsLoginRequired { host, sandbox_id } => {
+                let headers = &session.req_header().headers;
+                let navigation = crate::preview_auth::is_page_navigation(
+                    &ctx.method,
+                    headers
+                        .get("sec-fetch-mode")
+                        .and_then(|value| value.to_str().ok()),
+                    headers.get("accept").and_then(|value| value.to_str().ok()),
+                    ctx.is_websocket,
+                );
+                if !navigation {
+                    debug!(
+                        target = %host.label(),
+                        "preview-auth: Temps login required for a request that is not a page load"
+                    );
+                    return write_preview_refusal(
+                        session,
+                        ctx,
+                        StatusCode::UNAUTHORIZED,
+                        crate::preview_auth::temps_login_required_message(&host.hex),
+                        "preview_temps_login_required",
+                    )
+                    .await;
+                }
+                let next = match ctx.query_string.as_deref() {
+                    Some(qs) if !qs.is_empty() => format!("{}?{}", ctx.path, qs),
+                    _ => ctx.path.clone(),
+                };
+                let scheme = if self.is_https_request(session) {
+                    crate::ingress::LoginScheme::Https
+                } else {
+                    crate::ingress::LoginScheme::Http
+                };
+                // `ctx.host` has no port; the visitor's port comes from the
+                // request so the sign-in returns them to it.
+                let port = self
+                    .request_authority(session)
+                    .ok()
+                    .and_then(|authority| authority.port);
+                let location = settings.external_url.as_deref().and_then(|base| {
+                    crate::ingress::login_redirect_url(
+                        base,
+                        self.crypto.ingress_grant_master_key(),
+                        crate::ingress::sandbox_owner(sandbox_id),
+                        crate::ingress::LoginSite {
+                            scheme,
+                            host: &ctx.host,
+                            port,
+                        },
+                        &next,
+                        now_secs,
+                    )
+                });
+                match location {
+                    Some(location) => {
+                        debug!(
+                            target = %host.label(),
+                            sandbox_id,
+                            "preview-auth: sending the visitor to the Temps login"
+                        );
+                        write_preview_redirect(
+                            session,
+                            ctx,
+                            &location,
+                            "preview_temps_login_redirect",
+                        )
+                        .await
+                    }
+                    None => {
+                        warn!(
+                            target = %host.label(),
+                            sandbox_id,
+                            "Sandbox preview requires a Temps login but the instance has no valid external URL to send the visitor to"
+                        );
+                        write_preview_refusal(
+                            session,
+                            ctx,
+                            StatusCode::FORBIDDEN,
+                            crate::preview_auth::temps_login_unconfigured_message(&host.hex),
+                            "preview_temps_login_unconfigured",
+                        )
+                        .await
+                    }
+                }
+            }
+        }
+    }
+
+    /// `GET`/`HEAD` [`PREVIEW_LOGIN_PATH`]: the password form, or the share
+    /// link bridge, for a `password` sandbox. Any other sandbox has no form:
+    /// the visitor is sent on to `next`, where its own gate applies.
+    async fn preview_login_form(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        preview_host: &PreviewHost,
+        settings: &temps_core::AppSettings,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<bool> {
+        let hex = &preview_host.hex;
+        let next = preview_next_from_query(ctx.query_string.as_deref());
+        let lookup = self.sandbox_lookup_cache.lookup(hex).await;
+        let Some(gate) = lookup.gate() else {
+            return write_preview_not_found(session, ctx).await;
+        };
+        if !gate.admits_ip(client_ip) {
+            return write_preview_refusal(
+                session,
+                ctx,
+                StatusCode::FORBIDDEN,
+                crate::preview_auth::ip_denied_message(hex, client_ip),
+                "preview_ip_denied",
+            )
+            .await;
+        }
+        if gate.password_hash().is_none() {
+            return write_preview_redirect(session, ctx, &next, "preview_login_not_required").await;
+        }
+        let label = format!("sandbox sbx_{}", hex);
+
+        // A share link carries its grant in the URL fragment, which never
+        // reaches this request. The non-secret `grant=1` marker selects a
+        // bridge whose JavaScript reads the fragment, clears browser
+        // history, and POSTs the grant to the existing verification/cookie
+        // path.
+        let has_session_grant = ctx
+            .query_string
+            .as_deref()
+            .and_then(|qs| {
+                url::form_urlencoded::parse(qs.as_bytes())
+                    .find(|(k, _)| k == "grant")
+                    .map(|(_, v)| v == "1")
+            })
+            .unwrap_or(false);
+
+        let html = if has_session_grant {
+            generate_preview_bridge_html(&label, &next)
+        } else {
+            generate_preview_form_html_labeled(
+                &label,
+                preview_host.port,
+                &next,
+                false,
+                settings.external_url.as_deref(),
+            )
+        };
+        let mut response = ResponseHeader::build(StatusCode::OK, None)?;
+        response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+        response.insert_header("Cache-Control", "no-store")?;
+        response.insert_header("Referrer-Policy", "no-referrer")?;
+        response.insert_header("X-Request-ID", &ctx.request_id)?;
+        session
+            .write_response_header(Box::new(response), false)
+            .await?;
+        if ctx.method == "GET" {
+            session
+                .write_response_body(Some(Bytes::from(html)), true)
+                .await?;
+        } else {
+            session.write_response_body(None, true).await?;
+        }
+        ctx.routing_status = "preview_login_form".to_string();
+        Ok(true)
+    }
+
+    /// `POST` [`PREVIEW_LOGIN_PATH`]: verify a password (or a share-link
+    /// grant) for a `password` sandbox and mint its cookie. The allow-list
+    /// is checked first, so an address it refuses cannot guess at all.
+    async fn preview_password_login(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        preview_host: &PreviewHost,
+        settings: &temps_core::AppSettings,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<bool> {
+        let hex = preview_host.hex.as_str();
+        // The limiter needs a key; unknown addresses share one bucket.
+        let limiter_ip = client_ip.unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
+        let lookup = self.sandbox_lookup_cache.lookup(hex).await;
+        let Some(gate) = lookup.gate() else {
+            return write_preview_not_found(session, ctx).await;
+        };
+        if !gate.admits_ip(client_ip) {
+            return write_preview_refusal(
+                session,
+                ctx,
+                StatusCode::FORBIDDEN,
+                crate::preview_auth::ip_denied_message(hex, client_ip),
+                "preview_ip_denied",
+            )
+            .await;
+        }
+        let Some(stored_hash) = gate.password_hash().map(str::to_string) else {
+            // Not a password sandbox — nothing to verify.
+            return write_preview_redirect(session, ctx, "/", "preview_login_not_required").await;
+        };
+
+        let body = session.read_request_body().await.map_err(|e| {
+            error!("preview-auth: failed to read sandbox login body: {}", e);
+            e
+        })?;
+        let body_str = body
+            .as_ref()
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_default();
+        let params: Vec<(String, String)> = url::form_urlencoded::parse(body_str.as_bytes())
+            .into_owned()
+            .collect();
+        let form_value = |name: &str| {
+            params
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        };
+        let password = form_value("password").unwrap_or("");
+        let session_grant = form_value("session_grant").unwrap_or("");
+        let next = sanitize_next(form_value("next").unwrap_or("/"));
+
+        let subject = format!("sbx_{}", hex);
+        let now = std::time::SystemTime::now();
+        // Grants are bound to the password hash that existed when they were
+        // minted. Authenticate the self-contained grant envelope before
+        // touching the database so random public input cannot amplify into
+        // an uncached lookup. A valid candidate then bypasses the cache so
+        // password rotation revokes it immediately rather than after the
+        // cache TTL.
+        let grant_password_hash = self
+            .sandbox_lookup_cache
+            .verify_session_grant(&self.crypto, session_grant, hex, now)
+            .await;
+        let valid_session_grant = grant_password_hash.is_some();
+
+        // A valid platform-session grant is not a password guess and must
+        // remain usable even if this IP previously hit the manual-login
+        // limiter.
+        if !valid_session_grant && self.preview_auth_limiter.is_blocked(limiter_ip, hex) {
+            warn!(
+                sandbox = %hex,
+                client_ip = ?client_ip,
+                "preview-auth: sandbox login POST rate limited"
+            );
+            let mut response = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+            response.insert_header("Retry-After", "60")?;
+            response.insert_header("Cache-Control", "no-store")?;
+            response.insert_header("Referrer-Policy", "no-referrer")?;
+            response.insert_header("X-Request-ID", &ctx.request_id)?;
+            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+            session
+                .write_response_header(Box::new(response), false)
+                .await?;
+            session
+                .write_response_body(
+                    Some(Bytes::from_static(b"Too many failed attempts\n")),
+                    true,
+                )
+                .await?;
+            ctx.routing_status = "preview_rate_limited".to_string();
+            return Ok(true);
+        }
+
+        // Password reconciliation can update the sandbox row immediately
+        // while this worker still has the previous hash in its short-lived
+        // lookup cache. The owner bridge already has the new password, so
+        // retry against a fresh row before showing a manual password wall.
+        let verified_hash = if let Some(password_hash) = grant_password_hash {
+            Some(password_hash)
+        } else if verify_argon2(password, &stored_hash) {
+            Some(stored_hash)
+        } else {
+            let fresh = self.sandbox_lookup_cache.lookup_fresh(hex).await;
+            let refreshed = fresh
+                .password_hash()
+                .filter(|password_hash| verify_argon2(password, password_hash))
+                .map(str::to_string);
+            if refreshed.is_some() {
+                debug!(
+                    sandbox = %hex,
+                    "preview-auth: login succeeded after refreshing stale password hash"
+                );
+            }
+            refreshed
+        };
+
+        let Some(stored_hash) = verified_hash else {
+            self.preview_auth_limiter.record_failure(limiter_ip, hex);
+            debug!(sandbox = %hex, "preview-auth: sandbox login failed (bad password)");
+            let label = format!("sandbox sbx_{}", hex);
+            let html = generate_preview_form_html_labeled(
+                &label,
+                preview_host.port,
+                &next,
+                true,
+                settings.external_url.as_deref(),
+            );
+            let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
+            response.insert_header("Content-Type", "text/html; charset=utf-8")?;
+            response.insert_header("Cache-Control", "no-store")?;
+            response.insert_header("Referrer-Policy", "no-referrer")?;
+            response.insert_header("X-Request-ID", &ctx.request_id)?;
+            session
+                .write_response_header(Box::new(response), false)
+                .await?;
+            session
+                .write_response_body(Some(Bytes::from(html)), true)
+                .await?;
+            ctx.routing_status = "preview_login_failed".to_string();
+            return Ok(true);
+        };
+
+        self.preview_auth_limiter.record_success(limiter_ip, hex);
+        let cookie_name = format!("temps_preview_sbx_{}", hex);
+        let cookie_values = session
+            .req_header()
+            .headers
+            .get_all("cookie")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .collect::<Vec<_>>();
+        let cookie_header = combine_cookie_header_values(cookie_values);
+        let cookie_needs_refresh = preview_cookie_needs_refresh(
+            &self.crypto,
+            cookie_header.as_deref(),
+            &cookie_name,
+            &subject,
+            &stored_hash,
+            now,
+        );
+        // Duplicate names indicate an obsolete cookie scope. Mint the
+        // partitioned replacement before expiring the old scopes so cleanup
+        // can never delete the only healthy cookie.
+        let has_duplicate_candidates = cookie_header
+            .as_deref()
+            .is_some_and(|header| extract_cookie_values(header, &cookie_name).len() > 1);
+        let should_refresh_cookie = cookie_needs_refresh || has_duplicate_candidates;
+
+        let set_cookie = if !should_refresh_cookie {
+            None
+        } else {
+            let Some(cookie_value) =
+                encode_preview_cookie_subject(&self.crypto, &subject, &stored_hash, now)
+            else {
+                error!("preview-auth: failed to encode sandbox preview cookie");
+                let mut response = ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Cookie mint failed\n")), true)
+                    .await?;
+                ctx.routing_status = "preview_cookie_error".to_string();
+                return Ok(true);
+            };
+            Some(build_set_cookie_sandbox(
+                hex,
+                &cookie_value,
+                &settings.preview_domain,
+                self.is_tls_connection(session),
+            ))
+        };
+
+        info!(
+            sandbox = %hex,
+            auth_kind = if valid_session_grant { "platform_session" } else { "password" },
+            cookie_refreshed = should_refresh_cookie,
+            "preview-auth: sandbox login succeeded"
+        );
+        let mut response = ResponseHeader::build(303, None)?;
+        response.insert_header("Location", &next)?;
+        if let Some(set_cookie) = &set_cookie {
+            response.append_header("Set-Cookie", set_cookie)?;
+        }
+        // Expire both scopes used by older gateway versions. Chrome can keep
+        // an unpartitioned host-only cookie and a parent-domain cookie
+        // alongside the fresh CHIPS cookie, sometimes emitting them in
+        // separate Cookie header fields.
+        if should_refresh_cookie && self.is_tls_connection(session) {
+            let unpartitioned_cookie = build_logout_cookie_sandbox_unpartitioned(hex);
+            response.append_header("Set-Cookie", &unpartitioned_cookie)?;
+            let legacy_cookie = build_logout_cookie_sandbox(hex, &settings.preview_domain, false);
+            response.append_header("Set-Cookie", &legacy_cookie)?;
+        }
+        response.insert_header("Cache-Control", "no-store")?;
+        response.insert_header("Referrer-Policy", "no-referrer")?;
+        response.insert_header("X-Request-ID", &ctx.request_id)?;
+        session
+            .write_response_header(Box::new(response), true)
+            .await?;
+        ctx.routing_status = "preview_login_ok".to_string();
+        Ok(true)
+    }
+
+    /// [`GRANT_EXCHANGE_PATH`](crate::ingress::GRANT_EXCHANGE_PATH) on a
+    /// preview host: the console's redirect back after a Temps login. For a
+    /// `temps_login` sandbox, trade the exchange grant for a host-only
+    /// session cookie and send the visitor to `next`; any other sandbox is
+    /// sent straight to `next`, where its own gate applies.
+    ///
+    /// Reads the sandbox fresh, so a sandbox switched to `temps_login`
+    /// seconds ago signs in without waiting for the lookup cache. Once per
+    /// sign-in, never per request.
+    async fn preview_login_exchange(
+        &self,
+        session: &mut PingoraSession,
+        ctx: &mut ProxyContext,
+        preview_host: &PreviewHost,
+        client_ip: Option<std::net::IpAddr>,
+    ) -> Result<bool> {
+        let hex = preview_host.hex.as_str();
+        // The query holds the grant: keep it out of the proxy log, which
+        // outlives the grant and is readable by project members.
+        let query = ctx.query_string.take();
+        let lookup = self.sandbox_lookup_cache.lookup_fresh(hex).await;
+        let Some(gate) = lookup.gate() else {
+            return write_preview_not_found(session, ctx).await;
+        };
+        if !gate.admits_ip(client_ip) {
+            return write_preview_refusal(
+                session,
+                ctx,
+                StatusCode::FORBIDDEN,
+                crate::preview_auth::ip_denied_message(hex, client_ip),
+                "preview_ip_denied",
+            )
+            .await;
+        }
+        if gate.access != crate::preview_auth::PreviewGateAccess::TempsLogin {
+            let next = preview_next_from_query(query.as_deref());
+            return write_preview_redirect(session, ctx, &next, "preview_login_not_required").await;
+        }
+
+        let secure = self.is_tls_connection(session);
+        let snapshot = self
+            .route_table
+            .as_ref()
+            .map(|table| table.ingress_snapshot());
+        let no_revocations = temps_workload_ingress::grant::Revocations::default();
+        let mut host_buffer = [0u8; 256];
+        let grants = crate::ingress::GrantFacts {
+            master: self.crypto.ingress_grant_master_key(),
+            revocations: snapshot
+                .as_deref()
+                .map(|snapshot| snapshot.revocations())
+                .unwrap_or(&no_revocations),
+            host: crate::ingress::grant_host(&ctx.host, &mut host_buffer),
+            now_secs: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        let exchange = crate::ingress::exchange_preview_grant(
+            gate.sandbox_id,
+            &grants,
+            &self.consumed_exchanges,
+            query.as_deref(),
+            secure,
+        );
+        match exchange {
+            Ok(exchange) => {
+                info!(
+                    sandbox = %hex,
+                    sandbox_id = gate.sandbox_id,
+                    grant_id = exchange.grant_id,
+                    user_id = exchange.user_id,
+                    "Temps login grant exchanged for a sandbox preview session"
+                );
+                let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
+                response.insert_header("Location", exchange.location)?;
+                response.insert_header("Set-Cookie", exchange.set_cookie)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("Referrer-Policy", "no-referrer")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Signed in.\n")), true)
+                    .await?;
+                ctx.routing_status = "preview_login_grant_exchanged".to_string();
+                Ok(true)
+            }
+            Err(error) => {
+                warn!(
+                    sandbox = %hex,
+                    sandbox_id = gate.sandbox_id,
+                    error = %error,
+                    "Refused a Temps login grant exchange for a sandbox preview"
+                );
+                write_preview_refusal(
+                    session,
+                    ctx,
+                    StatusCode::FORBIDDEN,
+                    "This sign-in link is invalid or has expired. Reload the page to sign in again.\n"
+                        .to_string(),
+                    "preview_login_grant_refused",
+                )
+                .await
+            }
+        }
+    }
+}
+
+pub(crate) fn legacy_ip_gate_denies(
     decision: temps_core::RequestPolicyDecision,
     gate: &dyn temps_core::ProjectIpGate,
     project_id: i32,
@@ -4610,7 +5686,7 @@ fn legacy_ip_gate_denies(
     }
 }
 
-fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+pub(crate) fn normalize_client_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
     match ip {
         std::net::IpAddr::V6(v6) => v6
             .to_ipv4_mapped()
@@ -5632,6 +6708,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            preview_on_worker: false,
             path_route: None,
             gated_host: false,
             gate_identity: None,
@@ -5904,12 +6981,12 @@ impl ProxyHttp for LoadBalancer {
             }
         }
 
-        // Workspace preview gateway: requests to `ws-<sid>-<port>.<preview_domain>`
-        // are authenticated here against the per-session argon2 password hash
-        // via a form-based login + encrypted cookie. On success we mark the
-        // request as a preview route so `upstream_peer` forwards it to the
-        // local gateway. On failure we short-circuit with a 303 redirect to
-        // the login form, or 429 when rate-limited.
+        // Sandbox preview gateway: requests to `ws-<sid>-<port>.<preview_domain>`
+        // are checked against the sandbox's preview allow-list, then its
+        // access mode: a Temps login (the default), a password form, or
+        // public. On success we mark the request as a preview route so
+        // `upstream_peer` forwards it to the local gateway or worker relay;
+        // otherwise `handle_preview_request` answers it.
         //
         // HTTP Basic auth is NOT supported — see `preview_auth.rs` for
         // rationale.
@@ -5925,495 +7002,11 @@ impl ProxyHttp for LoadBalancer {
                     self.upstream_resolver.is_public_ingress_host(&ctx.host)
                 })
             {
-                let client_ip = ctx
-                    .ip_address
-                    .as_deref()
-                    .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-                    .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
-
-                // ── Login/logout endpoints intercepted before auth ────────
-                //
-                // We serve these on the same preview host so the cookie can
-                // be scoped to the preview domain. They must come BEFORE
-                // `check_preview_auth` so unauthenticated GET /login works.
-                let sandbox_hex: Option<String> = Some(preview_host.hex.clone());
-
-                // POST /__temps/preview/login for a sandbox host.
-                if let Some(hex) = sandbox_hex
-                    .clone()
-                    .filter(|_| ctx.path == PREVIEW_LOGIN_PATH && ctx.method == "POST")
+                if self
+                    .handle_preview_request(session, ctx, preview_host, &settings)
+                    .await?
                 {
-                    let stored_hash = match self.sandbox_lookup_cache.lookup(&hex).await {
-                        PreviewSandboxLookup::Protected { password_hash } => password_hash,
-                        PreviewSandboxLookup::Open => {
-                            // No password configured — nothing to verify. Redirect to `/`.
-                            let mut response = ResponseHeader::build(303, None)?;
-                            response.insert_header("Location", "/")?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            session
-                                .write_response_header(Box::new(response), true)
-                                .await?;
-                            ctx.routing_status = "preview_login_not_required".to_string();
-                            return Ok(true);
-                        }
-                        PreviewSandboxLookup::NotFound => {
-                            let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session
-                                .write_response_body(
-                                    Some(Bytes::from_static(b"Sandbox preview not found\n")),
-                                    true,
-                                )
-                                .await?;
-                            ctx.routing_status = "preview_not_found".to_string();
-                            return Ok(true);
-                        }
-                    };
-
-                    let body = session.read_request_body().await.map_err(|e| {
-                        error!("preview-auth: failed to read sandbox login body: {}", e);
-                        e
-                    })?;
-                    let body_str = body
-                        .as_ref()
-                        .map(|b| String::from_utf8_lossy(b).to_string())
-                        .unwrap_or_default();
-                    let params: Vec<(String, String)> =
-                        url::form_urlencoded::parse(body_str.as_bytes())
-                            .into_owned()
-                            .collect();
-                    let password = params
-                        .iter()
-                        .find(|(k, _)| k == "password")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("");
-                    let session_grant = params
-                        .iter()
-                        .find(|(k, _)| k == "session_grant")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("");
-                    let next_raw = params
-                        .iter()
-                        .find(|(k, _)| k == "next")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("/");
-                    let next = sanitize_next(next_raw);
-
-                    let subject = format!("sbx_{}", hex);
-                    let now = std::time::SystemTime::now();
-                    // Grants are bound to the password hash that existed when
-                    // they were minted. Authenticate the self-contained grant
-                    // envelope before touching the database so random public
-                    // input cannot amplify into an uncached lookup. A valid
-                    // candidate then bypasses the cache so password rotation
-                    // revokes it immediately rather than after the cache TTL.
-                    let grant_password_hash = self
-                        .sandbox_lookup_cache
-                        .verify_session_grant(&self.crypto, session_grant, &hex, now)
-                        .await;
-                    let valid_session_grant = grant_password_hash.is_some();
-
-                    // A valid platform-session grant is not a password guess
-                    // and must remain usable even if this IP previously hit
-                    // the manual-login limiter.
-                    if !valid_session_grant && self.preview_auth_limiter.is_blocked(client_ip, &hex)
-                    {
-                        warn!(
-                            sandbox = %hex,
-                            client_ip = %client_ip,
-                            "preview-auth: sandbox login POST rate limited"
-                        );
-                        let mut response =
-                            ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                        response.insert_header("Retry-After", "60")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("Referrer-Policy", "no-referrer")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session
-                            .write_response_body(
-                                Some(Bytes::from_static(b"Too many failed attempts\n")),
-                                true,
-                            )
-                            .await?;
-                        ctx.routing_status = "preview_rate_limited".to_string();
-                        return Ok(true);
-                    }
-
-                    // Password reconciliation can update the sandbox row
-                    // immediately while this worker still has the previous
-                    // hash in its short-lived lookup cache. The owner bridge
-                    // already has the new password, so retry against a fresh
-                    // row before showing a manual password wall.
-                    let verified_hash = if let Some(password_hash) = grant_password_hash {
-                        Some(password_hash)
-                    } else if verify_argon2(password, &stored_hash) {
-                        Some(stored_hash)
-                    } else {
-                        match self.sandbox_lookup_cache.lookup_fresh(&hex).await {
-                            PreviewSandboxLookup::Protected { password_hash }
-                                if verify_argon2(password, &password_hash) =>
-                            {
-                                debug!(
-                                    sandbox = %hex,
-                                    "preview-auth: login succeeded after refreshing stale password hash"
-                                );
-                                Some(password_hash)
-                            }
-                            _ => None,
-                        }
-                    };
-
-                    if let Some(stored_hash) = verified_hash {
-                        self.preview_auth_limiter.record_success(client_ip, &hex);
-                        let cookie_name = format!("temps_preview_sbx_{}", hex);
-                        let cookie_values = session
-                            .req_header()
-                            .headers
-                            .get_all("cookie")
-                            .iter()
-                            .filter_map(|value| value.to_str().ok())
-                            .collect::<Vec<_>>();
-                        let cookie_header = combine_cookie_header_values(cookie_values);
-                        let cookie_needs_refresh = preview_cookie_needs_refresh(
-                            &self.crypto,
-                            cookie_header.as_deref(),
-                            &cookie_name,
-                            &subject,
-                            &stored_hash,
-                            now,
-                        );
-                        // Duplicate names indicate an obsolete cookie scope.
-                        // Mint the partitioned replacement before expiring the
-                        // old scopes so cleanup can never delete the only
-                        // healthy cookie.
-                        let has_duplicate_candidates =
-                            cookie_header.as_deref().is_some_and(|header| {
-                                extract_cookie_values(header, &cookie_name).len() > 1
-                            });
-                        let should_refresh_cookie =
-                            cookie_needs_refresh || has_duplicate_candidates;
-
-                        let set_cookie = if !should_refresh_cookie {
-                            None
-                        } else {
-                            let Some(cookie_value) = encode_preview_cookie_subject(
-                                &self.crypto,
-                                &subject,
-                                &stored_hash,
-                                now,
-                            ) else {
-                                error!("preview-auth: failed to encode sandbox preview cookie");
-                                let mut response =
-                                    ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
-                                response.insert_header("Cache-Control", "no-store")?;
-                                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                                session
-                                    .write_response_header(Box::new(response), false)
-                                    .await?;
-                                session
-                                    .write_response_body(
-                                        Some(Bytes::from_static(b"Cookie mint failed\n")),
-                                        true,
-                                    )
-                                    .await?;
-                                ctx.routing_status = "preview_cookie_error".to_string();
-                                return Ok(true);
-                            };
-                            Some(build_set_cookie_sandbox(
-                                &hex,
-                                &cookie_value,
-                                &settings.preview_domain,
-                                self.is_tls_connection(session),
-                            ))
-                        };
-
-                        info!(
-                            sandbox = %hex,
-                            auth_kind = if valid_session_grant { "platform_session" } else { "password" },
-                            cookie_refreshed = should_refresh_cookie,
-                            "preview-auth: sandbox login succeeded"
-                        );
-                        let mut response = ResponseHeader::build(303, None)?;
-                        response.insert_header("Location", &next)?;
-                        if let Some(set_cookie) = &set_cookie {
-                            response.append_header("Set-Cookie", set_cookie)?;
-                        }
-                        // Expire both scopes used by older gateway versions.
-                        // Chrome can keep an unpartitioned host-only cookie and
-                        // a parent-domain cookie alongside the fresh CHIPS
-                        // cookie, sometimes emitting them in separate Cookie
-                        // header fields.
-                        if should_refresh_cookie && self.is_tls_connection(session) {
-                            let unpartitioned_cookie =
-                                build_logout_cookie_sandbox_unpartitioned(&hex);
-                            response.append_header("Set-Cookie", &unpartitioned_cookie)?;
-                            let legacy_cookie =
-                                build_logout_cookie_sandbox(&hex, &settings.preview_domain, false);
-                            response.append_header("Set-Cookie", &legacy_cookie)?;
-                        }
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("Referrer-Policy", "no-referrer")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        session
-                            .write_response_header(Box::new(response), true)
-                            .await?;
-                        ctx.routing_status = "preview_login_ok".to_string();
-                        return Ok(true);
-                    } else {
-                        self.preview_auth_limiter.record_failure(client_ip, &hex);
-                        debug!(sandbox = %hex, "preview-auth: sandbox login failed (bad password)");
-                        let label = format!("sandbox sbx_{}", hex);
-                        let html = generate_preview_form_html_labeled(
-                            &label,
-                            preview_host.port,
-                            &next,
-                            true,
-                            settings.external_url.as_deref(),
-                        );
-                        let html_bytes = Bytes::from(html);
-                        let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
-                        response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("Referrer-Policy", "no-referrer")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session.write_response_body(Some(html_bytes), true).await?;
-                        ctx.routing_status = "preview_login_failed".to_string();
-                        return Ok(true);
-                    }
-                }
-
-                // GET/HEAD /__temps/preview/login for a sandbox host.
-                if let Some(hex) = sandbox_hex.clone().filter(|_| {
-                    ctx.path == PREVIEW_LOGIN_PATH && (ctx.method == "GET" || ctx.method == "HEAD")
-                }) {
-                    let next_raw = ctx
-                        .query_string
-                        .as_deref()
-                        .and_then(|qs| {
-                            url::form_urlencoded::parse(qs.as_bytes())
-                                .find(|(k, _)| k == "next")
-                                .map(|(_, v)| v.into_owned())
-                        })
-                        .unwrap_or_else(|| "/".to_string());
-                    let next = sanitize_next(&next_raw);
-                    let label = format!("sandbox sbx_{}", hex);
-
-                    // A share link carries its grant in the URL fragment, which
-                    // never reaches this request. The non-secret `grant=1`
-                    // marker selects a bridge whose JavaScript reads the
-                    // fragment, clears browser history, and POSTs the grant to
-                    // the existing verification/cookie path.
-                    let has_session_grant = ctx
-                        .query_string
-                        .as_deref()
-                        .and_then(|qs| {
-                            url::form_urlencoded::parse(qs.as_bytes())
-                                .find(|(k, _)| k == "grant")
-                                .map(|(_, v)| v == "1")
-                        })
-                        .unwrap_or(false);
-
-                    let html = if has_session_grant {
-                        generate_preview_bridge_html(&label, &next)
-                    } else {
-                        generate_preview_form_html_labeled(
-                            &label,
-                            preview_host.port,
-                            &next,
-                            false,
-                            settings.external_url.as_deref(),
-                        )
-                    };
-                    let html_bytes = Bytes::from(html);
-                    let mut response = ResponseHeader::build(StatusCode::OK, None)?;
-                    response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("Referrer-Policy", "no-referrer")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    if ctx.method == "GET" {
-                        session.write_response_body(Some(html_bytes), true).await?;
-                    } else {
-                        session.write_response_body(None, true).await?;
-                    }
-                    ctx.routing_status = "preview_login_form".to_string();
                     return Ok(true);
-                }
-
-                // POST /__temps/preview/logout for a sandbox host.
-                if let Some(hex) = sandbox_hex
-                    .clone()
-                    .filter(|_| ctx.path == PREVIEW_LOGOUT_PATH && ctx.method == "POST")
-                {
-                    let set_cookie = build_logout_cookie_sandbox(
-                        &hex,
-                        &settings.preview_domain,
-                        self.is_tls_connection(session),
-                    );
-                    let mut response = ResponseHeader::build(303, None)?;
-                    response.insert_header("Location", "/")?;
-                    response.insert_header("Set-Cookie", &set_cookie)?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    session
-                        .write_response_header(Box::new(response), true)
-                        .await?;
-                    ctx.routing_status = "preview_logout".to_string();
-                    return Ok(true);
-                }
-
-                // ── Regular preview request: check cookie ─────────────────
-                // HTTP/2 and some browser cookie stores may emit duplicate
-                // cookie names in separate Cookie header fields. Join every
-                // field so check_preview_auth can validate every candidate.
-                let cookie_values = session
-                    .req_header()
-                    .headers
-                    .get_all("cookie")
-                    .iter()
-                    .filter_map(|value| value.to_str().ok())
-                    .collect::<Vec<_>>();
-                let cookie_header = combine_cookie_header_values(cookie_values);
-
-                let outcome = check_preview_auth(
-                    &self.sandbox_lookup_cache,
-                    &self.crypto,
-                    &self.preview_auth_limiter,
-                    preview_host,
-                    client_ip,
-                    cookie_header.as_deref(),
-                )
-                .await;
-
-                match outcome {
-                    PreviewAuthOutcome::Allow { host } => {
-                        info!(
-                            target = %host.label(),
-                            port = host.port,
-                            "preview-auth: allowed"
-                        );
-                        ctx.preview_route = Some(host);
-                        ctx.routing_status = "preview".to_string();
-
-                        // Strip any Authorization header before forwarding so
-                        // the dev server inside the sandbox never sees upstream
-                        // secrets that happen to be present.
-                        let _ = session.req_header_mut().remove_header("authorization");
-
-                        // Inject the shared secret so the gateway accepts us.
-                        // Read at request time to allow live rotation.
-                        if let Ok(secret) = std::env::var("PREVIEW_GATEWAY_SHARED_SECRET") {
-                            if !secret.is_empty() {
-                                session
-                                    .req_header_mut()
-                                    .insert_header("X-Temps-Preview-Token", &secret)?;
-                            }
-                        }
-                        // The gateway strips its bearer token once, at the TCP
-                        // connection boundary. Non-upgrade HTTP traffic must
-                        // therefore close after this request so neither side
-                        // can place another token-bearing request on the same
-                        // authenticated connection. WebSocket upgrades are a
-                        // single HTTP request followed by non-HTTP frames.
-                        if !ctx.is_websocket {
-                            session
-                                .req_header_mut()
-                                .insert_header("Connection", "close")?;
-                        }
-                        // Fall through — upstream_peer will route to the gateway.
-                    }
-                    PreviewAuthOutcome::LoginRequired { host } => {
-                        debug!(
-                            target = %host.label(),
-                            "preview-auth: redirecting to login"
-                        );
-                        // Build the original path + query to stash as `next`.
-                        let original = if let Some(ref qs) = ctx.query_string {
-                            if qs.is_empty() {
-                                ctx.path.clone()
-                            } else {
-                                format!("{}?{}", ctx.path, qs)
-                            }
-                        } else {
-                            ctx.path.clone()
-                        };
-                        let next = sanitize_next(&original);
-                        let location = format!(
-                            "{}?next={}",
-                            PREVIEW_LOGIN_PATH,
-                            url::form_urlencoded::byte_serialize(next.as_bytes())
-                                .collect::<String>()
-                        );
-                        let mut response = ResponseHeader::build(303, None)?;
-                        response.insert_header("Location", &location)?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        session
-                            .write_response_header(Box::new(response), true)
-                            .await?;
-                        ctx.routing_status = "preview_login_required".to_string();
-                        return Ok(true);
-                    }
-                    PreviewAuthOutcome::RateLimited { host } => {
-                        warn!(
-                            target = %host.label(),
-                            client_ip = %client_ip,
-                            "preview-auth: rate limited"
-                        );
-                        let mut response =
-                            ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                        response.insert_header("Retry-After", "60")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session
-                            .write_response_body(
-                                Some(Bytes::from_static(b"Too many failed attempts\n")),
-                                true,
-                            )
-                            .await?;
-                        ctx.routing_status = "preview_rate_limited".to_string();
-                        return Ok(true);
-                    }
-                    PreviewAuthOutcome::NotFound { host } => {
-                        debug!(
-                            target = %host.label(),
-                            "preview-auth: target not found or no password"
-                        );
-                        let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session
-                            .write_response_body(
-                                Some(Bytes::from_static(b"Preview not found\n")),
-                                true,
-                            )
-                            .await?;
-                        ctx.routing_status = "preview_not_found".to_string();
-                        return Ok(true);
-                    }
                 }
             }
         }
@@ -6617,8 +7210,11 @@ impl ProxyHttp for LoadBalancer {
         // route; `resolve_request_path_route` matches it by the routed path
         // the form carries, so the password is checked (and the cookie
         // issued) for the target environment the form was rendered for,
-        // never the host's own. Client input only selects among the
-        // prefixes this host already serves.
+        // never the host's own. The Temps-login exchange callback is matched
+        // the same way, by the `next` path its sign-in started from, so the
+        // grant is traded (and the cookie scoped) for the routed target.
+        // Client input only selects among the prefixes this host already
+        // serves.
         if ctx.preview_route.is_none() {
             ctx.path_route = crate::handler::password_wall::resolve_request_path_route(
                 &ctx.method,
@@ -6960,41 +7556,20 @@ impl ProxyHttp for LoadBalancer {
                 ctx.routing_status = "request_policy_unavailable".to_string();
                 return Ok(true);
             }
-            if ip_restricted || matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
-                match decision {
-                    temps_core::RequestPolicyDecision::Deny {
-                        reason,
-                        rule_id,
-                        revision,
-                    } => warn!(
-                        project_id = project_ctx.project.id,
-                        environment_id = project_ctx.environment.id,
-                        reason,
-                        rule_id,
-                        revision,
-                        "Request denied by project policy"
-                    ),
-                    _ => {
-                        // Counted for every denial; logged through a
-                        // process-wide limiter so a scan against a locked
-                        // project cannot flood the log (the counter keeps
-                        // the true rate).
-                        self.proxy_metrics.record_ip_access_denied();
-                        let now_secs = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0);
-                        if let Some(suppressed) = IP_DENY_LOG_LIMITER.admit(now_secs) {
-                            warn!(
-                                environment_id = project_ctx.environment.id,
-                                project_id = project_ctx.project.id,
-                                ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                                suppressed_since_last_log = suppressed,
-                                "Request denied by project IP restriction"
-                            );
-                        }
-                    }
-                }
+            if let temps_core::RequestPolicyDecision::Deny {
+                reason,
+                rule_id,
+                revision,
+            } = decision
+            {
+                warn!(
+                    project_id = project_ctx.project.id,
+                    environment_id = project_ctx.environment.id,
+                    reason,
+                    rule_id,
+                    revision,
+                    "Request denied by project policy"
+                );
                 let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
                 response.insert_header("Cache-Control", "no-store")?;
                 response.insert_header("X-Request-ID", &ctx.request_id)?;
@@ -7005,88 +7580,315 @@ impl ProxyHttp for LoadBalancer {
                 session
                     .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
                     .await?;
-                ctx.routing_status =
-                    if matches!(decision, temps_core::RequestPolicyDecision::Deny { .. }) {
-                        "request_policy_denied"
-                    } else {
-                        "project_ip_restricted"
-                    }
-                    .to_string();
+                ctx.routing_status = "request_policy_denied".to_string();
                 return Ok(true);
             }
 
-            // Per-client-IP rate limits and rate-limit blacklists (issue
-            // #1288). Runs after the IP restriction gate so a denied caller
-            // never consumes budget. An unresolvable client IP is not
-            // limited: there is nothing to attribute the request to, and the
-            // IP gate above already fails closed where a policy requires it.
-            if let Some(client_ip) = parsed_ip {
-                if let Some(resolved) = crate::rate_limiter::resolve_policy(
-                    &instance_rate_limiting,
-                    effective_config.security.as_ref(),
-                    project_ctx.environment.id,
-                ) {
+            // The access decision (ADR-055 §11): the legacy chain, or the
+            // environment's compiled ingress endpoint, as its
+            // `ingress_mode` says. Either way it is one `AccessOutcome`,
+            // answered below by the same responses.
+            let password_protection = project_ctx
+                .environment
+                .deployment_config
+                .as_ref()
+                .and_then(|dc| dc.security.as_ref())
+                .and_then(|s| s.password_protection.as_ref())
+                .filter(|pp| pp.enabled);
+            let access_outcome = self
+                .decide_environment_access(
+                    project_ctx,
+                    AccessRequest {
+                        request: session.req_header(),
+                        host: &ctx.host,
+                        path: &ctx.path,
+                        tls_fingerprint: ctx.tls_fingerprint.as_deref(),
+                        policy_decision: decision,
+                        ip_restricted,
+                        client_ip: parsed_ip,
+                        rate_limit: crate::rate_limiter::resolve_policy(
+                            &instance_rate_limiting,
+                            effective_config.security.as_ref(),
+                            project_ctx.environment.id,
+                        ),
+                        password: password_protection.map(|pp| crate::ingress::PasswordFacts {
+                            verify_post: ctx.path
+                                == crate::handler::password_wall::PASSWORD_VERIFY_PATH
+                                && ctx.method == "POST",
+                            cookie_valid: find_request_cookie(
+                                session.req_header(),
+                                crate::handler::password_wall::PASSWORD_COOKIE_NAME,
+                                |value| {
+                                    crate::handler::password_wall::validate_cookie(
+                                        value,
+                                        project_ctx.environment.id,
+                                        &pp.password_hash,
+                                    )
+                                    .then_some(true)
+                                },
+                            )
+                            .unwrap_or(false),
+                        }),
+                    },
+                )
+                .await;
+
+            match access_outcome {
+                crate::ingress::AccessOutcome::Allow
+                | crate::ingress::AccessOutcome::PasswordWall => {}
+                crate::ingress::AccessOutcome::IpForbidden
+                | crate::ingress::AccessOutcome::Forbidden => {
+                    // Counted for every denial; logged through a
+                    // process-wide limiter so a scan against a locked
+                    // project cannot flood the log (the counter keeps
+                    // the true rate).
+                    self.proxy_metrics.record_ip_access_denied();
                     let now_secs = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    match resolved.check(&self.rate_limiter, client_ip, now_secs) {
-                        crate::rate_limiter::RateLimitDecision::Allow => {}
-                        crate::rate_limiter::RateLimitDecision::Blacklisted => {
-                            self.proxy_metrics.record_rate_limited();
+                    if let Some(suppressed) = IP_DENY_LOG_LIMITER.admit(now_secs) {
+                        warn!(
+                            environment_id = project_ctx.environment.id,
+                            project_id = project_ctx.project.id,
+                            ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                            outcome = access_outcome.label(),
+                            suppressed_since_last_log = suppressed,
+                            "Request denied by project IP restriction"
+                        );
+                    }
+                    // A generic 403 with no detail: an unauthenticated
+                    // caller must not be able to tell "this project is
+                    // restricted" from "this project does not exist".
+                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                        .await?;
+                    ctx.routing_status =
+                        if access_outcome == crate::ingress::AccessOutcome::IpForbidden {
+                            "project_ip_restricted"
+                        } else {
+                            "ingress_forbidden"
+                        }
+                        .to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::Blacklisted => {
+                    self.proxy_metrics.record_rate_limited();
+                    warn!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                        "Request denied by rate-limit blacklist"
+                    );
+                    // Same generic 403 as the IP restriction above.
+                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                        .await?;
+                    ctx.routing_status = "rate_limit_blacklisted".to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::TooManyRequests {
+                    window,
+                    retry_after_secs,
+                } => {
+                    self.proxy_metrics.record_rate_limited();
+                    debug!(
+                        project_id = project_ctx.project.id,
+                        environment_id = project_ctx.environment.id,
+                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                        window = window.as_str(),
+                        "Request rejected by rate limit"
+                    );
+                    let mut response = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                    response.insert_header("Retry-After", retry_after_secs.to_string())?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(Some(Bytes::from_static(b"Too Many Requests\n")), true)
+                        .await?;
+                    ctx.routing_status = "rate_limited".to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::Unavailable => {
+                    // Logged (rate-limited, with the reason) where it was decided.
+                    let mut response =
+                        ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(
+                            Some(Bytes::from_static(
+                                b"Service unavailable: this environment's access policy is not available\n",
+                            )),
+                            true,
+                        )
+                        .await?;
+                    ctx.routing_status = "ingress_endpoint_unavailable".to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::LoginRequired
+                    if ctx.path == crate::ingress::GRANT_EXCHANGE_PATH =>
+                {
+                    let secure = self.is_https_request(session);
+                    // A path-routed target (resolved from the exchange's
+                    // `next`) gets a cookie scoped to its prefix.
+                    let exchange = self.exchange_ingress_grant(
+                        project_ctx.environment.id,
+                        &ctx.host,
+                        ctx.query_string.as_deref(),
+                        secure,
+                        ctx.path_route.as_ref().map(|route| route.prefix.as_str()),
+                    );
+                    // The query holds the grant: keep it out of the proxy
+                    // log, which outlives the grant and is readable by
+                    // project members.
+                    ctx.query_string = None;
+                    let mut response = match exchange {
+                        Ok(exchange) => {
+                            info!(
+                                project_id = project_ctx.project.id,
+                                environment_id = project_ctx.environment.id,
+                                grant_id = exchange.grant_id,
+                                user_id = exchange.user_id,
+                                "Temps login grant exchanged for an ingress session"
+                            );
+                            let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
+                            response.insert_header("Location", exchange.location)?;
+                            response.insert_header("Set-Cookie", exchange.set_cookie)?;
+                            response
+                        }
+                        Err(error) => {
                             warn!(
                                 project_id = project_ctx.project.id,
                                 environment_id = project_ctx.environment.id,
-                                ip = %client_ip,
-                                "Request denied by rate-limit blacklist"
+                                error = %error,
+                                "Refused a Temps login grant exchange"
                             );
-                            // Same generic 403 as the IP restriction above.
-                            let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session
-                                .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                                .await?;
-                            ctx.routing_status = "rate_limit_blacklisted".to_string();
-                            return Ok(true);
+                            ResponseHeader::build(StatusCode::FORBIDDEN, None)?
                         }
-                        crate::rate_limiter::RateLimitDecision::Limited {
-                            window,
-                            retry_after_secs,
-                        } => {
-                            self.proxy_metrics.record_rate_limited();
-                            debug!(
+                    };
+                    let refused = response.status != StatusCode::SEE_OTHER;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("Referrer-Policy", "no-referrer")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    let body: &'static [u8] = if refused {
+                        b"This sign-in link is invalid or has expired. Reload the page to sign in again.\n"
+                    } else {
+                        b"Signed in.\n"
+                    };
+                    session
+                        .write_response_body(Some(Bytes::from_static(body)), true)
+                        .await?;
+                    ctx.routing_status = if refused {
+                        "ingress_grant_refused"
+                    } else {
+                        "ingress_grant_exchanged"
+                    }
+                    .to_string();
+                    return Ok(true);
+                }
+                crate::ingress::AccessOutcome::LoginRequired => {
+                    let external_url = self
+                        .config_service
+                        .get_settings()
+                        .await
+                        .ok()
+                        .and_then(|settings| settings.external_url);
+                    let next = match ctx.query_string.as_deref() {
+                        Some(qs) if !qs.is_empty() => format!("{}?{}", ctx.path, qs),
+                        _ => ctx.path.clone(),
+                    };
+                    let scheme = if self.is_https_request(session) {
+                        crate::ingress::LoginScheme::Https
+                    } else {
+                        crate::ingress::LoginScheme::Http
+                    };
+                    let now_secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let port = self
+                        .request_authority(session)
+                        .ok()
+                        .and_then(|authority| authority.port);
+                    let location = external_url.as_deref().and_then(|base| {
+                        crate::ingress::login_redirect_url(
+                            base,
+                            self.crypto.ingress_grant_master_key(),
+                            temps_workload_ingress::ProductRef {
+                                kind: temps_workload_ingress::ProductKind::Environment,
+                                id: i64::from(project_ctx.environment.id),
+                            },
+                            crate::ingress::LoginSite {
+                                scheme,
+                                host: &ctx.host,
+                                port,
+                            },
+                            &next,
+                            now_secs,
+                        )
+                    });
+                    let mut response = match location {
+                        Some(location) => {
+                            let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
+                            response.insert_header("Location", location)?;
+                            response
+                        }
+                        None => {
+                            warn!(
                                 project_id = project_ctx.project.id,
                                 environment_id = project_ctx.environment.id,
-                                ip = %client_ip,
-                                window = window.as_str(),
-                                scope = ?resolved.scope,
-                                "Request rejected by rate limit"
+                                "Environment requires a Temps login but the instance has no valid external URL to send the visitor to"
                             );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                            response.insert_header("Retry-After", retry_after_secs.to_string())?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session
-                                .write_response_body(
-                                    Some(Bytes::from_static(b"Too Many Requests\n")),
-                                    true,
-                                )
-                                .await?;
-                            ctx.routing_status = "rate_limited".to_string();
-                            return Ok(true);
+                            ResponseHeader::build(StatusCode::FORBIDDEN, None)?
                         }
-                    }
+                    };
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("Referrer-Policy", "no-referrer")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session
+                        .write_response_body(
+                            Some(Bytes::from_static(b"Sign in to Temps to open this page.\n")),
+                            true,
+                        )
+                        .await?;
+                    ctx.routing_status = "ingress_login_required".to_string();
+                    return Ok(true);
                 }
+                // Bot challenges are Shield's (ADR 066), which runs right
+                // after this decision; the access decision defers to it.
+                crate::ingress::AccessOutcome::HttpsRequired
+                | crate::ingress::AccessOutcome::CaptchaChallenge => {}
             }
 
             // ADR 066 (I4): Shield, after the operator's IP gate and the
@@ -7129,16 +7931,30 @@ impl ProxyHttp for LoadBalancer {
                 return Ok(true);
             }
 
-            // Password wall: check if environment has password protection enabled
-            let password_protection = project_ctx
-                .environment
-                .deployment_config
-                .as_ref()
-                .and_then(|dc| dc.security.as_ref())
-                .and_then(|s| s.password_protection.as_ref())
-                .filter(|pp| pp.enabled);
-
-            if let Some(pp) = password_protection {
+            // Password wall: the outcome says the wall decides this request
+            // (no valid cookie, or the wall's own verify POST).
+            if access_outcome == crate::ingress::AccessOutcome::PasswordWall
+                && password_protection.is_none()
+            {
+                // The compiled endpoint asked for a wall this environment no
+                // longer has (a reload in flight): refuse rather than guess.
+                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                response.insert_header("Retry-After", "1")?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
+                    .await?;
+                ctx.routing_status = "ingress_endpoint_unavailable".to_string();
+                return Ok(true);
+            }
+            if let Some(pp) = password_protection
+                .filter(|_| access_outcome == crate::ingress::AccessOutcome::PasswordWall)
+            {
                 let password_hash = pp.password_hash.clone();
                 let env_id = project_ctx.environment.id;
                 let project_name = &project_ctx.project.name;
@@ -8402,7 +9218,21 @@ impl ProxyHttp for LoadBalancer {
             } else {
                 std::time::Duration::from_secs(60)
             };
-            let gateway_peer = preview_gateway_peer();
+            let gateway_peer = if ctx.preview_on_worker {
+                // A sandbox on a worker is reached through the relay the
+                // sandbox plugin runs in the console process; a proxy
+                // running on its own has none.
+                let Some(relay) = temps_core::sandbox_preview_relay::worker_preview_relay() else {
+                    return Err(Error::explain(
+                        pingora_core::ErrorType::ConnectNoRoute,
+                        "this sandbox runs on a worker node, and its previews are relayed by \
+                         the console process; this proxy runs without one",
+                    ));
+                };
+                relay.address.to_string()
+            } else {
+                preview_gateway_peer()
+            };
             let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
             peer.group_key = preview_request_group_key(host, &ctx.request_id);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
@@ -9292,6 +10122,7 @@ mod markdown_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            preview_on_worker: false,
             path_route: None,
             gated_host: false,
             gate_identity: None,
@@ -9836,6 +10667,7 @@ mod markdown_pipeline_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            preview_on_worker: false,
             path_route: None,
             gated_host: false,
             gate_identity: None,

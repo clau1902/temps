@@ -13,8 +13,8 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use temps_entities::{
-    deployment_containers, deployments, environments, monitoring_alert_rules, nodes, projects,
-    sandboxes,
+    deployment_containers, deployments, environments, external_services, monitoring_alert_rules,
+    nodes, projects, sandboxes, service_members,
 };
 
 /// `deployment_containers.status` for a container Temps confirmed is gone from
@@ -306,6 +306,24 @@ pub enum NodeError {
         count: u64,
     },
 
+    /// `external_services.node_id` and `service_members.node_id` are `ON
+    /// DELETE SET NULL`, and NULL means "the control plane": removing the
+    /// node would silently re-home these databases onto the control plane,
+    /// where none of their containers or data exist (ADR-055 defect 10).
+    #[error(
+        "Node '{node_name}' (id {node_id}) still hosts {} managed service(s): {}. Removing it \
+         would silently re-home them onto the control plane, where their containers and data \
+         do not exist. Delete them, or move them to another node, before removing the node",
+        services.len(),
+        describe_services(services)
+    )]
+    HostsManagedServices {
+        node_id: i32,
+        node_name: String,
+        /// Services on the node, or with a cluster member on it.
+        services: Vec<NodeServiceReference>,
+    },
+
     #[error(
         "Node '{node_name}' (id {node_id}) still has {count} container(s) of current or \
          in-progress deployments, or of the deployment a rollout in progress would fall back \
@@ -509,6 +527,28 @@ pub enum NodeError {
     DnsRegistry(#[from] temps_dns::DnsRegistryError),
 }
 
+/// A managed service that blocks a node's removal.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct NodeServiceReference {
+    pub service_id: i32,
+    pub service_name: String,
+    pub service_type: String,
+}
+
+/// `postgres 'orders' (id 4), ...` for messages.
+fn describe_services(services: &[NodeServiceReference]) -> String {
+    services
+        .iter()
+        .map(|s| {
+            format!(
+                "{} '{}' (id {})",
+                s.service_type, s.service_name, s.service_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The row a [`NodePlacementReference`] was read from, to rewrite it.
 enum PlacementRow {
     Environment(Box<environments::Model>),
@@ -655,6 +695,10 @@ pub struct ArchitectureChange {
     pub to: String,
 }
 
+/// Most container overlay addresses one heartbeat may carry; matches the
+/// agent's own bound.
+pub const MAX_REPORTED_OVERLAY_ADDRESSES: usize = 4096;
+
 /// Request to update a node's heartbeat.
 #[derive(Debug, Clone)]
 pub struct HeartbeatRequest {
@@ -687,6 +731,10 @@ pub struct HeartbeatRequest {
     /// The node's occupied IPv4 ranges (ADR 056), sent when they change.
     /// `None` leaves the stored ranges untouched; already validated.
     pub occupied_ranges: Option<Vec<temps_network::occupied::OccupiedRange>>,
+    /// Deployment ids running on the node without its cluster resolver,
+    /// already bounded. `None` from an older agent leaves the stored value
+    /// untouched; an empty list clears it.
+    pub deployments_without_resolver: Option<Vec<i64>>,
 }
 
 /// What the agent last saw of its cross-node overlay (ADR 056).
@@ -991,6 +1039,15 @@ fn truncate_dns_error(reason: &str) -> String {
         end -= 1;
     }
     format!("{}... (truncated)", &reason[..end])
+}
+
+/// Sorted, deduplicated and capped like the agent's own report, so an older
+/// or misbehaving agent cannot write an unbounded list into the column.
+fn bounded_deployment_ids(mut ids: Vec<i64>) -> Vec<i64> {
+    ids.sort_unstable();
+    ids.dedup();
+    ids.truncate(temps_deployer::resolver_coverage::MAX_REPORTED_DEPLOYMENTS);
+    ids
 }
 
 /// Extract the host from a validated node agent URL or private address for use
@@ -1782,6 +1839,10 @@ impl NodeService {
                 Set(dns.last_sync_error.map(|e| truncate_dns_error(&e)));
             active.dns_resolver_record_count = Set(Some(dns.record_count));
         }
+        if let Some(deployments) = request.deployments_without_resolver {
+            active.deployments_without_resolver =
+                Set(Some(serde_json::json!(bounded_deployment_ids(deployments))));
+        }
         if let Some(ingress) = request.public_ingress {
             active.public_ingress_running = Set(Some(ingress.running));
             active.public_ingress_last_error = Set(ingress
@@ -2116,6 +2177,38 @@ impl NodeService {
         Ok(count)
     }
 
+    /// Move service members on `node_id` whose container now holds a
+    /// different overlay address than the one recorded, together with their
+    /// DNS records. `observed` comes from the node's heartbeat; entries that
+    /// are not addresses are dropped. Returns how many members moved.
+    pub async fn follow_member_addresses(
+        &self,
+        node_id: i32,
+        observed: Vec<(String, String)>,
+    ) -> Result<u64, NodeError> {
+        let observed: Vec<(String, std::net::IpAddr)> = observed
+            .into_iter()
+            .take(MAX_REPORTED_OVERLAY_ADDRESSES)
+            .filter_map(|(name, ip)| {
+                let ip = ip.trim().parse().ok()?;
+                (!name.is_empty()).then_some((name, ip))
+            })
+            .collect();
+        let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
+        Ok(dns_registry
+            .follow_member_addresses(node_id, &observed)
+            .await?)
+    }
+
+    /// Internal DNS names refused because another owner holds them
+    /// (ADR-055 §10), oldest first.
+    pub async fn dns_name_conflicts(
+        &self,
+    ) -> Result<Vec<temps_entities::dns_name_conflicts::Model>, NodeError> {
+        let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
+        Ok(dns_registry.list_name_conflicts().await?)
+    }
+
     /// List only active nodes (heartbeat within the threshold).
     pub async fn list_active(
         &self,
@@ -2369,7 +2462,9 @@ impl NodeService {
     /// Refused while the node hosts live sandboxes (ADR-048): the
     /// `sandboxes.node_id` FK is `ON DELETE SET NULL`, so deleting the row
     /// would silently re-home those sandboxes to the control plane, where no
-    /// container exists for them.
+    /// container exists for them. Refused for the same reason while it hosts
+    /// a managed service or a cluster member
+    /// ([`NodeError::HostsManagedServices`]).
     ///
     /// The node's internal DNS records are deleted in the same transaction,
     /// so resolvers stop answering with its addresses as soon as it is gone.
@@ -2433,6 +2528,17 @@ impl NodeService {
                 node_id,
                 node_name: locked.name,
                 count: live_sandboxes,
+            });
+        }
+        // Same lock argument as sandboxes: a service or member insert takes a
+        // KEY SHARE lock on the node row through its `node_id` foreign key,
+        // so it is either committed and counted here, or fails afterwards.
+        let services = Self::managed_services_on(&txn, node_id).await?;
+        if !services.is_empty() {
+            return Err(NodeError::HostsManagedServices {
+                node_id,
+                node_name: locked.name,
+                services,
             });
         }
         // Checked again under the lock: a deployment may have placed a
@@ -3112,6 +3218,36 @@ impl NodeService {
         Self::live_sandbox_count_on(self.db.as_ref(), node_id).await
     }
 
+    /// Managed services placed on `node_id`, or with a cluster member there,
+    /// in id order. One query.
+    async fn managed_services_on<C: sea_orm::ConnectionTrait>(
+        db: &C,
+        node_id: i32,
+    ) -> Result<Vec<NodeServiceReference>, NodeError> {
+        let members_here = sea_orm::sea_query::Query::select()
+            .column(service_members::Column::ServiceId)
+            .from(service_members::Entity)
+            .and_where(service_members::Column::NodeId.eq(node_id))
+            .to_owned();
+        let services = external_services::Entity::find()
+            .filter(
+                Condition::any()
+                    .add(external_services::Column::NodeId.eq(node_id))
+                    .add(external_services::Column::Id.in_subquery(members_here)),
+            )
+            .order_by_asc(external_services::Column::Id)
+            .all(db)
+            .await?;
+        Ok(services
+            .into_iter()
+            .map(|s| NodeServiceReference {
+                service_id: s.id,
+                service_name: s.name,
+                service_type: s.service_type,
+            })
+            .collect())
+    }
+
     async fn live_sandbox_count_on<C: sea_orm::ConnectionTrait>(
         db: &C,
         node_id: i32,
@@ -3784,6 +3920,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -3898,6 +4035,8 @@ mod tests {
                 "num_items".to_string(),
                 sea_orm::Value::BigInt(Some(0)),
             )])]])
+            // no managed service or cluster member on the node
+            .append_query_results(vec![Vec::<external_services::Model>::new()])
             // nothing serving on the node under the lock
             .append_query_results(vec![vec![count_row(0)]])
             // no Compose stack lives on the node
@@ -3937,6 +4076,8 @@ mod tests {
                 "num_items".to_string(),
                 sea_orm::Value::BigInt(Some(0)),
             )])]])
+            // no managed service or cluster member on the node
+            .append_query_results(vec![Vec::<external_services::Model>::new()])
             .append_query_results(vec![vec![count_row(0)]])
             // The placement joined with its live environment.
             .append_query_results(vec![vec![(
@@ -3977,6 +4118,8 @@ mod tests {
                 "num_items".to_string(),
                 sea_orm::Value::BigInt(Some(0)),
             )])]])
+            // no managed service or cluster member on the node
+            .append_query_results(vec![Vec::<external_services::Model>::new()])
             .append_query_results(vec![vec![count_row(0)]])
             // The placement joined with its live environment.
             .append_query_results(vec![vec![(
@@ -4013,6 +4156,7 @@ mod tests {
         let db = with_no_dns_records(MockDatabase::new(DatabaseBackend::Postgres))
             .append_query_results(vec![vec![sample_node()]]) // FOR UPDATE lock
             .append_query_results(vec![vec![count_row(0)]]) // no live sandboxes
+            .append_query_results(vec![Vec::<external_services::Model>::new()]) // no managed services
             .append_query_results(vec![vec![count_row(1)]]) // one serving container
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -4374,6 +4518,7 @@ mod tests {
             |overlay: Option<OverlayHeartbeatUpdate>,
              occupied: Option<Vec<temps_network::occupied::OccupiedRange>>| {
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({}),
                     labels: None,
@@ -4565,6 +4710,57 @@ mod tests {
         assert_eq!(stored_targets(&blog), Some(vec![0, a]), "not targeting it");
     }
 
+    /// ADR-055 phase 6: the sandbox driver mode columns are gone from the
+    /// real schema, nodes register and load without them, and the drop
+    /// migration's `down` and `up` are both real.
+    #[tokio::test]
+    async fn sandbox_driver_mode_columns_are_dropped_and_down_restores_them() {
+        use sea_orm::ConnectionTrait;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let worker = service
+            .register(register_req("worker-1", "hash", "https://10.100.0.2:3100"))
+            .await
+            .unwrap();
+        assert_eq!(service.get_by_id(worker.id).await.unwrap().name, "worker-1");
+        for sql in [
+            "SELECT sandbox_driver_mode FROM nodes",
+            "SELECT control_plane_sandbox_driver_mode FROM network_config",
+        ] {
+            assert!(
+                db.execute_unprepared(sql).await.is_err(),
+                "column still exists: {sql}"
+            );
+        }
+
+        db.execute_unprepared(temps_migrations::DROP_SANDBOX_DRIVER_MODE_DOWN_SQL)
+            .await
+            .expect("down");
+        for sql in [
+            "SELECT sandbox_driver_mode FROM nodes WHERE sandbox_driver_mode = 'legacy'",
+            "SELECT control_plane_sandbox_driver_mode FROM network_config \
+             WHERE control_plane_sandbox_driver_mode = 'legacy'",
+        ] {
+            db.execute_unprepared(sql)
+                .await
+                .unwrap_or_else(|e| panic!("down restores the column ({sql}): {e}"));
+        }
+        // The entity ignores the restored column, so a rolled-back schema
+        // still loads nodes.
+        assert_eq!(service.get_by_id(worker.id).await.unwrap().name, "worker-1");
+
+        db.execute_unprepared(temps_migrations::DROP_SANDBOX_DRIVER_MODE_UP_SQL)
+            .await
+            .expect("up again");
+        assert!(db
+            .execute_unprepared("SELECT sandbox_driver_mode FROM nodes")
+            .await
+            .is_err());
+    }
+
     /// Emptying a pinned placement would let it run on any node, so the
     /// removal is refused, names the environment, and changes nothing.
     #[tokio::test]
@@ -4657,6 +4853,107 @@ mod tests {
             zone.generation > before,
             "resolvers must see the removal as a new generation"
         );
+    }
+
+    /// A managed service row of `topology`, placed on `node_id`.
+    async fn seed_service(
+        db: &sea_orm::DatabaseConnection,
+        name: &str,
+        topology: &str,
+        node_id: Option<i32>,
+    ) -> external_services::Model {
+        external_services::ActiveModel {
+            name: Set(name.to_string()),
+            service_type: Set("postgres".to_string()),
+            status: Set("running".to_string()),
+            topology: Set(topology.to_string()),
+            node_id: Set(node_id),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
+    /// ADR-055 phase 0: a node that hosts a database, directly or as a
+    /// cluster member, cannot be removed. Removal used to succeed and the
+    /// `ON DELETE SET NULL` on `external_services.node_id` silently moved
+    /// the service onto the control plane, where no container exists.
+    #[tokio::test]
+    async fn test_remove_refuses_a_node_that_hosts_managed_services() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = NodeService::new(db.clone());
+        let node = service
+            .register(register_req("worker-db", "hash", "https://10.100.0.3:3100"))
+            .await
+            .unwrap();
+
+        let standalone = seed_service(db.as_ref(), "orders-db", "standalone", Some(node.id)).await;
+        // A cluster whose service row sits on the control plane but has a
+        // member on the worker.
+        let cluster = seed_service(db.as_ref(), "cache-cluster", "cluster", None).await;
+        let member = service_members::ActiveModel {
+            service_id: Set(cluster.id),
+            node_id: Set(Some(node.id)),
+            role: Set("replica".to_string()),
+            container_name: Set("cache-cluster-1".to_string()),
+            status: Set("running".to_string()),
+            ordinal: Set(1),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        // A service elsewhere must not be listed.
+        seed_service(db.as_ref(), "elsewhere-db", "standalone", None).await;
+
+        let err = service.remove(node.id).await.unwrap_err();
+        match &err {
+            NodeError::HostsManagedServices {
+                node_id, services, ..
+            } => {
+                assert_eq!(*node_id, node.id);
+                let ids: Vec<_> = services.iter().map(|s| s.service_id).collect();
+                assert_eq!(ids, vec![standalone.id, cluster.id]);
+            }
+            other => panic!("expected HostsManagedServices, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("orders-db") && message.contains("cache-cluster"),
+            "{message}"
+        );
+
+        // Nothing moved: the services still point at the node.
+        let reloaded = external_services::Entity::find_by_id(standalone.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.node_id, Some(node.id));
+        assert!(nodes::Entity::find_by_id(node.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_some());
+
+        // Once both are gone from the node, it can be removed.
+        service_members::Entity::delete_by_id(member.id)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        external_services::Entity::delete_by_id(standalone.id)
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        service.remove(node.id).await.unwrap();
     }
 
     /// Regression: removing a node while a route reload republishes its DNS
@@ -5465,6 +5762,8 @@ mod tests {
             shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -5664,6 +5963,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5696,6 +5996,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5730,6 +6031,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5797,6 +6099,7 @@ mod tests {
                 .heartbeat(
                     1,
                     HeartbeatRequest {
+                        deployments_without_resolver: None,
                         architecture: None,
                         capacity: serde_json::json!({}),
                         labels: None,
@@ -5857,6 +6160,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -5900,6 +6204,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_reported_deployment_list_is_capped() {
+        let limit = temps_deployer::resolver_coverage::MAX_REPORTED_DEPLOYMENTS;
+        let reported: Vec<i64> = (0..(limit as i64 * 2)).rev().collect();
+
+        let stored = bounded_deployment_ids(reported);
+
+        assert_eq!(stored.len(), limit);
+        assert_eq!(stored.first(), Some(&0));
+    }
+
+    /// The deployments a node runs without its resolver are stored bounded
+    /// and sorted when reported, and left alone when an older agent omits
+    /// them.
+    #[tokio::test]
+    async fn test_heartbeat_stores_deployments_without_resolver_only_when_reported() {
+        async fn heartbeat_update(reported: Option<Vec<i64>>) -> (String, Vec<sea_orm::Value>) {
+            let node = sample_node();
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![node.clone()]])
+                    .append_query_results(vec![vec![node]])
+                    .into_connection(),
+            );
+            let service = NodeService::new(db.clone());
+            service
+                .heartbeat(
+                    1,
+                    HeartbeatRequest {
+                        deployments_without_resolver: reported,
+                        architecture: None,
+                        capacity: serde_json::json!({}),
+                        labels: None,
+                        dns_resolver: None,
+                        docker_socket_projects: None,
+                        overlay: None,
+                        occupied_ranges: None,
+                        public_ingress: None,
+                    },
+                )
+                .await
+                .unwrap_or_else(|error| panic!("heartbeat failed: {error}"));
+            drop(service);
+            let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+            let log = db.into_transaction_log();
+            let statement = log
+                .last()
+                .expect("heartbeat must issue an UPDATE")
+                .statements()[0]
+                .clone();
+            let values = statement.values.map(|values| values.0).unwrap_or_default();
+            (statement.sql, values)
+        }
+
+        let (sql, values) = heartbeat_update(Some(vec![9, 3, 9])).await;
+        assert!(sql.contains("\"deployments_without_resolver\" ="), "{sql}");
+        let stored = serde_json::json!([3, 9]);
+        assert!(
+            values.iter().any(|value| matches!(
+                value,
+                sea_orm::Value::Json(Some(json)) if **json == stored
+            )),
+            "the list is stored sorted and deduplicated: {values:?}"
+        );
+
+        let (sql, _) = heartbeat_update(None).await;
+        assert!(!sql.contains("\"deployments_without_resolver\" ="), "{sql}");
+    }
+
     /// A resolver that just self-healed after a crash reports `running:
     /// true` but `last_sync_success_at: None` (it hasn't completed its
     /// first sync tick yet). This must NOT regress a previously stored,
@@ -5926,6 +6299,7 @@ mod tests {
             .heartbeat(
                 1,
                 HeartbeatRequest {
+                    deployments_without_resolver: None,
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
@@ -7338,6 +7712,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let service = NodeService::new(Arc::new(db));
         let request = HeartbeatRequest {
+            deployments_without_resolver: None,
             capacity: serde_json::json!({}),
             labels: None,
             architecture: None,

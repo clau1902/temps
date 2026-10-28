@@ -10,6 +10,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
+import { ClusterDnsOffNotice } from '@/components/settings/ClusterDnsOffNotice'
 import { ClusterNetworkCard } from '@/components/settings/ClusterNetworkCard'
 import { useClusterNetwork } from '@/hooks/useClusterNetwork'
 import {
@@ -60,6 +61,7 @@ import {
   nodeRemovalBlocker,
   shouldPromptForFirstWorkerNode,
   WORKER_NODES_URL,
+  nodesAdvancedSection,
 } from '@/lib/worker-nodes'
 import {
   Table,
@@ -93,7 +95,6 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
   AlertTriangle,
-  ArrowLeft,
   Box,
   ChevronDown,
   Cpu,
@@ -113,7 +114,13 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -132,6 +139,20 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
+import {
+  NodeDesiredStateStream,
+  NodeNetworkPolicySettings,
+  NodeSchedulingResources,
+} from '@/components/nodes/NodeWorkloadSettings'
+import { NodeOverviewAlerts } from '@/components/nodes/NodeOverviewAlerts'
+import { NodeNetworkStatusCard } from '@/components/nodes/NodeNetworkStatusCard'
+import {
+  nodeSections,
+  nodeSectionUrl,
+  resolveNodeSection,
+  type NodeSection,
+} from '@/lib/node-detail'
+import { NodeStateStreamStatus } from '@/components/nodes/NodeStateStreamStatus'
 import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
 import { ServerMonitoring } from '@/components/monitoring/ServerMonitoring'
 
@@ -962,7 +983,10 @@ function MiniStat({
 // ── Node Detail Page (URL-routed) ──
 
 export function NodeDetailPage() {
-  const { nodeId } = useParams<{ nodeId: string }>()
+  const { nodeId, section: segment } = useParams<{
+    nodeId: string
+    section?: string
+  }>()
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const id = Number(nodeId)
@@ -971,15 +995,31 @@ export function NodeDetailPage() {
     ...adminGetNodeOptions({ path: { node_id: id } }),
     enabled: !isNaN(id),
   })
+  const section = resolveNodeSection(segment, nodeData?.role)
+  const sectionTitle = nodeSections(nodeData?.role).find(
+    (link) => link.section === section
+  )?.title
 
   useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Worker Nodes', href: WORKER_NODES_URL },
-      { label: nodeData?.name ?? `Node ${nodeId}` },
-    ])
-  }, [setBreadcrumbs, nodeData?.name, nodeId])
+    const name = nodeData?.name ?? `Node ${nodeId}`
+    setBreadcrumbs(
+      section === 'overview'
+        ? [{ label: 'Worker Nodes', href: WORKER_NODES_URL }, { label: name }]
+        : [
+            { label: 'Worker Nodes', href: WORKER_NODES_URL },
+            { label: name, href: nodeSectionUrl(id, 'overview') },
+            { label: sectionTitle ?? section },
+          ]
+    )
+  }, [setBreadcrumbs, nodeData?.name, nodeId, id, section, sectionTitle])
 
-  usePageTitle(nodeData?.name ?? 'Node Detail')
+  usePageTitle(
+    nodeData?.name
+      ? section === 'overview'
+        ? nodeData.name
+        : `${sectionTitle} · ${nodeData.name}`
+      : 'Node Detail'
+  )
 
   if (isNaN(id)) {
     return (
@@ -993,18 +1033,25 @@ export function NodeDetailPage() {
 
   return (
     <div className="w-full space-y-6">
-      <NodeDetail nodeId={id} onBack={() => navigate('/settings/nodes')} />
+      <NodeDetail
+        nodeId={id}
+        section={section}
+        onBack={() => navigate('/settings/nodes')}
+      />
     </div>
   )
 }
 
 function NodeDetail({
   nodeId,
+  section,
   onBack,
 }: {
   nodeId: number
+  section: NodeSection
   onBack: () => void
 }) {
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   // Draining, removing or reactivating a node changes what this installation
   // can schedule, so the capability every page's banner reads is stale the
@@ -1067,14 +1114,7 @@ function NodeDetail({
     // Live sandboxes block removal and draining doesn't move them: point
     // straight at the tab that can destroy them.
     onShowSandboxes: () =>
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev)
-          next.set('tab', 'sandboxes')
-          return next
-        },
-        { replace: true }
-      ),
+      navigate(`${nodeSectionUrl(nodeId, 'overview')}?tab=sandboxes`),
   })
 
   // Drain status decides whether the node can be removed; the server folds
@@ -1222,16 +1262,7 @@ function NodeDetail({
     <div className="space-y-6">
       {verificationDialog}
       {/* Header */}
-      <div className="flex items-center gap-3">
-        <Button
-          aria-label="Back"
-          variant="ghost"
-          size="icon"
-          onClick={onBack}
-          className="h-8 w-8"
-        >
-          <ArrowLeft className="h-4 w-4" />
-        </Button>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <Server className="h-5 w-5 text-muted-foreground" />
@@ -1249,7 +1280,7 @@ function NodeDetail({
           </p>
           <NodeRoleDescription labels={node.labels} />
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           {canDrain && (
             <Button
               variant="outline"
@@ -1402,7 +1433,10 @@ function NodeDetail({
           <AlertDescription>
             Draining does not move sandboxes, so the node can&rsquo;t be removed
             yet. Destroy them on the{' '}
-            <Link to="?tab=sandboxes" className="underline underline-offset-2">
+            <Link
+              to={`${nodeSectionUrl(nodeId, 'overview')}?tab=sandboxes`}
+              className="underline underline-offset-2"
+            >
               Sandboxes tab
             </Link>
             , then remove the node.
@@ -1410,179 +1444,220 @@ function NodeDetail({
         </Alert>
       )}
 
-      {/* Labels */}
-      <NodeDetailLabels labels={node.labels} />
+      {section === 'overview' && (
+        <>
+          <NodeOverviewAlerts node={node} />
+          {/* Metrics */}
+          {metrics && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {metrics.cpu_percent !== undefined && (
+                <MetricCard
+                  icon={<Cpu className="h-4 w-4 text-muted-foreground" />}
+                  label="CPU"
+                  value={formatPercent(metrics.cpu_percent)}
+                  percent={metrics.cpu_percent}
+                />
+              )}
 
-      {node.role === 'worker' && <WorkerIngressCard node={node} />}
-      {node.role === 'worker' && (
+              {metrics.memory_total_bytes != null &&
+                metrics.memory_used_bytes != null && (
+                  <MetricCard
+                    icon={
+                      <MemoryStick className="h-4 w-4 text-muted-foreground" />
+                    }
+                    label="Memory"
+                    value={`${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`}
+                    percent={
+                      (metrics.memory_used_bytes / metrics.memory_total_bytes) *
+                      100
+                    }
+                  />
+                )}
+
+              {metrics.disk_total_bytes != null &&
+                metrics.disk_used_bytes != null && (
+                  <MetricCard
+                    icon={
+                      <HardDrive className="h-4 w-4 text-muted-foreground" />
+                    }
+                    label="Disk"
+                    value={`${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`}
+                    percent={
+                      (metrics.disk_used_bytes / metrics.disk_total_bytes) * 100
+                    }
+                  />
+                )}
+            </div>
+          )}
+
+          {/* Workload on this node: deployment containers and sandboxes */}
+          <Tabs
+            value={tab}
+            onValueChange={(value) =>
+              setSearchParams(
+                (prev) => {
+                  const next = new URLSearchParams(prev)
+                  if (value === 'containers') next.delete('tab')
+                  else next.set('tab', value)
+                  return next
+                },
+                { replace: true }
+              )
+            }
+          >
+            <TabsList>
+              <TabsTrigger
+                value="containers"
+                count={containersLoading ? undefined : containers.length}
+              >
+                <Box className="h-4 w-4" />
+                Containers
+              </TabsTrigger>
+              <TabsTrigger value="sandboxes" count={sandboxesQuery.data?.total}>
+                <Terminal className="h-4 w-4" />
+                Sandboxes
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="containers">
+              <Card>
+                <CardContent className="px-0 pb-0 pt-0">
+                  {containersLoading ? (
+                    <div className="flex items-center justify-center py-8">
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                    </div>
+                  ) : containers.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-8 text-center px-4">
+                      <Box className="h-8 w-8 text-muted-foreground mb-2" />
+                      <p className="text-sm text-muted-foreground">
+                        No containers running on this node.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead>Container</TableHead>
+                            <TableHead>Status</TableHead>
+                            <TableHead className="hidden md:table-cell">
+                              Service
+                            </TableHead>
+                            <TableHead className="hidden md:table-cell">
+                              Environment
+                            </TableHead>
+                            <TableHead className="hidden lg:table-cell">
+                              Image
+                            </TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {containers.map((c: NodeContainerResponse) => (
+                            <TableRow key={c.container_id}>
+                              <TableCell>
+                                <span className="font-mono text-xs truncate max-w-[200px] block">
+                                  {c.container_name}
+                                </span>
+                              </TableCell>
+                              <TableCell>
+                                <Badge
+                                  variant={
+                                    c.status === 'running'
+                                      ? 'success-subtle'
+                                      : 'secondary'
+                                  }
+                                  className="text-xs"
+                                >
+                                  {c.status}
+                                </Badge>
+                              </TableCell>
+                              <TableCell className="hidden md:table-cell">
+                                <span className="text-sm">
+                                  {c.project_name}
+                                </span>
+                              </TableCell>
+                              <TableCell className="hidden md:table-cell">
+                                <Badge variant="outline" className="text-xs">
+                                  {c.environment_name}
+                                </Badge>
+                              </TableCell>
+                              <TableCell className="hidden lg:table-cell">
+                                <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
+                                  {c.image_name}
+                                </span>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </TabsContent>
+            <TabsContent value="sandboxes">
+              <NodeSandboxesPanel
+                nodeId={nodeId}
+                nodeName={node.name}
+                canSee={canSeeSandboxes}
+                query={sandboxesQuery}
+                page={sandboxPage}
+                onPageChange={setSandboxPage}
+                sandboxesAvailable={sandboxesAvailable}
+                sandboxesLocal={platformFeatures.data?.sandboxes_local}
+              />
+            </TabsContent>
+          </Tabs>
+        </>
+      )}
+
+      {section === 'monitoring' && (
+        <>
+          {/* History and alerts. Always rendered: with no samples yet, or no
+              metrics store, ServerMonitoring explains what is missing. */}
+          <ServerMonitoring
+            nodeId={nodeId}
+            embedded
+            rangeParamName="metrics_range"
+          />
+          <NodeAlertRules nodeId={nodeId} />
+
+          {/* Edge Analytics (only for edge nodes) */}
+          {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}
+        </>
+      )}
+
+      {section === 'networking' && (
+        <>
+          <NodeNetworkStatusCard node={node} />
+          {node.role === 'worker' && <WorkerIngressCard node={node} />}
+          {(node.role === 'worker' || node.role === 'control-plane') && (
+            <NodeNetworkPolicySettings
+              key={`policy-${node.id}`}
+              nodeId={node.id}
+              nodeName={node.name}
+            />
+          )}
+        </>
+      )}
+
+      {section === 'builds' && node.role === 'worker' && (
         <BuilderLimitsPanel key={node.id} node={node} />
       )}
 
-      {/* Metrics */}
-      {metrics && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {metrics.cpu_percent !== undefined && (
-            <MetricCard
-              icon={<Cpu className="h-4 w-4 text-muted-foreground" />}
-              label="CPU"
-              value={formatPercent(metrics.cpu_percent)}
-              percent={metrics.cpu_percent}
+      {section === 'scheduling' && (
+        <>
+          {(node.role === 'worker' || node.role === 'control-plane') && (
+            <NodeSchedulingResources
+              key={`resources-${node.id}`}
+              nodeId={node.id}
             />
           )}
-
-          {metrics.memory_total_bytes != null &&
-            metrics.memory_used_bytes != null && (
-              <MetricCard
-                icon={<MemoryStick className="h-4 w-4 text-muted-foreground" />}
-                label="Memory"
-                value={`${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`}
-                percent={
-                  (metrics.memory_used_bytes / metrics.memory_total_bytes) * 100
-                }
-              />
-            )}
-
-          {metrics.disk_total_bytes != null &&
-            metrics.disk_used_bytes != null && (
-              <MetricCard
-                icon={<HardDrive className="h-4 w-4 text-muted-foreground" />}
-                label="Disk"
-                value={`${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`}
-                percent={
-                  (metrics.disk_used_bytes / metrics.disk_total_bytes) * 100
-                }
-              />
-            )}
-        </div>
+          <NodeDetailLabels labels={node.labels} />
+          {(node.role === 'worker' || node.role === 'control-plane') && (
+            <NodeDesiredStateStream nodeId={node.id} />
+          )}
+        </>
       )}
-
-      {/* History and alerts. Always rendered: with no samples yet, or no
-          metrics store, ServerMonitoring explains what is missing. */}
-      <ServerMonitoring
-        nodeId={nodeId}
-        embedded
-        rangeParamName="metrics_range"
-      />
-      <NodeAlertRules nodeId={nodeId} />
-
-      {/* Edge Analytics (only for edge nodes) */}
-      {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}
-
-      {/* Workload on this node: deployment containers and sandboxes */}
-      <Tabs
-        value={tab}
-        onValueChange={(value) =>
-          setSearchParams(
-            (prev) => {
-              const next = new URLSearchParams(prev)
-              if (value === 'containers') next.delete('tab')
-              else next.set('tab', value)
-              return next
-            },
-            { replace: true }
-          )
-        }
-      >
-        <TabsList>
-          <TabsTrigger
-            value="containers"
-            count={containersLoading ? undefined : containers.length}
-          >
-            <Box className="h-4 w-4" />
-            Containers
-          </TabsTrigger>
-          <TabsTrigger value="sandboxes" count={sandboxesQuery.data?.total}>
-            <Terminal className="h-4 w-4" />
-            Sandboxes
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="containers">
-          <Card>
-            <CardContent className="px-0 pb-0 pt-0">
-              {containersLoading ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                </div>
-              ) : containers.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-8 text-center px-4">
-                  <Box className="h-8 w-8 text-muted-foreground mb-2" />
-                  <p className="text-sm text-muted-foreground">
-                    No containers running on this node.
-                  </p>
-                </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Container</TableHead>
-                        <TableHead>Status</TableHead>
-                        <TableHead className="hidden md:table-cell">
-                          Service
-                        </TableHead>
-                        <TableHead className="hidden md:table-cell">
-                          Environment
-                        </TableHead>
-                        <TableHead className="hidden lg:table-cell">
-                          Image
-                        </TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {containers.map((c: NodeContainerResponse) => (
-                        <TableRow key={c.container_id}>
-                          <TableCell>
-                            <span className="font-mono text-xs truncate max-w-[200px] block">
-                              {c.container_name}
-                            </span>
-                          </TableCell>
-                          <TableCell>
-                            <Badge
-                              variant={
-                                c.status === 'running'
-                                  ? 'success-subtle'
-                                  : 'secondary'
-                              }
-                              className="text-xs"
-                            >
-                              {c.status}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="hidden md:table-cell">
-                            <span className="text-sm">{c.project_name}</span>
-                          </TableCell>
-                          <TableCell className="hidden md:table-cell">
-                            <Badge variant="outline" className="text-xs">
-                              {c.environment_name}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="hidden lg:table-cell">
-                            <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
-                              {c.image_name}
-                            </span>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-        <TabsContent value="sandboxes">
-          <NodeSandboxesPanel
-            nodeId={nodeId}
-            nodeName={node.name}
-            canSee={canSeeSandboxes}
-            query={sandboxesQuery}
-            page={sandboxPage}
-            onPageChange={setSandboxPage}
-            sandboxesAvailable={sandboxesAvailable}
-            sandboxesLocal={platformFeatures.data?.sandboxes_local}
-          />
-        </TabsContent>
-      </Tabs>
     </div>
   )
 }
@@ -1714,6 +1789,27 @@ export function NodesPage() {
 
   usePageTitle('Worker Nodes')
 
+  // A link to one of the advanced cards (search, other pages) opens the
+  // section and brings the card into view. A toggle by hand wins until the
+  // link changes.
+  const { hash } = useLocation()
+  const linkedSection = nodesAdvancedSection(hash)
+  const [advancedToggle, setAdvancedToggle] = useState<{
+    hash: string
+    open: boolean
+  } | null>(null)
+  const advancedOpen =
+    advancedToggle?.hash === hash ? advancedToggle.open : linkedSection !== null
+  useEffect(() => {
+    if (!linkedSection) return
+    const frame = requestAnimationFrame(() =>
+      document
+        .getElementById(linkedSection)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    )
+    return () => cancelAnimationFrame(frame)
+  }, [linkedSection, isLoading])
+
   if (isLoading) {
     return (
       <div className="flex items-center justify-center min-h-[400px]">
@@ -1768,6 +1864,7 @@ export function NodesPage() {
             </Button>
           )}
 
+          <NodeStateStreamStatus />
           {noWayIn && (
             <Alert className="border-amber-500/30 bg-amber-500/5">
               <AlertTriangle className="h-4 w-4 text-amber-500" />
@@ -1795,6 +1892,15 @@ export function NodesPage() {
                 </div>
               </AlertDescription>
             </Alert>
+          )}
+
+          {workerCount > 0 && (
+            <ClusterDnsOffNotice title="Apps can't reach a database on another node">
+              Cluster DNS is off, so containers can&apos;t resolve{' '}
+              <code>*.temps.local</code> names. Deployments linked to a managed
+              service on a different node are blocked, and a database cluster
+              spanning nodes can&apos;t be reached by its apps.
+            </ClusterDnsOffNotice>
           )}
 
           {stranded.length > 0 && (
@@ -1864,22 +1970,33 @@ export function NodesPage() {
         </CardContent>
       </Card>
 
-      <Collapsible>
+      <Collapsible
+        open={advancedOpen}
+        onOpenChange={(open) => setAdvancedToggle({ hash, open })}
+      >
         <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
           <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
           Advanced: mesh hub, cluster network, DNS and trust
         </CollapsibleTrigger>
         <CollapsibleContent className="mt-6 space-y-6">
-          <MeshHubCard
-            mesh={mesh}
-            isLoading={meshLoading}
-            error={meshError}
-            onRetry={() => void refetchMesh()}
-            retrying={meshFetching}
-          />
-          <ClusterNetworkCard />
-          <ClusterDnsCard />
-          <ClusterTrustCard />
+          <div id="mesh-hub" className="scroll-mt-20">
+            <MeshHubCard
+              mesh={mesh}
+              isLoading={meshLoading}
+              error={meshError}
+              onRetry={() => void refetchMesh()}
+              retrying={meshFetching}
+            />
+          </div>
+          <div id="cluster-network" className="scroll-mt-20">
+            <ClusterNetworkCard />
+          </div>
+          <div id="cluster-dns" className="scroll-mt-20">
+            <ClusterDnsCard />
+          </div>
+          <div id="cluster-trust" className="scroll-mt-20">
+            <ClusterTrustCard />
+          </div>
         </CollapsibleContent>
       </Collapsible>
     </div>

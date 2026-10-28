@@ -33,6 +33,7 @@ pub mod compose;
 pub mod compose_interpolation;
 pub mod compose_protocol;
 mod compose_remote;
+pub mod compose_translation;
 pub mod runner_protocol;
 
 /// Callback function type for processing build logs in real-time
@@ -55,6 +56,7 @@ pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
+pub mod resolver_coverage;
 pub mod s3_static_deployer;
 pub mod static_deployer;
 pub mod static_ingestion;

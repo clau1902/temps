@@ -22,6 +22,8 @@ temps-entities = { path = "../temps-entities" }
 temps-file-store = { path = "../temps-file-store" }
 temps-geo = { path = "../temps-geo" }
 temps-routes = { path = "../temps-routes" }
+temps-workload-ingress = { path = "../temps-workload-ingress" }
+temps-workload-activator = { path = "../temps-workload-activator" }
 temps-shield = { path = "../temps-shield", features = ["tokio", "crawlers", "netwatch", "utoipa"] }
 temps-metrics = { path = "../temps-metrics" }
 temps-migrations = { path = "../temps-migrations" }

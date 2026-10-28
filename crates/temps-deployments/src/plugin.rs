@@ -57,6 +57,201 @@ impl DeploymentsPlugin {
             pending_job_processor: tokio::sync::Mutex::new(None),
         }
     }
+
+    /// Build the workload plane that runs `job` crons, start its
+    /// reconciler and hand it to the cron scheduler.
+    ///
+    /// Runs on node 0 (this host) only: with local workloads disabled, or
+    /// no Docker daemon, the plane still starts and reports every run as
+    /// `NoEligibleNode` instead of the cron silently doing nothing. With no
+    /// audit logger the plane is not started (its refusals must be
+    /// audited) and `job` crons are recorded as failed with that reason.
+    async fn start_workload_plane(&self, context: &PluginContext) {
+        let Some(cron_service) =
+            context.get_service::<crate::services::DatabaseCronConfigService>()
+        else {
+            tracing::warn!("Cron scheduler service is not registered; job crons cannot run");
+            return;
+        };
+        let Some(audit) = context.get_service::<dyn temps_core::AuditLogger>() else {
+            tracing::warn!(
+                "No audit logger is registered; the workload plane is not started, so job \
+                 crons are recorded as failed (HTTP crons are unaffected)"
+            );
+            return;
+        };
+        let db = context.require_service::<sea_orm::DatabaseConnection>();
+        let deployment_service = context.require_service::<DeploymentService>();
+        let docker_handle = context.require_service::<temps_core::DockerHandle>();
+        let local_workloads =
+            temps_core::policy_or_default(context.get_service::<temps_core::LocalWorkloadPolicy>());
+        let driver = match docker_handle.cloned() {
+            Some(docker) if local_workloads.local_workloads_enabled() => {
+                let driver: Arc<dyn temps_workload::RuntimeDriver> = Arc::new(
+                    // The legacy deployer's secrets root, so a replica's
+                    // `/run/secrets` lives where it always has and survives
+                    // a reboot.
+                    temps_workload_docker::DockerDriver::new(docker.as_ref().clone())
+                        .with_secrets_root(temps_workload_docker::secrets::default_secrets_root()),
+                );
+                Some(driver)
+            }
+            _ => {
+                tracing::info!(
+                    "No local Docker daemon for workloads in this process; job cron runs will \
+                     report NoEligibleNode"
+                );
+                None
+            }
+        };
+
+        let mut config = temps_workload_plane::PlaneConfig::new("temps");
+        config.network = Some(temps_core::NETWORK_NAME.clone());
+        config.admission.grant = temps_core::docker_socket_grant::process_grant().clone();
+        // ADR-024: the same proxy-owned resolver slot the legacy deployer
+        // injects, so a replica the plane starts here resolves `*.temps.local`
+        // exactly as a legacy one does. The slot holds an address only while
+        // cluster DNS is enabled and the resolver answers, so turning the
+        // setting on or off needs no restart; while it is empty, replicas
+        // keep Docker's embedded DNS.
+        if local_workloads.local_workloads_enabled() {
+            match context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>() {
+                Some(slot) => config.cluster_dns = Some(cluster_dns_resolver(slot)),
+                None => tracing::warn!(
+                    "no proxy resolver slot is registered; workloads the plane starts keep \
+                     Docker's embedded DNS even when cluster DNS is enabled"
+                ),
+            }
+        }
+        let placement = context.get_service::<crate::services::WorkloadPlacementService>();
+
+        // ADR-055 §7: a run is placed like a one-replica deployment of its
+        // environment, through the same scheduler policy as the deploy
+        // path. With no worker nodes that is always the control plane, as
+        // before.
+        let image_builder = context.require_service::<dyn temps_deployer::ImageBuilder>();
+        let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
+        let scheduler = Arc::new(
+            crate::services::NodeScheduler::new(node_service.clone())
+                .with_platform_source(image_builder.clone())
+                .with_local_workloads_enabled(local_workloads.local_workloads_enabled())
+                .with_docker_socket_grant(temps_core::docker_socket_grant::process_grant().clone()),
+        );
+        let attempt_placement = Arc::new(crate::services::NodeWorkloadPlacement::new(
+            db.clone(),
+            scheduler,
+            context.require_service::<temps_config::ConfigService>(),
+            context.require_service::<temps_core::EncryptionService>(),
+            Some(image_builder),
+        ));
+        let volume_provider = docker_volume_provider(
+            context.get_service::<temps_core::LocalWorkloadPolicy>(),
+            Some(docker_handle.clone()),
+        );
+        let mut plane = temps_workload_plane::WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(driver),
+            Arc::new(crate::services::cron_jobs::DeploymentEnvSource::new(
+                deployment_service.clone(),
+            )),
+            audit,
+            config,
+        )
+        .with_finalizer(Arc::new(crate::services::cron_jobs::CronRunFinalizer::new(
+            db,
+        )))
+        .with_placement(attempt_placement);
+        if let Some(provider) = volume_provider {
+            plane = plane.with_volume_provider(provider);
+        }
+        // ADR-055 phase 10: runtimes the binary adds on the control plane
+        // next to the node driver (the WASM driver, behind `temps-cli`'s
+        // `wasm` feature). None registered: functions report it.
+        if let Some(local) = context.get_service::<temps_workload_plane::LocalDrivers>() {
+            for extra in local.drivers() {
+                plane = plane.with_local_driver(extra.clone());
+            }
+        }
+        // ADR-055 Phase 10: a host with a working Firecracker also runs
+        // `micro_vm` deployment replicas on node 0. The explain endpoint is
+        // told, so it answers as the plane schedules.
+        if let Some(micro_vm) =
+            context.get_service::<crate::services::plane_deployer::ControlPlaneMicroVmDriver>()
+        {
+            plane = plane.with_control_plane_driver(micro_vm.0.clone());
+        }
+        if let Some(placement) = placement.as_ref() {
+            placement.set_control_plane_isolations(plane.control_plane_isolations());
+        }
+        // ADR-055 §8: the plane schedules from the product's node inventory
+        // with the same threshold and control-plane policy as NodeScheduler.
+        if let Some(placement) = placement {
+            plane = plane
+                .with_scheduler_config(placement.scheduler_config().clone())
+                .with_inventory(placement);
+        }
+        let plane = Arc::new(plane);
+        match plane.start() {
+            // Dropping the handle leaves the reconciler running for the
+            // life of the process.
+            Ok(_handle) => {
+                let node_state = context.require_service::<crate::services::NodeStateService>();
+                node_state.set_plane(plane.clone());
+                node_state.start_retention(node_service);
+                cron_service.set_workload_plane(plane.clone());
+                // Backups as jobs (Phase 9) read it from here.
+                if let Some(slot) = context.get_service::<temps_workload_plane::PlaneSlot>() {
+                    slot.set(plane.clone());
+                }
+                // `enforce` environments start replicas through it.
+                if let Some(workflow) = context.get_service::<WorkflowExecutionService>() {
+                    workflow.set_workload_plane(plane.clone());
+                }
+                // Rollback and promotion retire superseded `enforce`
+                // replicas through it.
+                deployment_service.set_workload_plane(plane.clone());
+                // Products registered beside deployments (functions) find
+                // the started plane here.
+                if let Some(shared) = context.get_service::<temps_workload_plane::SharedPlane>() {
+                    shared.set(plane);
+                }
+                tracing::info!(
+                    "Workload plane started; job crons are enabled and the node state stream \
+                     is served"
+                );
+            }
+            Err(e) => tracing::error!("Workload plane did not start: {e}"),
+        }
+    }
+}
+
+/// The resolvers the legacy deployer gives a container, read from the
+/// proxy's slot at each create: its address with public fallbacks, or
+/// Docker's default while the proxy's resolver is not listening.
+fn cluster_dns_resolver(
+    slot: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+) -> temps_workload::ResolverSource {
+    temps_workload::ResolverSource::new(move || {
+        slot.read()
+            .ok()
+            .and_then(|ip| ip.map(|ip| vec![ip.to_string()]))
+            .map(temps_deployer::docker::dns_with_fallback)
+    })
+}
+
+/// The control plane's Docker volume provider, when this process has a
+/// Docker daemon for local workloads.
+fn docker_volume_provider(
+    policy: Option<Arc<temps_core::LocalWorkloadPolicy>>,
+    docker: Option<Arc<temps_core::DockerHandle>>,
+) -> Option<Arc<dyn temps_workload_volumes::VolumeProvider>> {
+    if !temps_core::policy_or_default(policy).local_workloads_enabled() {
+        return None;
+    }
+    let docker = docker.and_then(|handle| handle.cloned())?;
+    Some(Arc::new(temps_workload_docker::DockerVolumeProvider::new(
+        docker.as_ref().clone(),
+    )))
 }
 
 impl Default for DeploymentsPlugin {
@@ -147,6 +342,10 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.set_environment_addresses(slot);
             }
             context.register_service(deployment_service.clone());
+            // The node state stream (ADR-055 §7). Registered now so the
+            // node routes can be built; the plane is handed to it once it
+            // starts, in `initialize_plugin_services`.
+            context.register_service(Arc::new(crate::services::NodeStateService::new()));
             let runtime_resolver =
                 deployment_service.clone() as Arc<dyn temps_monitoring::ContainerRuntimeResolver>;
             context.register_service(runtime_resolver);
@@ -434,7 +633,7 @@ impl TempsPlugin for DeploymentsPlugin {
             // must drop out of the pool instead of taking the replica.
             let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
             let node_scheduler = Arc::new(
-                crate::services::NodeScheduler::new(node_service)
+                crate::services::NodeScheduler::new(node_service.clone())
                     .with_platform_source(image_builder.clone())
                     // Without this the `Local` slot stays in the pool even in a
                     // profile with no Docker daemon, and a zero-node install
@@ -448,6 +647,32 @@ impl TempsPlugin for DeploymentsPlugin {
                     ),
             );
             workflow_execution_service.set_node_scheduler(node_scheduler.clone());
+
+            // ADR-055 Phase 5: the unified scheduler's view of the nodes,
+            // built from the same settings as NodeScheduler so a shadow run
+            // differs only where the ADR says it does. Feeds the workload
+            // plane's scheduler and the admin placement API.
+            let workload_placement = Arc::new(crate::services::WorkloadPlacementService::new(
+                db.clone(),
+                node_service,
+                config_service.clone(),
+                &node_scheduler,
+            ));
+            workflow_execution_service.set_workload_placement(workload_placement.clone());
+            context.register_service(workload_placement);
+
+            // ADR-055 Phase 9: environment volumes, and the slot the backup
+            // plugin reads the plane from once it starts.
+            let volume_provider: Option<Arc<dyn temps_workload_volumes::VolumeProvider>> =
+                docker_volume_provider(
+                    context.get_service::<temps_core::LocalWorkloadPolicy>(),
+                    context.get_service::<temps_core::DockerHandle>(),
+                );
+            context.register_service(Arc::new(crate::services::WorkloadVolumeService::new(
+                db.clone(),
+                volume_provider,
+            )));
+            context.register_service(Arc::new(temps_workload_plane::PlaneSlot::new()));
             // A process with no Docker compiles external plugins on a joined
             // worker; the external-plugins plugin looks this service up.
             if let Some(encryption_service) = context.get_service::<temps_core::EncryptionService>()
@@ -747,6 +972,12 @@ impl TempsPlugin for DeploymentsPlugin {
                 ),
             }
 
+            // The workload plane runs `job` crons (ADR-055 §14). Built here,
+            // not at registration, because it audit-logs its admission
+            // refusals and the audit logger is only resolvable now. Started
+            // once per process. `http` crons never touch it.
+            self.start_workload_plane(context).await;
+
             // Wire auditing for deploy-path security events — currently the
             // ADR-045 record that a deployment received the host Docker
             // socket. Optional: an install with no audit sink still deploys,
@@ -977,6 +1208,24 @@ impl TempsPlugin for DeploymentsPlugin {
         // control-plane process (no local daemon) never panics at boot.
         let docker_for_exec = context.require_service::<temps_core::DockerHandle>();
 
+        // ADR-024: which applications still run without the cluster resolver.
+        // The proxy's resolver slot exists only in a process that runs
+        // workloads; without it, only workers' heartbeat reports are listed.
+        let resolver_slot = if temps_core::policy_or_default(
+            context.get_service::<temps_core::LocalWorkloadPolicy>(),
+        )
+        .local_workloads_enabled()
+        {
+            context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
+        } else {
+            None
+        };
+        let resolver_coverage = Arc::new(crate::services::ResolverCoverageService::new(
+            db.clone(),
+            docker_for_exec.clone(),
+            resolver_slot,
+        ));
+
         // Resolves the per-managed-domain public hostname strategy. Falls back to
         // the Standard resolver when no DNS provider plugin registered one.
         let hostname_resolver = context
@@ -1068,6 +1317,7 @@ impl TempsPlugin for DeploymentsPlugin {
             config_service: config_service.clone(),
             docker: docker_for_exec,
             docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
+            resolver_coverage,
             deployment_gate,
             project_access_checker,
             hostname_resolver,
@@ -1166,6 +1416,31 @@ impl TempsPlugin for DeploymentsPlugin {
             .merge(traefik_discovery_routes)
             .merge(compose_check_routes)
             .merge(
+                handlers::workload_placement::configure_routes().with_state(Arc::new(
+                    handlers::workload_placement::WorkloadPlacementAppState {
+                        service: context
+                            .require_service::<crate::services::WorkloadPlacementService>(),
+                        audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                    },
+                )),
+            )
+            .merge(
+                handlers::workload_volumes::configure_routes().with_state(Arc::new(
+                    handlers::workload_volumes::WorkloadVolumesAppState {
+                        service: context
+                            .require_service::<crate::services::WorkloadVolumeService>(),
+                        audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+                    },
+                )),
+            )
+            .merge(
+                handlers::node_state::configure_status_routes().with_state(Arc::new(
+                    handlers::node_state::NodeStateStatusAppState {
+                        node_state: context.require_service::<crate::services::NodeStateService>(),
+                    },
+                )),
+            )
+            .merge(
                 handlers::runtime_health::routes()
                     .with_state(Arc::new(handlers::runtime_health::RuntimeHealthAppState {
                     service: context
@@ -1200,6 +1475,7 @@ impl TempsPlugin for DeploymentsPlugin {
         let remote_deployments_schema =
             <handlers::remote_deployments::RemoteDeploymentsApiDoc as UtoimaOpenApi>::openapi();
         let nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
+        let node_state_schema = <handlers::node_state::NodeStateApiDoc as UtoimaOpenApi>::openapi();
         let deployment_tokens_schema =
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
         let traefik_discovery_schema =
@@ -1216,11 +1492,14 @@ impl TempsPlugin for DeploymentsPlugin {
                 external_images_schema,
                 remote_deployments_schema,
                 nodes_schema,
+                node_state_schema,
                 <handlers::ci_dispatch::CiDispatchApiDoc as UtoimaOpenApi>::openapi(),
                 deployment_tokens_schema,
                 traefik_discovery_schema,
                 compose_check_schema,
                 <handlers::runtime_health::RuntimeHealthApiDoc as UtoimaOpenApi>::openapi(),
+                <handlers::workload_placement::WorkloadPlacementApiDoc as UtoimaOpenApi>::openapi(),
+                <handlers::workload_volumes::WorkloadVolumesApiDoc as UtoimaOpenApi>::openapi(),
                 compose_placement_schema,
             ],
         ))
@@ -1230,6 +1509,21 @@ impl TempsPlugin for DeploymentsPlugin {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_plane_resolver_follows_the_proxy_slot() {
+        let slot = Arc::new(std::sync::RwLock::new(None));
+        let resolver = cluster_dns_resolver(slot.clone());
+        assert_eq!(resolver.resolvers(), None, "no listener, Docker's default");
+
+        *slot.write().expect("slot") = Some(std::net::IpAddr::from([10, 0, 0, 53]));
+        let resolvers = resolver.resolvers().expect("the slot's resolver");
+        assert_eq!(resolvers.first().map(String::as_str), Some("10.0.0.53"));
+        assert!(
+            resolvers.len() > 1,
+            "public fallbacks follow: {resolvers:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_deployments_plugin_name() {

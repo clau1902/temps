@@ -213,6 +213,13 @@ pub struct AppSettings {
     /// hardware that already has its own per-host headroom).
     pub build_limits: BuildLimitsSettings,
 
+    /// The control plane's (node 0's) scheduling settings, the counterpart
+    /// of `nodes.resource_policy` / `nodes.system_reserved` on worker rows
+    /// (ADR-055 §5). Stored here because node 0 is not a `nodes` row; changed
+    /// through `PUT /nodes/0/resources`.
+    #[serde(default)]
+    pub control_plane_resources: ControlPlaneResourceSettings,
+
     /// Retention policy for locally-built deployment images. Modeled as a
     /// settings row (not an env var) per CLAUDE.md so an operator can change
     /// the system-wide default at runtime without restarting the binary.
@@ -660,6 +667,30 @@ pub struct ClusterDnsSettings {
     /// `*.temps.local` FQDNs resolve inside containers.
     #[schema(example = false)]
     pub enabled: bool,
+    /// Whether an operator has ever changed `enabled` themselves. Until then,
+    /// the control plane turns cluster DNS on when the first worker joins,
+    /// since cross-node links need `*.temps.local`. Set by the server when a
+    /// save changes `enabled`; a client cannot clear it.
+    #[schema(example = false)]
+    pub operator_chosen: bool,
+}
+
+impl ClusterDnsSettings {
+    /// The settings to store after a save that asked for `requested`, given
+    /// what was stored before. Changing `enabled` is an operator choice, and
+    /// once made it stays made, whatever the client sent for the marker.
+    pub fn after_operator_save(stored: &Self, requested: &Self) -> Self {
+        Self {
+            enabled: requested.enabled,
+            operator_chosen: stored.operator_chosen || requested.enabled != stored.enabled,
+        }
+    }
+
+    /// Whether a worker joining should turn cluster DNS on: only while it is
+    /// off and no operator has decided either way.
+    pub fn should_enable_for_worker(&self) -> bool {
+        !self.enabled && !self.operator_chosen
+    }
 }
 
 /// Bounds on one AI chat turn.
@@ -1049,6 +1080,24 @@ impl BuildLimitsSettings {
     pub fn effective_build_cache_max_unused_days(&self) -> u32 {
         self.build_cache_max_unused_days.clamp(1, 365)
     }
+}
+
+/// The control plane's scheduling settings (ADR-055 §5).
+///
+/// `None` reserves take the §5 default for the control plane, which depends
+/// on whether its PostgreSQL runs on the same host (0.5 vCPU / 1 GB) or not
+/// (0.25 vCPU / 512 MB). Those defaults are estimates.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ControlPlaneResourceSettings {
+    /// `true` = `enforced`: refuse a placement on the control plane whose
+    /// reservations exceed its capacity minus the reserve. `false` (the
+    /// default) = `best_effort`.
+    pub enforce_reservations: bool,
+    /// CPU kept for Temps itself, in millicores. `None` = the default.
+    pub system_reserved_cpu_millis: Option<u32>,
+    /// Memory kept for Temps itself, in megabytes. `None` = the default.
+    pub system_reserved_memory_mb: Option<u32>,
 }
 
 /// System-wide retention policy for locally-built deployment images.
@@ -2528,6 +2577,7 @@ impl Default for AppSettings {
             connection_limits: ConnectionLimitSettings::default(),
             tenant_resource_ceilings: TenantResourceCeilings::default(),
             build_limits: BuildLimitsSettings::default(),
+            control_plane_resources: ControlPlaneResourceSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
@@ -2987,6 +3037,53 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_worker_turns_cluster_dns_on_only_until_an_operator_decides() {
+        let untouched = ClusterDnsSettings::default();
+        assert!(untouched.should_enable_for_worker());
+
+        // Already on: nothing to do.
+        let on = ClusterDnsSettings {
+            enabled: true,
+            operator_chosen: false,
+        };
+        assert!(!on.should_enable_for_worker());
+
+        // An operator turned it off: a later worker must not override that.
+        let turned_off = ClusterDnsSettings::after_operator_save(
+            &on,
+            &ClusterDnsSettings {
+                enabled: false,
+                operator_chosen: false,
+            },
+        );
+        assert!(!turned_off.enabled);
+        assert!(turned_off.operator_chosen);
+        assert!(!turned_off.should_enable_for_worker());
+    }
+
+    #[test]
+    fn saving_cluster_dns_unchanged_is_not_a_choice_and_a_choice_sticks() {
+        let stored = ClusterDnsSettings::default();
+        // A save that resends the stored value decides nothing.
+        let resent = ClusterDnsSettings::after_operator_save(&stored, &stored);
+        assert!(!resent.operator_chosen);
+
+        // Once chosen, a client sending `operator_chosen: false` cannot clear it.
+        let chosen = ClusterDnsSettings {
+            enabled: true,
+            operator_chosen: true,
+        };
+        let cleared = ClusterDnsSettings::after_operator_save(
+            &chosen,
+            &ClusterDnsSettings {
+                enabled: true,
+                operator_chosen: false,
+            },
+        );
+        assert!(cleared.operator_chosen);
+    }
 
     #[test]
     fn ingest_override_validation_accepts_inherit_zero_and_max_only() {

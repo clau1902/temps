@@ -446,6 +446,9 @@ pub fn refresh_control_plane_metrics() {
         "memory_total_bytes": memory_total_bytes,
         "disk_used_bytes": disk_used,
         "disk_total_bytes": disk_total,
+        // What the scheduler needs to enforce CPU reservations on node 0,
+        // as the agent's heartbeat reports it for a worker.
+        "cpu_cores": sys.cpus().len(),
     });
 
     if let Ok(mut g) = control_plane_metrics_cell().write() {
@@ -1024,6 +1027,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,

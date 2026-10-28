@@ -1004,6 +1004,7 @@ mod tests {
             config: None,
             node_id: None,
             topology: "cluster".to_string(),
+            workload_mode: Default::default(),
             error_message: None,
             health_status: None,
             last_health_check_at: None,

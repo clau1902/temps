@@ -780,6 +780,8 @@ mod tests {
             shield_exempt_paths: Default::default(),
             last_activity_at: None,
             force_https: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 

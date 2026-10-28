@@ -71,6 +71,10 @@ pub struct MarkDeploymentCompleteJob {
     queue: Arc<dyn JobQueue>,
     config_service: Option<Arc<temps_config::ConfigService>>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    /// The workload plane, when this process runs one: a replica an
+    /// `enforce` deployment started through it is retired by deleting its
+    /// workload, never by removing the container behind the plane's back.
+    workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
     /// ADR 068 D5: whether anyone can open what was deployed. Empty in a
     /// binary without the ingress plugin.
     environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
@@ -107,6 +111,7 @@ impl MarkDeploymentCompleteJob {
             queue,
             config_service: None,
             encryption_service,
+            workload_plane: None,
             environment_addresses: None,
         }
     }
@@ -166,6 +171,12 @@ impl MarkDeploymentCompleteJob {
 
     pub fn with_config_service(mut self, config_service: Arc<temps_config::ConfigService>) -> Self {
         self.config_service = Some(config_service);
+        self
+    }
+
+    /// Retire plane-started replicas through `plane` (ADR-055 `enforce`).
+    pub fn with_workload_plane(mut self, plane: Arc<temps_workload_plane::WorkloadPlane>) -> Self {
+        self.workload_plane = Some(plane);
         self
     }
 
@@ -1566,6 +1577,33 @@ WHERE project.id = $2
             return Ok(());
         }
 
+        // Only nodes whose last heartbeat reports a running, answering
+        // resolver can ACK a DNS generation. A node without one (an old
+        // agent, port 53 taken) serves its containers through Docker's
+        // embedded DNS, so waiting on it would roll back every deployment
+        // without making anything resolve.
+        let dns_nodes: Vec<i32> = if cluster_dns_enabled {
+            nodes::Entity::find()
+                .select_only()
+                .column(nodes::Column::Id)
+                .filter(nodes::Column::Id.is_in(active_nodes.clone()))
+                .filter(nodes::Column::DnsResolverRunning.eq(true))
+                .into_tuple::<i32>()
+                .all(db)
+                .await
+                .map_err(|e| format!("listing nodes with a running DNS resolver: {e}"))?
+        } else {
+            Vec::new()
+        };
+        if cluster_dns_enabled && dns_nodes.len() < active_nodes.len() {
+            warn!(
+                active_nodes = active_nodes.len(),
+                resolver_nodes = dns_nodes.len(),
+                "not waiting for DNS ACKs from active nodes whose resolver is not running; \
+                 their containers use Docker's embedded DNS"
+            );
+        }
+
         let deadline = tokio::time::Instant::now() + timeout;
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
 
@@ -1585,9 +1623,9 @@ WHERE project.id = $2
             // No node runs a DNS resolver/sync client when cluster DNS is
             // disabled, so no node ever ACKs a DNS generation — nothing to
             // wait for.
-            let dns_states = if cluster_dns_enabled {
+            let dns_states = if cluster_dns_enabled && !dns_nodes.is_empty() {
                 node_dns_state::Entity::find()
-                    .filter(node_dns_state::Column::NodeId.is_in(active_nodes.clone()))
+                    .filter(node_dns_state::Column::NodeId.is_in(dns_nodes.clone()))
                     .all(db)
                     .await
                     .map_err(|e| format!("reading node_dns_state: {e}"))?
@@ -1595,7 +1633,7 @@ WHERE project.id = $2
                 Vec::new()
             };
             let dns_ok = !cluster_dns_enabled
-                || (dns_states.len() == active_nodes.len()
+                || (dns_states.len() == dns_nodes.len()
                     && dns_states.iter().all(|s| s.applied_generation >= dns_gen));
 
             if route_ok && dns_ok {
@@ -1645,15 +1683,13 @@ WHERE project.id = $2
                     }
                 }
                 if cluster_dns_enabled && !dns_ok {
-                    let never_acked = active_nodes.len() - dns_states.len();
+                    let never_acked = dns_nodes.len() - dns_states.len();
                     if never_acked > 0 {
                         reason.push_str(&format!(
-                            " — {never_acked} active node(s) have never ACKed a DNS generation \
-                             at all. Cluster DNS was likely enabled after these nodes' agents \
-                             last started: the per-node resolver is only spawned once, during \
-                             initial overlay bootstrap, so an already-running agent won't pick up \
-                             a newly-enabled cluster_dns.enabled until its `temps agent` process \
-                             is restarted."
+                            " — {never_acked} node(s) report a running DNS resolver but have \
+                             never ACKed a DNS generation. Check that their resolver can reach \
+                             the control plane's DNS sync endpoint (`temps agent` logs on each \
+                             node), then redeploy."
                         ));
                     } else {
                         let lagging = dns_states
@@ -2198,6 +2234,13 @@ WHERE project.id = $2
     /// best-effort, but a failed remove or database update is returned so the
     /// caller does not silently consider a still-running container cleaned up.
     /// Resolves the correct (local vs remote) deployer from node_id.
+    ///
+    /// A replica an `enforce` deployment started through the workload plane
+    /// is retired by deleting its plane workload: the plane stops and
+    /// removes the instance (a container, or a microVM no deployer can
+    /// see). Removing only the container would leave the workload running
+    /// -- or restarted by the reconciler -- and a microVM's id is a 404 to
+    /// Docker, which must not count as "already removed".
     async fn teardown_container(
         &self,
         container: deployment_containers::Model,
@@ -2205,13 +2248,32 @@ WHERE project.id = $2
         environment_id: i32,
     ) -> Result<(), String> {
         let container_id = container.container_id.clone();
+        let plane_workload = crate::services::plane_deployer::deployment_replica_workload(
+            self.db.as_ref(),
+            container.deployment_id,
+            &container_id,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         // Determine which deployer to use based on node_id
-        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = if let Some(node_id) =
+        let deployer: Option<Arc<dyn temps_deployer::ContainerDeployer>> = if let Some(node_id) =
             container.node_id
         {
             match self.get_remote_deployer(node_id).await {
-                Ok(remote) => remote,
+                Ok(remote) => Some(remote),
+                // The plane retires its replica without this deployer; only
+                // the log capture below is skipped.
+                Err(e) if plane_workload.is_some() => {
+                    warn!(
+                        container_id = %container_id,
+                        node_id,
+                        error = %e,
+                        "Cannot reach worker node to capture logs; retiring the replica through \
+                         the workload plane"
+                    );
+                    None
+                }
                 Err(e) => {
                     // Never fall back to the local daemon: it does not own this
                     // container, and a matching ID there would be the wrong
@@ -2229,16 +2291,70 @@ WHERE project.id = $2
                 }
             }
         } else {
-            self.container_deployer.clone()
+            Some(self.container_deployer.clone())
         };
 
         // Capture the container's logs to durable storage BEFORE we stop and
         // remove it, so they survive teardown and can be viewed later.
-        self.capture_container_logs(&deployer, &container, project_id, environment_id)
-            .await;
+        if let Some(deployer) = deployer.as_ref() {
+            self.capture_container_logs(deployer, &container, project_id, environment_id)
+                .await;
+        }
 
+        match (plane_workload, deployer) {
+            (Some(workload), _) => {
+                if let Err(e) = crate::services::plane_deployer::retire_replica_workload(
+                    self.workload_plane.as_deref(),
+                    container.deployment_id,
+                    &container_id,
+                    workload,
+                )
+                .await
+                {
+                    self.log(format!("Failed to retire container {container_id}: {e}"))
+                        .await
+                        .ok();
+                    return Err(e.to_string());
+                }
+                self.log(format!(
+                    "Retired container {} through the workload plane (workload {})",
+                    container_id, workload.workload_id
+                ))
+                .await
+                .ok();
+            }
+            (None, Some(deployer)) => {
+                self.stop_and_remove_container(deployer.as_ref(), &container_id)
+                    .await?;
+            }
+            (None, None) => {
+                return Err(format!(
+                    "No deployer resolved to remove container {container_id}"
+                ));
+            }
+        }
+
+        // Mark container as deleted in database
+        let mut active_container: deployment_containers::ActiveModel = container.into();
+        active_container.deleted_at = Set(Some(chrono::Utc::now()));
+        active_container.status = Set(Some("removed".to_string()));
+        active_container
+            .update(self.db.as_ref())
+            .await
+            .map_err(|e| format!("Failed to mark container {container_id} removed: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Stop (best effort) and remove a legacy container through its node's
+    /// deployer. An already-removed container counts as removed.
+    async fn stop_and_remove_container(
+        &self,
+        deployer: &dyn temps_deployer::ContainerDeployer,
+        container_id: &str,
+    ) -> Result<(), String> {
         // Stop container first
-        match deployer.stop_container(&container_id).await {
+        match deployer.stop_container(container_id).await {
             Ok(_) => {
                 self.log(format!("Stopped container {}", container_id))
                     .await
@@ -2255,7 +2371,7 @@ WHERE project.id = $2
         // (pruned, removed by hand, lost with its node's disk) is torn down:
         // retrying could never succeed and would keep the deployment in the
         // sweep forever.
-        match deployer.remove_container(&container_id).await {
+        match deployer.remove_container(container_id).await {
             Ok(_) => {
                 self.log(format!("Removed container {}", container_id))
                     .await
@@ -2281,15 +2397,6 @@ WHERE project.id = $2
                 ));
             }
         }
-
-        // Mark container as deleted in database
-        let mut active_container: deployment_containers::ActiveModel = container.into();
-        active_container.deleted_at = Set(Some(chrono::Utc::now()));
-        active_container.status = Set(Some("removed".to_string()));
-        active_container
-            .update(self.db.as_ref())
-            .await
-            .map_err(|e| format!("Failed to mark container {container_id} removed: {e}"))?;
 
         Ok(())
     }
@@ -2771,6 +2878,7 @@ pub struct MarkDeploymentCompleteJobBuilder {
     queue: Option<Arc<dyn JobQueue>>,
     config_service: Option<Arc<temps_config::ConfigService>>,
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
+    workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
     environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
 }
 
@@ -2786,8 +2894,19 @@ impl MarkDeploymentCompleteJobBuilder {
             queue: None,
             config_service: None,
             encryption_service: None,
+            workload_plane: None,
             environment_addresses: None,
         }
+    }
+
+    /// The workload plane, when this process runs one (see
+    /// [`MarkDeploymentCompleteJob::with_workload_plane`]).
+    pub fn workload_plane(
+        mut self,
+        plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
+    ) -> Self {
+        self.workload_plane = plane;
+        self
     }
 
     pub fn job_id(mut self, job_id: String) -> Self {
@@ -2885,6 +3004,9 @@ impl MarkDeploymentCompleteJobBuilder {
             job = job.with_log_service(log_service);
         }
         job = job.with_config_service(config_service);
+        if let Some(plane) = self.workload_plane {
+            job = job.with_workload_plane(plane);
+        }
         if let Some(slot) = self.environment_addresses {
             job = job.with_environment_addresses(slot);
         }
@@ -3120,11 +3242,15 @@ mod teardown_tests {
     #[tokio::test]
     async fn health_probe_portless_withdrawal_requires_worker_route_and_enabled_dns_acknowledgements(
     ) {
-        for (dns_enabled, route_ack, dns_ack, success) in [
-            (false, 7, 0, true),
-            (false, 6, 0, false),
-            (true, 7, 9, true),
-            (true, 7, 8, false),
+        // (cluster DNS on, route ACK, DNS ACK, node runs a resolver, succeeds)
+        for (dns_enabled, route_ack, dns_ack, resolver, success) in [
+            (false, 7, 0, true, true),
+            (false, 6, 0, true, false),
+            (true, 7, 9, true, true),
+            (true, 7, 8, true, false),
+            // A node without a running resolver cannot ACK DNS, and its
+            // containers use Docker's DNS: it must not hold the deploy back.
+            (true, 7, 0, false, true),
         ] {
             let mut mock = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([[BTreeMap::from([("current", Value::BigInt(Some(7)))])]]);
@@ -3134,15 +3260,23 @@ mod teardown_tests {
                     Value::BigInt(Some(9)),
                 )])]]);
             }
-            mock = mock
-                .append_query_results([[BTreeMap::from([("id", Value::Int(Some(1)))])]])
-                .append_query_results([vec![temps_entities::node_route_state::Model {
-                    node_id: 1,
-                    applied_generation: route_ack,
-                    last_sync_at: None,
-                    health: "healthy".into(),
-                }]]);
+            mock = mock.append_query_results([[BTreeMap::from([("id", Value::Int(Some(1)))])]]);
             if dns_enabled {
+                // Active nodes whose heartbeat reports a running resolver.
+                let resolver_nodes: Vec<BTreeMap<&str, Value>> = if resolver {
+                    vec![BTreeMap::from([("id", Value::Int(Some(1)))])]
+                } else {
+                    Vec::new()
+                };
+                mock = mock.append_query_results([resolver_nodes]);
+            }
+            mock = mock.append_query_results([vec![temps_entities::node_route_state::Model {
+                node_id: 1,
+                applied_generation: route_ack,
+                last_sync_at: None,
+                health: "healthy".into(),
+            }]]);
+            if dns_enabled && resolver {
                 mock = mock.append_query_results([vec![temps_entities::node_dns_state::Model {
                     node_id: 1,
                     applied_generation: dns_ack,

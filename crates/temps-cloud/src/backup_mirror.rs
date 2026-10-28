@@ -3898,6 +3898,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         };
@@ -4358,6 +4359,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         }
@@ -4650,6 +4652,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         }
@@ -5976,6 +5979,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         };
@@ -6791,6 +6795,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         }

@@ -48,6 +48,7 @@ pub use stage_log_writer::*;
 pub mod job_tracker;
 pub use job_tracker::*;
 
+pub mod cron_jobs;
 pub mod database_cron_service;
 pub use database_cron_service::*;
 
@@ -112,3 +113,17 @@ pub(crate) mod deployment_commit;
 pub mod ci_dispatch;
 
 pub mod runtime_health;
+
+pub mod workload_placement;
+pub use workload_placement::{WorkloadPlacementError, WorkloadPlacementService};
+pub mod workload_volumes;
+pub use workload_volumes::{WorkloadVolumeError, WorkloadVolumeService};
+pub mod node_state;
+pub mod resolver_coverage;
+pub use resolver_coverage::{
+    DeploymentWithoutResolver, ResolverCoverageError, ResolverCoverageHost, ResolverCoverageService,
+};
+pub mod plane_deployer;
+pub use node_state::{
+    AgentApiDriver, NodeStateError, NodeStateService, NodeStateStatus, NodeWorkloadPlacement,
+};

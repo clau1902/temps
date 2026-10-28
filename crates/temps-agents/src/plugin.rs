@@ -188,10 +188,20 @@ fn local_sandbox_opt_in() -> bool {
 /// more than one live, consumers get the routing provider — still one
 /// `Arc<dyn SandboxProvider>`, per ADR-010. Registration is passive: this
 /// probes, it never downloads or mutates the host.
+///
+/// ADR-055 phase 6: what is returned is the driver facade over these
+/// backends (see [`driver_facade`]), which serves every one of node 0's
+/// sandboxes.
+///
+/// When Firecracker is available, `workload_vm` receives the runtime driver
+/// that runs deployment replicas in microVMs (ADR-055 Phase 10), over the
+/// same provider instance, so sandboxes and replicas share one TAP pool and
+/// one rootfs cache lock.
 async fn build_sandbox_provider(
     docker_provider: Arc<DockerSandboxProvider>,
     docker: Arc<bollard::Docker>,
     settings: &temps_core::AgentSandboxSettings,
+    workload_vm: &mut Option<Arc<dyn temps_workload::RuntimeDriver>>,
 ) -> Arc<dyn SandboxProvider> {
     use crate::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};
     use crate::sandbox::routing::RoutingSandboxProvider;
@@ -204,9 +214,15 @@ async fn build_sandbox_provider(
 
     let firecracker = Arc::new(FirecrackerSandboxProvider::new(
         FirecrackerSandboxConfig::from_data_dir(data_dir.clone()),
-        docker,
+        docker.clone(),
     ));
     if firecracker.is_available().await {
+        *workload_vm = Some(Arc::new(
+            crate::sandbox::workload_vm::FirecrackerWorkloadDriver::new(
+                firecracker.clone(),
+                docker,
+            ),
+        ));
         backends.insert(SandboxBackend::Firecracker, firecracker);
     }
     if let Some(microsandbox) = microsandbox_provider(&data_dir) {
@@ -218,7 +234,12 @@ async fn build_sandbox_provider(
         backends.contains_key(&backend)
     });
     if backends.is_empty() {
-        return docker_provider;
+        let docker_provider: Arc<dyn SandboxProvider> = docker_provider;
+        return driver_facade(
+            docker_provider.clone(),
+            vec![(SandboxBackend::Docker, docker_provider)],
+            SandboxBackend::Docker,
+        );
     }
 
     backends.insert(SandboxBackend::Docker, docker_provider);
@@ -229,7 +250,38 @@ async fn build_sandbox_provider(
         available.join(", "),
         default
     );
-    Arc::new(RoutingSandboxProvider::new(backends, default))
+    let mut drivers: Vec<(SandboxBackend, Arc<dyn SandboxProvider>)> = backends
+        .iter()
+        .map(|(backend, provider)| (*backend, provider.clone()))
+        .collect();
+    drivers.sort_by_key(|(backend, _)| backend.to_string());
+    let product: Arc<dyn SandboxProvider> =
+        Arc::new(RoutingSandboxProvider::new(backends, default));
+    driver_facade(product, drivers, default)
+}
+
+/// Serve node 0's sandboxes through the driver facade (ADR-055 phase 6):
+/// each backend becomes a runtime driver, new sandboxes are placed by
+/// filtering those drivers on what the request needs, and every later call
+/// goes to the driver that owns the handle. `product` keeps the operations
+/// that are not about one sandbox (the sandbox image, the rootfs cache, the
+/// provider's name and availability).
+fn driver_facade(
+    product: Arc<dyn SandboxProvider>,
+    backends: Vec<(crate::sandbox::SandboxBackend, Arc<dyn SandboxProvider>)>,
+    default: crate::sandbox::SandboxBackend,
+) -> Arc<dyn SandboxProvider> {
+    use crate::sandbox::driver::SandboxBackendDriver;
+    use crate::sandbox::facade::DriverSandboxProvider;
+
+    let drivers: Vec<Arc<dyn temps_workload::SandboxExt>> = backends
+        .into_iter()
+        .map(|(backend, provider)| {
+            Arc::new(SandboxBackendDriver::new(backend, provider))
+                as Arc<dyn temps_workload::SandboxExt>
+        })
+        .collect();
+    Arc::new(DriverSandboxProvider::new(drivers, default, product))
 }
 
 /// Keep the guest agents each microVM backend injects in step with the ones
@@ -827,6 +879,7 @@ impl TempsPlugin for AgentsPlugin {
                 context.get_service::<temps_core::LocalWorkloadPolicy>(),
             );
             let local_workloads = workload_policy.local_workloads_enabled();
+            let mut workload_vm_driver: Option<Arc<dyn temps_workload::RuntimeDriver>> = None;
             // Only a process that runs workloads ever contacts the daemon.
             let docker = if local_workloads {
                 match bollard::Docker::connect_with_local_defaults() {
@@ -871,7 +924,13 @@ impl TempsPlugin for AgentsPlugin {
                     tracing::info!(
                         "Docker sandbox provider initialized (image built on demand at first agent run)"
                     );
-                    build_sandbox_provider(provider, docker, &global_sandbox).await
+                    build_sandbox_provider(
+                        provider,
+                        docker,
+                        &global_sandbox,
+                        &mut workload_vm_driver,
+                    )
+                    .await
                 }
                 (HostSandbox::NoLocal, _) => {
                     tracing::info!(
@@ -918,6 +977,18 @@ impl TempsPlugin for AgentsPlugin {
             // other plugins (e.g. workspace) can pick it up via the trait
             // without depending on temps-agents directly.
             context.register_service(sandbox_provider.clone());
+            // ADR-055 Phase 10: offered to the deployments plugin's workload
+            // plane, which runs `micro_vm` replicas on it. Absent when this
+            // host has no working Firecracker, and the plane then refuses
+            // such replicas with the reason.
+            if let Some(driver) = workload_vm_driver {
+                tracing::info!(
+                    "Firecracker is available: deployment replicas may request micro_vm isolation"
+                );
+                context.register_service(Arc::new(
+                    temps_deployments::services::plane_deployer::ControlPlaneMicroVmDriver(driver),
+                ));
+            }
 
             let sandbox_registry = Arc::new(if local_workloads {
                 SandboxRegistry::new(sandbox_provider)

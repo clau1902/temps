@@ -46,6 +46,13 @@ use tracing::{debug, error, info, warn};
 use utoipa::ToSchema;
 // use crate::routes::types::external_services::EnvironmentVariableInfo;
 use temps_core::EncryptionService;
+
+// ADR-055 Phase 4: per-database workload mode, pending changes, recreate
+// from the spec and the shadow pass.
+mod workload_ops;
+pub use workload_ops::{
+    RecreateOutcome, WorkloadModeChange, WorkloadModeStatus, SHADOW_BATCH, SHADOW_INTERVAL,
+};
 // Add these constants at the top of the file proper key management
 #[allow(dead_code)]
 const NONCE_LENGTH: usize = 12;
@@ -54,6 +61,34 @@ const NONCE_LENGTH: usize = 12;
 /// Keep control-plane connections on the same address: `localhost` may resolve
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
+
+/// The address the control plane dials to reach a cluster member's published
+/// port: the worker's data address for a member on a worker, the IPv4
+/// loopback for a member on the control plane.
+///
+/// Never the member's overlay `compute_ip`. The control plane is not on the
+/// workload overlay, so that address routes only between workloads; a monitor
+/// probe sent there times out, which left every worker-hosted cluster reading
+/// as Down with no known primary. Workers publish member ports on their data
+/// address, which is what this returns.
+pub(crate) async fn control_plane_member_dial_host<C: sea_orm::ConnectionTrait>(
+    db: &C,
+    node_id: Option<i32>,
+    container_name: &str,
+) -> Result<String, String> {
+    let Some(node_id) = node_id.filter(|id| *id != 0) else {
+        return Ok(LOCAL_CLUSTER_HOST.to_string());
+    };
+    match nodes::Entity::find_by_id(node_id).one(db).await {
+        Ok(Some(node)) => Ok(node.data_address().to_string()),
+        Ok(None) => Err(format!(
+            "node {node_id} of cluster member '{container_name}' was not found in the nodes table"
+        )),
+        Err(error) => Err(format!(
+            "failed to load node {node_id} of cluster member '{container_name}': {error}"
+        )),
+    }
+}
 
 /// Outcome of copying one managed S3 service's buckets into another.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1630,9 +1665,9 @@ pub struct ServiceMemberInfo {
     /// prefers this over `hostname` because it's the only path that
     /// reliably reaches the container from any node.
     pub compute_ip: Option<String>,
-    /// Most recent phase of the background add-member provisioning task,
-    /// when applicable. See `MemberProvisioningStep` for the canonical
-    /// step names. NULL for members not created through that flow.
+    /// Most recent provisioning phase, written by initial cluster creation
+    /// and by the add-member task. See `member_provisioning_step` for the
+    /// canonical names. NULL for members created before steps were recorded.
     pub provisioning_step: Option<String>,
     pub provisioning_error: Option<String>,
     /// Live FSM state from the pg_auto_failover monitor (`primary`,
@@ -2224,6 +2259,9 @@ pub mod member_provisioning_step {
     pub const RESOLVING_MONITOR: &str = "resolving_monitor";
     pub const INSERTING_ROW: &str = "inserting_row";
     pub const PROVISIONING_CONTAINER: &str = "provisioning_container";
+    /// Initial cluster creation only: the monitor's container is up and the
+    /// data nodes wait until it is ready to accept their registration.
+    pub const WAITING_FOR_HEALTH: &str = "waiting_for_health";
     pub const REGISTERING_DNS: &str = "registering_dns";
     pub const DONE: &str = "done";
     pub const FAILED: &str = "failed";
@@ -2234,9 +2272,28 @@ pub mod member_provisioning_step {
         RESOLVING_MONITOR,
         INSERTING_ROW,
         PROVISIONING_CONTAINER,
+        WAITING_FOR_HEALTH,
         REGISTERING_DNS,
         DONE,
     ];
+}
+
+/// Whether a cluster member's container is ready: running, and healthy when
+/// its image defines a health check. `health` is Docker's status in any of
+/// the spellings the agent and the local inspect produce (`healthy`,
+/// `HEALTHY`, `"healthy"`); `none` or an empty status means the image has no
+/// health check, so running is enough.
+fn member_container_ready(running: bool, health: Option<&str>) -> bool {
+    if !running {
+        return false;
+    }
+    match health {
+        None => true,
+        Some(status) => {
+            let status = status.trim().trim_matches('"').to_ascii_lowercase();
+            matches!(status.as_str(), "healthy" | "none" | "")
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -2627,6 +2684,11 @@ pub struct ExternalServiceManager {
             HashMap<i32, Arc<crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown>>,
         >,
     >,
+    /// The control plane's cluster resolver address (ADR-024), published by
+    /// the deployer's probe only while cluster DNS is enabled and the
+    /// resolver answers. Empty otherwise, and on processes that run no
+    /// resolver: local cluster members then keep Docker's embedded DNS.
+    cluster_dns_slot: temps_dns::OverlayDnsSlot,
 }
 
 impl ExternalServiceManager {
@@ -2709,6 +2771,7 @@ impl ExternalServiceManager {
             local_workloads_enabled: true,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -2729,7 +2792,28 @@ impl ExternalServiceManager {
             local_workloads_enabled,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
         }
+    }
+
+    /// Follow the control plane's cluster resolver slot, so local cluster
+    /// members resolve `*.temps.local` while the resolver is up.
+    pub fn with_cluster_dns_slot(mut self, slot: temps_dns::OverlayDnsSlot) -> Self {
+        self.cluster_dns_slot = slot;
+        self
+    }
+
+    /// Nameservers for a container this process creates: the cluster
+    /// resolver followed by the host's own servers, or `None` (Docker's
+    /// embedded DNS) while the resolver is not published.
+    fn cluster_dns_servers(&self) -> Option<Vec<String>> {
+        let resolver = match self.cluster_dns_slot.read() {
+            Ok(slot) => *slot,
+            Err(poisoned) => *poisoned.into_inner(),
+        }?;
+        Some(temps_dns_resolver::host_dns::dns_with_fallback(vec![
+            resolver.to_string(),
+        ]))
     }
 
     /// Stop every restore helper container that may still be writing into
@@ -6216,27 +6300,21 @@ impl ExternalServiceManager {
             }
         };
 
-        // Resolve the monitor host: prefer overlay IP, fall back to the
-        // node's underlay address, then the IPv4 loopback address. The monitor's host port
-        // is `service_id * 10 + 6000` for the dev cluster; in general
-        // `monitor.port` is what the lifecycle hook stored.
-        let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
-            ip.to_string()
-        } else if let Some(node_id) = monitor.node_id {
-            match nodes::Entity::find_by_id(node_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(n)) => n.data_address().to_string(),
-                _ => {
-                    return ClusterProbeResult::down(format!(
-                        "Monitor's node {} not found in nodes table",
-                        node_id
-                    ))
-                }
+        // `monitor.port` is the host port the lifecycle hook published.
+        let monitor_host = match control_plane_member_dial_host(
+            self.db.as_ref(),
+            monitor.node_id,
+            &monitor.container_name,
+        )
+        .await
+        {
+            Ok(host) => host,
+            Err(reason) => {
+                return ClusterProbeResult::down(format!(
+                    "Cannot reach the monitor of cluster service {}: {reason}",
+                    service.id
+                ))
             }
-        } else {
-            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -6412,29 +6490,26 @@ impl ExternalServiceManager {
             }
         };
 
-        let monitor_host: String = if let Some(ip) = monitor.compute_ip.as_deref() {
-            ip.to_string()
-        } else if let Some(node_id) = monitor.node_id {
-            match nodes::Entity::find_by_id(node_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(n)) => n.data_address().to_string(),
-                _ => {
-                    return ClusterHealthReport {
-                        configured_standbys: 0,
-                        checked_at: chrono::Utc::now(),
-                        monitor_response_ms: 0,
-                        members: vec![],
-                        monitor_error: Some(format!(
-                            "Monitor's node {} not found in nodes table",
-                            node_id
-                        )),
-                    };
-                }
+        let monitor_host = match control_plane_member_dial_host(
+            self.db.as_ref(),
+            monitor.node_id,
+            &monitor.container_name,
+        )
+        .await
+        {
+            Ok(host) => host,
+            Err(reason) => {
+                return ClusterHealthReport {
+                    configured_standbys: 0,
+                    checked_at: chrono::Utc::now(),
+                    monitor_response_ms: 0,
+                    members: vec![],
+                    monitor_error: Some(format!(
+                        "Cannot reach the monitor of cluster service {}: {reason}",
+                        service.id
+                    )),
+                };
             }
-        } else {
-            LOCAL_CLUSTER_HOST.to_string()
         };
         let monitor_port = monitor.port.unwrap_or(5432);
 
@@ -7660,6 +7735,45 @@ echo "[restore] Pre-seed complete"
         }
     }
 
+    /// Whether `container_name` runs on worker `node_id`, asked of that
+    /// node's agent (the container is not on this host's Docker).
+    pub async fn worker_service_running(
+        &self,
+        node_id: i32,
+        container_name: &str,
+    ) -> Result<bool, ExternalServiceError> {
+        let client = self.get_remote_client(node_id).await?;
+        let status = client.service_status(container_name).await?;
+        Ok(status.running)
+    }
+
+    /// Run `command` inside `container_name` on worker `node_id` through its
+    /// agent and return the exit code.
+    pub async fn exec_in_worker_service(
+        &self,
+        node_id: i32,
+        container_name: &str,
+        command: Vec<String>,
+    ) -> Result<i64, ExternalServiceError> {
+        let client = self.get_remote_client(node_id).await?;
+        let result = client
+            .exec_in_service(crate::remote_service_client::RemoteExecParams {
+                container_name: container_name.to_string(),
+                command,
+                environment: HashMap::new(),
+                user: None,
+                detach: false,
+            })
+            .await
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Remote exec failed in '{}' on node {}: {}",
+                    container_name, node_id, e
+                ),
+            })?;
+        Ok(result.exit_code)
+    }
+
     /// Get the primary data node's connection address for a cluster service.
     ///
     /// Returns `Some((host, port))` if the service is a cluster with a running primary.
@@ -8864,13 +8978,25 @@ echo "[restore] Pre-seed complete"
             );
         }
 
-        // Create the container on the remote node
-        let response = client.create_service(create_params).await.map_err(|e| {
-            ExternalServiceError::InitializationFailed {
-                id: service_id,
-                reason: format!("Remote agent create_service failed: {}", e),
-            }
-        })?;
+        // Create the container on the remote node. A database in `enforce`
+        // mode (ADR-055 Phase 4) is created from its admitted workload spec
+        // through the agent's Docker driver; every other service sends the
+        // agent's own request exactly as before.
+        let response = if service.workload_mode.creates_from_spec() {
+            self.create_remote_from_workload_spec(service, &client, &create_params)
+                .await
+                .map_err(|e| ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!("Remote agent create from workload spec failed: {}", e),
+                })?
+        } else {
+            client.create_service(create_params).await.map_err(|e| {
+                ExternalServiceError::InitializationFailed {
+                    id: service_id,
+                    reason: format!("Remote agent create_service failed: {}", e),
+                }
+            })?
+        };
 
         info!(
             "Service {} created on node {} — container {} (port {})",
@@ -9335,6 +9461,8 @@ echo "[restore] Pre-seed complete"
             node_id: Option<i32>,
         }
         let mut created_members: Vec<CreatedMember> = Vec::new();
+        // The member being worked on, so a failure is recorded on its row.
+        let mut current_member_id: Option<i32> = None;
 
         // Create each member container (in order: monitor first, then data nodes)
         let create_result: Result<(), ExternalServiceError> = async {
@@ -9368,9 +9496,14 @@ echo "[restore] Pre-seed complete"
                     )?;
                     let mut active: service_members::ActiveModel = existing.into();
                     active.status = Set("creating".to_string());
+                    active.provisioning_step = Set(Some(
+                        member_provisioning_step::PROVISIONING_CONTAINER.to_string(),
+                    ));
+                    active.provisioning_error = Set(None);
                     active.updated_at = Set(Utc::now());
                     active.update(self.db.as_ref()).await?
                 };
+                current_member_id = Some(member_model.id);
 
                 // Assign port: monitor gets base_port, data nodes get base + ordinal
                 // Reserved (and validated against the block) with the rows.
@@ -9496,12 +9629,24 @@ echo "[restore] Pre-seed complete"
                         "Waiting for monitor '{}' to become healthy...",
                         result.container_name
                     );
-                    self.wait_for_container_health(&result.container_name, 60)
-                        .await
-                        .map_err(|e| ExternalServiceError::InitializationFailed {
+                    self.claim_provisioning_step(
+                        member_model.id,
+                        member_provisioning_step::WAITING_FOR_HEALTH,
+                    )
+                    .await?;
+                    self.wait_for_member_ready(
+                        service_id,
+                        spec.node_id,
+                        &result.container_name,
+                        60,
+                    )
+                    .await
+                    .map_err(|e| {
+                        ExternalServiceError::InitializationFailed {
                             id: service_id,
                             reason: format!("Monitor failed health check: {}", e),
-                        })?;
+                        }
+                    })?;
                 }
 
                 // Compute the FQDN for this member (ADR-011). Registered in the
@@ -9534,6 +9679,8 @@ echo "[restore] Pre-seed complete"
                 member_update.container_id = Set(Some(container_id));
                 member_update.port = Set(host_port);
                 member_update.status = Set("running".to_string());
+                member_update.provisioning_step =
+                    Set(Some(member_provisioning_step::REGISTERING_DNS.to_string()));
                 member_update.hostname = Set(Some(member_hostname));
                 member_update.compute_ip = Set(compute_ip.clone());
                 member_update.updated_at = Set(Utc::now());
@@ -9597,6 +9744,8 @@ echo "[restore] Pre-seed complete"
                         );
                     }
                 }
+                self.claim_provisioning_step(member_id, member_provisioning_step::DONE)
+                    .await?;
             }
             Ok(())
         }
@@ -9608,6 +9757,32 @@ echo "[restore] Pre-seed complete"
                 "Cluster member creation failed for service {}: {}. Rolling back {} created container(s).",
                 service_id, e, created_members.len()
             );
+
+            // Say which member failed and why, on its own row, so the console
+            // shows the reason next to it rather than only on the service.
+            if let Some(member_id) = current_member_id {
+                if let Err(db_err) = service_members::Entity::update_many()
+                    .col_expr(
+                        service_members::Column::ProvisioningStep,
+                        Expr::value(member_provisioning_step::FAILED),
+                    )
+                    .col_expr(
+                        service_members::Column::ProvisioningError,
+                        Expr::value(e.to_string()),
+                    )
+                    .col_expr(service_members::Column::UpdatedAt, Expr::value(Utc::now()))
+                    .filter(service_members::Column::Id.eq(member_id))
+                    .exec(self.db.as_ref())
+                    .await
+                {
+                    error!(
+                        service_id,
+                        member_id,
+                        "Failed to record the cluster member's provisioning error: {}",
+                        db_err
+                    );
+                }
+            }
 
             for member in &created_members {
                 if let Some(node_id) = member.node_id {
@@ -11826,58 +12001,6 @@ echo "[restore] Pre-seed complete"
         ))
     }
 
-    /// Look up the gateway IP of the multi-host overlay docker network
-    /// (`temps0`). The per-host Hickory resolver listens there on :53 —
-    /// every container we create gets it as `--dns` so they can resolve
-    /// `*.temps.local` natively (ADR-011).
-    ///
-    /// Returns `None` when the overlay isn't bootstrapped on this host
-    /// (single-host setups). Callers fall back to Docker's default DNS
-    /// in that case.
-    async fn lookup_overlay_bridge_gateway(&self) -> Option<Vec<String>> {
-        // The overlay this process reconciles (`temps0` unless the cluster
-        // names another, ADR 059). If it does not exist on this host, the
-        // fallback (None → no DNS) keeps clusters functional, just without
-        // FQDN resolution inside containers.
-        let overlay_network = temps_network::overlay_name::current().docker_network;
-
-        let docker = match self.docker.get() {
-            Some(d) => d,
-            None => return None,
-        };
-        let inspected = match docker
-            .inspect_network(
-                &overlay_network,
-                None::<bollard::query_parameters::InspectNetworkOptions>,
-            )
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => {
-                debug!(
-                    error = %e,
-                    network = %overlay_network,
-                    "Overlay docker network not present; skipping DNS injection"
-                );
-                return None;
-            }
-        };
-
-        // The IPAM config has the gateway we set when creating the
-        // network in `temps-network/src/docker.rs`.
-        let gateway = inspected
-            .ipam
-            .as_ref()
-            .and_then(|ipam| ipam.config.as_ref())
-            .and_then(|configs| {
-                configs
-                    .iter()
-                    .find_map(|c| c.gateway.as_deref().filter(|s| !s.is_empty()))
-            });
-
-        gateway.map(|gw| vec![gw.to_string()])
-    }
-
     /// Create a cluster member container on the local Docker daemon.
     ///
     /// Returns `(container_id, host_port, compute_ip)`:
@@ -11945,14 +12068,11 @@ echo "[restore] Pre-seed complete"
             );
         }
 
-        // Wire the per-host Hickory resolver into the container's
-        // resolv.conf so it can resolve `*.temps.local` natively
-        // (ADR-011). The resolver listens on the bridge gateway IP of
-        // the multi-host overlay (`temps0`); we look that up by
-        // inspecting the network. Fails open: if the overlay isn't up
-        // yet (single-host setups) we just don't set `dns` and fall
-        // back to Docker's default resolver.
-        let dns_servers = self.lookup_overlay_bridge_gateway().await;
+        // The control plane's cluster resolver, so the member resolves
+        // `*.temps.local` (ADR-024), with the host's servers after it. Only
+        // while cluster DNS is enabled and the resolver answers; otherwise
+        // Docker's embedded DNS, as for every other container here.
+        let dns_servers = self.cluster_dns_servers();
 
         // Create container
         let mut cluster_host_config = HostConfig {
@@ -12110,58 +12230,93 @@ echo "[restore] Pre-seed complete"
         Ok((response.id, host_port, compute_ip))
     }
 
-    /// Wait for a container to become healthy (Docker health check).
-    async fn wait_for_container_health(
+    /// Wait until a cluster member's container is running and, when its
+    /// image defines a health check, healthy.
+    ///
+    /// A member on a worker is asked about through that worker's agent: the
+    /// control plane's own Docker daemon does not have the container, so
+    /// inspecting it locally never succeeds and the wait only ever timed
+    /// out. The timeout error carries the last state seen, so the operator
+    /// learns whether the container never started, kept restarting or stayed
+    /// unhealthy.
+    async fn wait_for_member_ready(
         &self,
+        service_id: i32,
+        node_id: Option<i32>,
         container_name: &str,
         timeout_secs: u64,
     ) -> Result<(), ExternalServiceError> {
         use bollard::query_parameters::InspectContainerOptions;
         use std::time::{Duration, Instant};
 
-        let docker = self.require_docker()?;
+        let remote = match node_id {
+            Some(node_id) => Some((node_id, self.get_remote_client(node_id).await?)),
+            None => None,
+        };
+        let docker = match remote {
+            Some(_) => None,
+            None => Some(self.require_docker()?),
+        };
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
+        let mut last_state: String;
 
         loop {
+            let observed = match (&remote, &docker) {
+                (Some((_, client)), _) => match client.service_status(container_name).await {
+                    Ok(status) => Ok((status.running, status.health)),
+                    Err(e) => Err(format!("status check failed: {}", e)),
+                },
+                (None, Some(docker)) => {
+                    match docker
+                        .inspect_container(container_name, None::<InspectContainerOptions>)
+                        .await
+                    {
+                        Ok(info) => {
+                            let state = info.state.as_ref();
+                            Ok((
+                                state.and_then(|s| s.running).unwrap_or(false),
+                                state
+                                    .and_then(|s| s.health.as_ref())
+                                    .and_then(|h| h.status.as_ref())
+                                    .map(|s| s.to_string()),
+                            ))
+                        }
+                        Err(e) => Err(format!("inspect failed: {}", e)),
+                    }
+                }
+                (None, None) => Err("no Docker client".to_string()),
+            };
+
+            match observed {
+                Ok((running, health)) => {
+                    if member_container_ready(running, health.as_deref()) {
+                        return Ok(());
+                    }
+                    last_state = format!(
+                        "running: {}, health: {}",
+                        running,
+                        health.as_deref().unwrap_or("none")
+                    );
+                }
+                Err(reason) => last_state = reason,
+            }
+
             if start.elapsed() > timeout {
+                let place = match &remote {
+                    Some((node_id, _)) => format!("on node {}", node_id),
+                    None => "on the control plane".to_string(),
+                };
                 return Err(ExternalServiceError::InitializationFailed {
-                    id: 0,
+                    id: service_id,
                     reason: format!(
-                        "Container {} did not become healthy within {}s",
-                        container_name, timeout_secs
+                        "Container {} {} did not become ready within {}s (last state: {})",
+                        container_name, place, timeout_secs, last_state
                     ),
                 });
             }
 
-            if let Ok(info) = docker
-                .inspect_container(container_name, None::<InspectContainerOptions>)
-                .await
-            {
-                let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
-
-                if running {
-                    // Check if container has a healthcheck and if it's healthy
-                    let health_status = info
-                        .state
-                        .as_ref()
-                        .and_then(|s| s.health.as_ref())
-                        .and_then(|h| h.status.as_ref())
-                        .map(|s| format!("{:?}", s));
-
-                    match health_status.as_deref() {
-                        Some("\"HEALTHY\"") | Some("Healthy") => return Ok(()),
-                        None => {
-                            // No healthcheck defined — just check if running
-                            return Ok(());
-                        }
-                        _ => {} // Still starting or unhealthy — keep waiting
-                    }
-                }
-            }
-            // Container not found or not running yet — keep waiting
-
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
     }
 
@@ -18210,6 +18365,27 @@ mod tests {
     /// experimental, off-by-default `cluster_dns.enabled` resolver wiring
     /// is on, which broke every single-host cluster by default before this
     /// fix).
+    /// The agent reports Docker's health with `{:?}` (`HEALTHY`), the local
+    /// inspect with `Display` (`healthy`); both must count as ready, and a
+    /// member without a health check is ready once it runs.
+    #[test]
+    fn member_container_ready_accepts_every_health_spelling() {
+        assert!(member_container_ready(true, None));
+        assert!(member_container_ready(true, Some("HEALTHY")));
+        assert!(member_container_ready(true, Some("healthy")));
+        assert!(member_container_ready(true, Some("\"HEALTHY\"")));
+        assert!(member_container_ready(true, Some("NONE")));
+        assert!(member_container_ready(true, Some("")));
+    }
+
+    #[test]
+    fn member_container_ready_waits_for_start_and_health() {
+        assert!(!member_container_ready(false, None));
+        assert!(!member_container_ready(false, Some("HEALTHY")));
+        assert!(!member_container_ready(true, Some("STARTING")));
+        assert!(!member_container_ready(true, Some("unhealthy")));
+    }
+
     #[test]
     fn resolve_member_hostname_prefers_fqdn_only_when_cluster_spans_hosts() {
         assert_eq!(
@@ -18374,6 +18550,8 @@ mod tests {
             shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -18886,6 +19064,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -19160,6 +19339,58 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn control_plane_dials_a_worker_member_on_its_data_address_not_its_overlay_ip() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![nodes_test_model(2)]])
+            .into_connection();
+        let mut monitor = service_member_model(1, 0, "monitor");
+        monitor.node_id = Some(2);
+        monitor.compute_ip = Some("172.20.1.3".to_string());
+
+        let host = control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+            .await
+            .unwrap();
+
+        assert_eq!(host, "10.0.0.2");
+    }
+
+    #[tokio::test]
+    async fn control_plane_dials_its_own_members_on_loopback() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let mut monitor = service_member_model(1, 0, "monitor");
+        monitor.compute_ip = Some("172.18.0.5".to_string());
+        assert_eq!(
+            control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+                .await
+                .unwrap(),
+            LOCAL_CLUSTER_HOST
+        );
+        monitor.node_id = Some(0);
+        assert_eq!(
+            control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+                .await
+                .unwrap(),
+            LOCAL_CLUSTER_HOST
+        );
+    }
+
+    #[tokio::test]
+    async fn control_plane_member_dial_host_names_a_missing_node() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([Vec::<nodes::Model>::new()])
+            .into_connection();
+        let mut monitor = service_member_model(1, 0, "monitor");
+        monitor.node_id = Some(9);
+
+        let reason = control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
+            .await
+            .unwrap_err();
+
+        assert!(reason.contains("node 9"), "{reason}");
+        assert!(reason.contains("cluster-member-0"), "{reason}");
+    }
+
     fn nodes_test_model(id: i32) -> nodes::Model {
         nodes::Model {
             id,
@@ -19189,6 +19420,7 @@ mod tests {
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -22698,6 +22930,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         }
@@ -25916,6 +26149,7 @@ mod tests {
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
         }
