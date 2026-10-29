@@ -58,6 +58,9 @@ use super::compute::{
     AddressInput, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts, Resolution,
     ServeEntryState, ServiceHostsState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
 };
+use super::edge_rules::{
+    self, EdgeRuleCreated, EdgeRuleError, EdgeRulePurpose, EdgeRuleSeen, HttpPolicy,
+};
 use super::model::{
     AccessBinding, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
     DecideRequest, DnsRecordState, EnvironmentReachability, GateAllowList, GateKind, Intent,
@@ -69,18 +72,18 @@ use super::plan::{
     access_choice, access_policy_answer, AccessChoice, AccessProviderFact, FIELD_ACCESS_PROVIDER,
 };
 use super::plan::{
-    address_for_audience, choice, environment_hosts_tunnel, fingerprint, gate_allow_answer,
-    guess_zone, http01_direct, plan, planned_record, private_worker, record_type_of,
-    records_to_read, service_of, service_tag, service_worker, tunnel_domain_for, tunnel_route,
-    unique_tunnel_name, zone_for, NamedId, PlanFacts, PrivateWorkerFact, ServeEntryFact,
-    ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact, ZoneFact, FIELD_ADDRESS,
-    FIELD_DNS_PROVIDER, FIELD_TOKEN,
+    address_for_audience, choice, chosen_http_policy, environment_hosts_tunnel, fingerprint,
+    gate_allow_answer, guess_zone, http01_direct, place_http_policy_steps, plan, planned_record,
+    private_worker, record_type_of, records_to_read, service_of, service_tag, service_worker,
+    tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts,
+    PrivateWorkerFact, ServeEntryFact, ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact,
+    ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_HTTP_POLICY, FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
-    AccessRun, NewTunnel, RunInput, RunOps, RunRecord, RunSink, ServeClaim, ServeEntryStatus,
-    ServeRelease, ServeTarget, ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, Stop,
-    Timing, TunnelStatus, WriteError, ZoneState,
+    AccessRun, EdgeRuleAt, EdgeRuleMade, NewTunnel, RunInput, RunOps, RunRecord, RunSink,
+    ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget, ServeWish, ServiceDeletion,
+    ServiceEntryHost, ServicePlan, Stop, Timing, TunnelStatus, WriteError, ZoneState,
 };
 use super::serve_entries;
 use super::token_check::{
@@ -420,8 +423,21 @@ impl ReachabilityService {
         let db = self.deps.db.as_ref();
         let id = row.id;
         let was = RunState::parse(&row.state);
-        let mut journal: Vec<JournalEntry> =
-            serde_json::from_value(row.journal.clone()).unwrap_or_default();
+        // A journal or step list this Temps cannot read in full (a newer
+        // one wrote it, then was rolled back) is left exactly as it is:
+        // reconciling the part it reads and saving that would drop the rest.
+        let mut journal = match journal_to_recover(&row) {
+            Ok(journal) => journal,
+            Err(error) => {
+                warn!(
+                    run_id = id,
+                    %error,
+                    "a reachability run was written by a newer Temps; leaving it untouched \
+                     for that version to recover"
+                );
+                return;
+            }
+        };
         let mut active: reachability_runs::ActiveModel = row.clone().into();
         if was != RunState::Recovering {
             active.state = Set(RunState::Recovering.as_str().to_string());
@@ -1108,7 +1124,42 @@ impl ReachabilityService {
                 *verdict = super::gate_check::judged(verdict.clone(), probe);
             }
         }
+        // ADR 070 D4: what a tunnel address answers on plain HTTP, against
+        // what the user chose for it.
+        let policies = self.http_policies(&hosts).await;
+        for verdict in &mut verdicts {
+            if super::http_check::applies(verdict) {
+                let policy = policies.get(&verdict.address).copied();
+                let probe = if super::http_check::wants_probe(policy) {
+                    Some(super::http_check::probe(&verdict.address).await)
+                } else {
+                    None
+                };
+                *verdict = super::http_check::judged(verdict.clone(), policy, probe);
+            }
+        }
         verdicts
+    }
+
+    /// The recorded HTTPS-only choice of each of `hosts` that has one
+    /// (ADR 070).
+    pub(super) async fn http_policies(&self, hosts: &[String]) -> HashMap<String, HttpPolicy> {
+        project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.is_in(hosts.iter().cloned()))
+            .all(self.deps.db.as_ref())
+            .await
+            .unwrap_or_else(|e| {
+                // Read as never chosen: the check then only adds a gentle
+                // note, and a plan offers HTTPS only, the default.
+                warn!("could not read the HTTPS-only choices of {hosts:?}: {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .filter_map(|row| {
+                let policy = row.http_policy.as_deref().and_then(HttpPolicy::parse)?;
+                Some((row.domain, policy))
+            })
+            .collect()
     }
 
     /// The gate of each of `hosts` that is a signed-in address, with the
@@ -1459,6 +1510,12 @@ impl ReachabilityService {
             .iter()
             .map(|a| a.address.clone())
             .collect();
+        // ADR 070: a re-run offers the HTTPS-only choice the address keeps.
+        let http_policies = {
+            let mut hosts = attached_here.clone();
+            hosts.extend(requested.iter().cloned());
+            self.http_policies(&hosts).await
+        };
         let taken_elsewhere = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::EnvironmentId.ne(scope.environment.id))
             .all(db)
@@ -1531,6 +1588,7 @@ impl ReachabilityService {
             principals_now: Vec::new(),
             identity_workers,
             environment_host_label: Some(self.environment_host_label(scope).await?),
+            http_policies,
         };
         let mut dns_records = Vec::new();
         let mut access_providers = Vec::new();
@@ -1956,7 +2014,16 @@ impl ReachabilityService {
                 .clone()
                 .filter(|e| !e.trim().is_empty())
                 .or(user_email),
+            http_policy: None,
         };
+        // ADR 070 D1: the rules the chosen policy wants, and nothing when
+        // the user chose to also answer plain HTTP.
+        if let Some(policy) = chosen_http_policy(option, text(FIELD_HTTP_POLICY).as_deref())
+            .map_err(ReachabilityError::Validation)?
+        {
+            place_http_policy_steps(&mut input.steps, &address, policy);
+            input.http_policy = Some(policy);
+        }
         match option.kind {
             PlanOptionKind::ExistingTunnel => {
                 let route = tunnel_route(&facts, &address).ok_or_else(|| {
@@ -2607,7 +2674,7 @@ impl ReachabilityService {
                 ))
             }
         }
-        let record = record_of(&row);
+        let record = record_to_change(&row)?;
         if record.has_pending() {
             return Err(ReachabilityError::Conflict(RECOVERING.into()));
         }
@@ -2785,7 +2852,7 @@ impl ReachabilityService {
     ) -> Result<RunView, ReachabilityError> {
         let row = self.find_run(project_id, environment_id, run_id).await?;
         let state = RunState::parse(&row.state);
-        let record = record_of(&row);
+        let record = record_to_change(&row)?;
         if state == RunState::Recovering || record.has_pending() {
             return Err(ReachabilityError::Conflict(RECOVERING.into()));
         }
@@ -2911,7 +2978,7 @@ impl ReachabilityService {
                 ))
             }
         };
-        let mut record = record_of(&row);
+        let mut record = record_to_change(&row)?;
         decide(&mut record.journal, &request.key, request.decision, undoing)
             .map_err(ReachabilityError::Validation)?;
         let left = record.conflicts().len();
@@ -2967,7 +3034,46 @@ impl ReachabilityService {
     }
 }
 
-/// The run's progress as stored.
+/// The run's journal exactly as stored, or why this Temps cannot read all
+/// of it: an entry a newer Temps wrote (an edge rule, say, after rolling
+/// back) fails the whole list.
+fn stored_journal(journal: &Value) -> Result<Vec<JournalEntry>, String> {
+    serde_json::from_value(journal.clone()).map_err(|e| e.to_string())
+}
+
+/// The run's progress, for a change that writes it back. A journal or step
+/// list this Temps cannot read in full is refused, never replaced by an
+/// empty one: that would lose what undo needs to remove what the run made.
+fn record_to_change(row: &reachability_runs::Model) -> Result<RunRecord, ReachabilityError> {
+    let unreadable = |what: &str, error: String| {
+        ReachabilityError::Conflict(format!(
+            "This run's {what} was written by a newer version of Temps, and this one cannot \
+             read all of it ({error}). Nothing was changed: upgrade Temps again to resume, \
+             undo or decide on this run."
+        ))
+    };
+    let journal = stored_journal(&row.journal).map_err(|e| unreadable("journal", e))?;
+    let steps = serde_json::from_value::<Vec<RunStep>>(row.steps.clone())
+        .map_err(|e| unreadable("step list", e.to_string()))?;
+    Ok(RunRecord {
+        journal,
+        steps,
+        ..record_of(row)
+    })
+}
+
+/// The journal recovery reconciles, or why it must leave the run alone:
+/// it reads the whole record first, as every change does, so a journal or
+/// step list this Temps cannot read in full is neither marked recovering
+/// nor written back.
+fn journal_to_recover(
+    row: &reachability_runs::Model,
+) -> Result<Vec<JournalEntry>, ReachabilityError> {
+    record_to_change(row).map(|record| record.journal)
+}
+
+/// The run's progress as stored, for showing it: what does not decode
+/// reads as empty. Use [`record_to_change`] before writing any of it back.
 fn record_of(row: &reachability_runs::Model) -> RunRecord {
     RunRecord {
         state: RunState::parse(&row.state),
@@ -3329,6 +3435,14 @@ impl RunOps for LiveOps {
             // Looked up by its marker (run.rs `look`).
             Intent::TailscaleService { .. } => {
                 return Err("Tailscale Services are looked up by their marker.".to_string())
+            }
+            // Looked up by this run's reference (run.rs `look`).
+            Intent::EdgeRule { .. } => {
+                return Err("Cloudflare rules are looked up by their reference.".to_string())
+            }
+            // Looked up on the address's column (run.rs `look`).
+            Intent::HttpPolicy { .. } => {
+                return Err("A recorded choice is looked up on the address.".to_string())
             }
             Intent::EnvironmentHosts { connector_id, name } => self
                 .environment_hosts(*connector_id)
@@ -3824,6 +3938,7 @@ impl RunOps for LiveOps {
                 action: None,
                 network: None,
                 nothing_set_up: false,
+                findings: Vec::new(),
             })
     }
 
@@ -3835,6 +3950,24 @@ impl RunOps for LiveOps {
             .await
             .map(Some)
             .map_err(text)
+    }
+
+    async fn http_policy(&self, host: &str) -> Result<Option<Option<HttpPolicy>>, String> {
+        Ok(self
+            .own_address(host)
+            .await?
+            .map(|row| row.http_policy.as_deref().and_then(HttpPolicy::parse)))
+    }
+
+    async fn set_http_policy(&self, host: &str, policy: Option<HttpPolicy>) -> Result<(), String> {
+        let row = self
+            .own_address(host)
+            .await?
+            .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
+        let mut active: project_custom_domains::ActiveModel = row.into();
+        active.http_policy = Set(policy.map(|p| p.as_str().to_string()));
+        active.update(self.deps.db.as_ref()).await.map_err(text)?;
+        Ok(())
     }
 
     async fn set_address_audience(
@@ -4137,8 +4270,181 @@ impl RunOps for LiveOps {
         Ok(ServiceDeletion::Deleted)
     }
 
+    async fn create_edge_rule(
+        &self,
+        run_id: i32,
+        connector_id: Option<i32>,
+        host: &str,
+        purpose: EdgeRulePurpose,
+    ) -> Result<EdgeRuleMade, EdgeRuleError> {
+        let refused = |message: String| EdgeRuleError {
+            message,
+            missing_permission: None,
+            provider: None,
+            maybe_applied: false,
+        };
+        let (provider_id, provider_name, token) = self
+            .edge_credentials(connector_id, host)
+            .await
+            .map_err(refused)?;
+        let with_provider = |mut error: EdgeRuleError| {
+            error.provider = Some(provider_name.clone());
+            error
+        };
+        let reference = self.edge_rule_ref(run_id, purpose).await.map_err(refused)?;
+        let (zone, zone_id) = edge_rules::find_zone(&self.http, &token, host)
+            .await
+            .map_err(with_provider)?
+            .ok_or_else(|| {
+                with_provider(refused(format!(
+                    "The token cannot see the Cloudflare zone of {host}."
+                )))
+            })?;
+        if let Some(why) = edge_rules::rule_refusal(host, &zone, purpose) {
+            return Err(with_provider(refused(why)));
+        }
+        let made = edge_rules::add_rule(&self.http, &token, &zone_id, purpose, host, &reference)
+            .await
+            .map_err(with_provider)?;
+        Ok(match made {
+            EdgeRuleCreated::Created {
+                ruleset_id,
+                rule_id,
+                expression,
+            } => {
+                info!(run = run_id, host, %zone, rule = %rule_id, ?purpose, "added a Cloudflare edge rule");
+                EdgeRuleMade::Created(Box::new(RunResource::EdgeRule {
+                    hostname: host.to_string(),
+                    purpose,
+                    provider_id,
+                    zone,
+                    zone_id,
+                    ruleset_id,
+                    rule_id,
+                    expression,
+                }))
+            }
+            EdgeRuleCreated::AlreadyThere { description } => {
+                EdgeRuleMade::AlreadyThere(description)
+            }
+        })
+    }
+
+    async fn find_edge_rule(
+        &self,
+        run_id: i32,
+        connector_id: Option<i32>,
+        host: &str,
+        purpose: EdgeRulePurpose,
+    ) -> Result<Option<RunResource>, String> {
+        let (provider_id, _, token) = self.edge_credentials(connector_id, host).await?;
+        let reference = self.edge_rule_ref(run_id, purpose).await?;
+        let Some((zone, zone_id)) = edge_rules::find_zone(&self.http, &token, host)
+            .await
+            .map_err(|e| e.message)?
+        else {
+            return Ok(None);
+        };
+        Ok(
+            edge_rules::find_rule(&self.http, &token, &zone_id, purpose, &reference)
+                .await?
+                .map(|(ruleset_id, rule)| RunResource::EdgeRule {
+                    hostname: host.to_string(),
+                    purpose,
+                    provider_id,
+                    zone,
+                    zone_id,
+                    ruleset_id,
+                    rule_id: rule.id,
+                    expression: rule.expression,
+                }),
+        )
+    }
+
+    async fn edge_rule(&self, rule: &EdgeRuleAt) -> Result<Option<EdgeRuleSeen>, String> {
+        let token = self.provider_token(rule.provider_id).await?;
+        edge_rules::read_rule(
+            &self.http,
+            &token,
+            &rule.zone_id,
+            &rule.ruleset_id,
+            &rule.rule_id,
+        )
+        .await
+    }
+
+    async fn delete_edge_rule(&self, rule: &EdgeRuleAt) -> Result<(), String> {
+        let token = self.provider_token(rule.provider_id).await?;
+        edge_rules::delete_rule(
+            &self.http,
+            &token,
+            &rule.zone_id,
+            &rule.ruleset_id,
+            &rule.rule_id,
+        )
+        .await
+    }
+
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
+    }
+}
+
+impl LiveOps {
+    /// The Cloudflare token a run's edge rules for `host` use (ADR 070):
+    /// the tunnel's DNS provider's, else the provider managing the zone.
+    async fn edge_credentials(
+        &self,
+        connector_id: Option<i32>,
+        host: &str,
+    ) -> Result<(i32, String, String), String> {
+        let from_connector = match connector_id {
+            Some(id) => ingress_connectors::Entity::find_by_id(id)
+                .one(self.deps.db.as_ref())
+                .await
+                .map_err(text)?
+                .and_then(|c| c.dns_provider_id),
+            None => None,
+        };
+        let provider = match from_connector {
+            Some(id) => self.deps.dns_providers.get(id).await.map_err(text)?,
+            None => {
+                self.deps
+                    .dns_providers
+                    .find_provider_for_domain(host)
+                    .await
+                    .map_err(text)?
+                    .ok_or_else(|| {
+                        format!("No Cloudflare DNS provider in Temps manages the zone of {host}.")
+                    })?
+                    .0
+            }
+        };
+        let credentials = self
+            .deps
+            .dns_providers
+            .cloudflare_credentials(&provider)
+            .map_err(text)?;
+        Ok((provider.id, provider.name, credentials.api_token))
+    }
+
+    async fn provider_token(&self, provider_id: i32) -> Result<String, String> {
+        let provider = self
+            .deps
+            .dns_providers
+            .get(provider_id)
+            .await
+            .map_err(text)?;
+        self.deps
+            .dns_providers
+            .cloudflare_credentials(&provider)
+            .map(|c| c.api_token)
+            .map_err(text)
+    }
+
+    async fn edge_rule_ref(&self, run_id: i32, purpose: EdgeRulePurpose) -> Result<String, String> {
+        let install = self.deps.records.instance_id().await.map_err(text)?;
+        Ok(edge_rules::rule_ref(&install, run_id, purpose))
     }
 }
 
@@ -4749,6 +5055,72 @@ impl TunnelMoveGuard for WaysIn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_row(journal: Value, steps: Value) -> reachability_runs::Model {
+        let now = Utc::now();
+        reachability_runs::Model {
+            id: 7,
+            project_id: Some(1),
+            environment_id: Some(1),
+            kind: "apply".into(),
+            audience: "public".into(),
+            address: Some("app.example.com".into()),
+            option: "tunnel".into(),
+            plan_id: None,
+            state: "interrupted".into(),
+            steps,
+            journal,
+            context: serde_json::json!({}),
+            undo: None,
+            error: None,
+            live_url: None,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+        }
+    }
+
+    /// A journal or step list a newer Temps wrote is refused before
+    /// anything is written back, never read as empty and saved.
+    #[test]
+    fn a_run_a_newer_temps_wrote_is_refused_not_emptied() {
+        let unknown = serde_json::json!([{
+            "key": "run7/future/app.example.com",
+            "intent": { "type": "a_future_intent", "hostname": "app.example.com" },
+            "state": "done"
+        }]);
+        assert!(stored_journal(&unknown).is_err());
+        let row = run_row(unknown.clone(), serde_json::json!([]));
+        // Shown, it reads as empty; changed, it is refused.
+        assert!(record_of(&row).journal.is_empty());
+        let error = record_to_change(&row).expect_err("refused");
+        assert!(
+            matches!(&error, ReachabilityError::Conflict(m) if m.contains("newer version of Temps")),
+            "{error}"
+        );
+        let steps =
+            serde_json::json!([{ "kind": "a_future_step", "label": "x", "status": "done" }]);
+        assert!(record_to_change(&run_row(serde_json::json!([]), steps.clone())).is_err());
+        // Recovery refuses either before it marks the run recovering: a
+        // known journal does not carry an unknown step list through.
+        assert!(journal_to_recover(&row).is_err());
+        let known_journal = serde_json::json!([]);
+        assert!(stored_journal(&known_journal).is_ok());
+        let error = journal_to_recover(&run_row(known_journal, steps)).expect_err("refused");
+        assert!(
+            matches!(&error, ReachabilityError::Conflict(m) if m.contains("step list")),
+            "{error}"
+        );
+        // What this Temps wrote reads back.
+        let record = record_to_change(&run_row(serde_json::json!([]), serde_json::json!([])))
+            .expect("readable");
+        assert!(record.journal.is_empty() && record.steps.is_empty());
+        assert!(
+            journal_to_recover(&run_row(serde_json::json!([]), serde_json::json!([])))
+                .is_ok_and(|journal| journal.is_empty())
+        );
+    }
 
     #[test]
     fn a_wildcard_is_never_made_signed_in() {
