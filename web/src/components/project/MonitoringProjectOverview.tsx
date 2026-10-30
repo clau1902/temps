@@ -13,6 +13,7 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { monitoringSetupPrompt } from '@/lib/monitoring-setup-prompt'
 import { Badge } from '@/components/ui/badge'
+import { Skeleton } from '@/components/ui/skeleton'
 import { ProjectEnvironmentSelect } from '@/components/project-frame/ProjectEnvironmentBar'
 import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
 import { ArrowRight, BarChart3, ShieldAlert, GitFork } from 'lucide-react'
@@ -166,7 +167,7 @@ export function MonitoringProjectHeader({
   project: ProjectResponse
 }) {
   const { pathname } = useLocation()
-  const { environments } = useProjectEnvironment()
+  const { environments, isPending, isError, retry } = useProjectEnvironment()
   return (
     <header className="flex flex-wrap items-center justify-between gap-3 border-b p-4">
       {/* Same landmark as the project bar of hosted services: the pages
@@ -177,7 +178,19 @@ export function MonitoringProjectHeader({
       >
         <p className="truncate font-semibold">{project.name}</p>
         <Badge variant="secondary">External</Badge>
-        {environments.length > 0 && <ProjectEnvironmentSelect />}
+        {isPending ? (
+          <Skeleton className="h-8 w-36" />
+        ) : isError ? (
+          <Button variant="outline" size="sm" onClick={retry}>
+            Environments failed to load · Retry
+          </Button>
+        ) : environments.length === 0 ? (
+          <span className="text-sm text-muted-foreground">
+            No environments yet
+          </span>
+        ) : (
+          <ProjectEnvironmentSelect />
+        )}
       </nav>
       {!pathname.endsWith('/hosting') && (
         <Button asChild variant="outline">
