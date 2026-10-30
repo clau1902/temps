@@ -808,6 +808,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
             </>
           ) : (
             <EmptyState
+              size="compact"
               icon={AlertTriangle}
               title={
                 statusFilter === 'unresolved'
@@ -825,6 +826,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
           )
         ) : (
           <EmptyState
+            size="compact"
             icon={Info}
             title="No errors detected"
             description="Your application is running smoothly with no errors reported."

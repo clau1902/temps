@@ -49,16 +49,10 @@ export function ProjectEnvironmentBar({
     retry,
     scope,
     selection,
-    select,
     defaultEnvironment,
     setDefault,
   } = useProjectEnvironment()
   const environment = selection.environment
-  const production = environments.filter((env) => !env.is_preview)
-  const previews = environments.filter((env) => env.is_preview)
-  const selectValue = selection.all
-    ? ALL_ENVIRONMENTS
-    : (environment?.slug ?? undefined)
   const status = environment ? environmentLiveStatus(environment) : undefined
   const isDefault = !!environment && environment.id === defaultEnvironment?.id
   const hint = SCOPE_HINT[scope]
@@ -96,44 +90,7 @@ export function ProjectEnvironmentBar({
             No environments yet
           </Link>
         ) : (
-          <Select value={selectValue} onValueChange={select}>
-            <SelectTrigger
-              aria-label="Environment"
-              className="h-8 w-auto min-w-36 gap-2 font-medium"
-            >
-              <SelectValue placeholder="Select environment" />
-            </SelectTrigger>
-            <SelectContent>
-              {scope === 'all' && (
-                <>
-                  <SelectItem value={ALL_ENVIRONMENTS}>
-                    All environments
-                  </SelectItem>
-                  <SelectSeparator />
-                </>
-              )}
-              <SelectGroup>
-                {previews.length > 0 && <SelectLabel>Environments</SelectLabel>}
-                {production.map((env) => (
-                  <SelectItem key={env.id} value={env.slug}>
-                    {env.name}
-                    {env.id === defaultEnvironment?.id ? ' (default)' : ''}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-              {previews.length > 0 && (
-                <SelectGroup>
-                  <SelectSeparator />
-                  <SelectLabel>Previews</SelectLabel>
-                  {previews.map((env) => (
-                    <SelectItem key={env.id} value={env.slug}>
-                      {env.name}
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              )}
-            </SelectContent>
-          </Select>
+          <ProjectEnvironmentSelect />
         )}
         {status && !selection.all && (
           <Status tone={status.tone} label={status.label} variant="dot" />
@@ -177,5 +134,57 @@ export function ProjectEnvironmentBar({
         </Button>
       </div>
     </header>
+  )
+}
+
+/**
+ * The environment picker of the project bar, on its own: monitoring-only
+ * projects show it in their header, without the bar's deploy actions.
+ */
+export function ProjectEnvironmentSelect() {
+  const { environments, scope, selection, select, defaultEnvironment } =
+    useProjectEnvironment()
+  const production = environments.filter((env) => !env.is_preview)
+  const previews = environments.filter((env) => env.is_preview)
+  const selectValue = selection.all
+    ? ALL_ENVIRONMENTS
+    : (selection.environment?.slug ?? undefined)
+  return (
+    <Select value={selectValue} onValueChange={select}>
+      <SelectTrigger
+        aria-label="Environment"
+        className="h-8 w-auto min-w-36 gap-2 font-medium"
+      >
+        <SelectValue placeholder="Select environment" />
+      </SelectTrigger>
+      <SelectContent>
+        {scope === 'all' && (
+          <>
+            <SelectItem value={ALL_ENVIRONMENTS}>All environments</SelectItem>
+            <SelectSeparator />
+          </>
+        )}
+        <SelectGroup>
+          {previews.length > 0 && <SelectLabel>Environments</SelectLabel>}
+          {production.map((env) => (
+            <SelectItem key={env.id} value={env.slug}>
+              {env.name}
+              {env.id === defaultEnvironment?.id ? ' (default)' : ''}
+            </SelectItem>
+          ))}
+        </SelectGroup>
+        {previews.length > 0 && (
+          <SelectGroup>
+            <SelectSeparator />
+            <SelectLabel>Previews</SelectLabel>
+            {previews.map((env) => (
+              <SelectItem key={env.id} value={env.slug}>
+                {env.name}
+              </SelectItem>
+            ))}
+          </SelectGroup>
+        )}
+      </SelectContent>
+    </Select>
   )
 }

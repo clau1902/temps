@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useMemo, useState, type ReactNode } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  type ReactNode,
+} from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
@@ -69,12 +75,26 @@ export function ProjectEnvironmentProvider({
     [environmentsQuery.data]
   )
   // `?env=` wins; a link that still says `?environment=<id>` is honoured.
-  const urlParam =
-    searchParams.get(ENVIRONMENT_PARAM) ??
-    legacyEnvironmentSlug(
-      environments,
-      searchParams.get(LEGACY_ENVIRONMENT_PARAM)
+  const envParam = searchParams.get(ENVIRONMENT_PARAM)
+  const legacySlug = legacyEnvironmentSlug(
+    environments,
+    searchParams.get(LEGACY_ENVIRONMENT_PARAM)
+  )
+  const urlParam = envParam ?? legacySlug
+  // ...and rewritten as `?env=<slug>`, which tabs and menu links carry on,
+  // so the next page keeps the environment the link named.
+  useEffect(() => {
+    if (envParam || !legacySlug) return
+    setSearchParams(
+      (current) => {
+        const next = new URLSearchParams(current)
+        next.set(ENVIRONMENT_PARAM, legacySlug)
+        next.delete(LEGACY_ENVIRONMENT_PARAM)
+        return next
+      },
+      { replace: true }
     )
+  }, [envParam, legacySlug, setSearchParams])
 
   const selection = useMemo(
     () =>

@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { MemoryRouter } from 'react-router'
+import { MemoryRouter, useLocation } from 'react-router'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
@@ -12,7 +12,7 @@ import {
   rememberedEnvironmentKey,
   useProjectEnvironment,
 } from './project-environment-context'
-import { ProjectFrame } from './ProjectFrame'
+import { ProjectFrame, ProjectSectionChrome } from './ProjectFrame'
 
 installBrowserWindow()
 afterEach(() => {
@@ -77,4 +77,40 @@ test('a link that still names the environment by id opens that environment', () 
     </QueryClientProvider>
   )
   expect(view.getByText('Selected: staging')).toBeTruthy()
+})
+
+function Search() {
+  return <output data-testid="search">{useLocation().search}</output>
+}
+
+test('a legacy environment link is rewritten as ?env=, so the next tab keeps it', async () => {
+  const query = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  query.setQueryData(
+    getEnvironmentsOptions({ path: { project_id: 1 } }).queryKey,
+    environments
+  )
+  const project = { id: 1, slug: 'first' } as ProjectResponse
+  const view = render(
+    <QueryClientProvider client={query}>
+      <MemoryRouter initialEntries={['/projects/first/errors?environment=2']}>
+        <ProjectFrame project={project}>
+          <ProjectSectionChrome project={project}>
+            <Selected />
+          </ProjectSectionChrome>
+          <Search />
+        </ProjectFrame>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+
+  await waitFor(() =>
+    expect(view.getByTestId('search').textContent).toBe('?env=staging')
+  )
+  expect(view.getByText('Selected: staging')).toBeTruthy()
+  const alerts = view.getByRole('link', { name: 'Alerts' })
+  expect(alerts.getAttribute('href')).toBe(
+    '/projects/first/errors/alert-rules?env=staging'
+  )
 })
