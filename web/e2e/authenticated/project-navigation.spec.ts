@@ -63,6 +63,12 @@ const SECTION_TABS = [
   ['Automation & integrations', ['Automation', 'Integrations', 'Telemetry']],
 ] as const
 
+// Errors sends a project that has never reported one to its Setup tab, so
+// its menu entry may land there instead of on Issues.
+const OPENS_ON: Partial<Record<string, readonly string[]>> = {
+  Errors: ['Issues', 'Setup'],
+}
+
 test('the project menu groups its sections and each section lists its pages as tabs', async ({
   page,
 }) => {
@@ -111,9 +117,11 @@ test('the project menu groups its sections and each section lists its pages as t
     const nav = page.getByRole('navigation', { name: `${section} pages` })
     await expect(nav.getByRole('link')).toHaveText([...tabs])
     // The menu entry opens the section's first page.
-    await expect(
-      nav.getByRole('link', { name: tabs[0], exact: true })
-    ).toHaveAttribute('aria-current', 'page')
+    const current = nav.locator('a[aria-current="page"]')
+    await expect(current).toHaveCount(1)
+    await expect(current).toHaveText(
+      new RegExp(`^(${(OPENS_ON[section] ?? [tabs[0]]).join('|')})$`)
+    )
   }
   await page.screenshot({
     path: '/tmp/temps-project-navigation.png',

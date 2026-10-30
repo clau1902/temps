@@ -1,10 +1,17 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ChevronRight, ExternalLink, Rocket, Star } from 'lucide-react'
+import { ChevronRight, ExternalLink, Plug, Rocket, Star } from 'lucide-react'
 import { Link } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
 import { Status } from '@temps-sdk/ds'
+import { ExternalBadge } from '@/components/dashboard/ProjectCard'
+import { ProjectServiceSwitcher } from '@/components/project-groups/ProjectServiceSwitcher'
+import {
+  ServiceGroupControl,
+  useServiceGroup,
+} from '@/components/project-groups/ServiceGroupControl'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -22,6 +29,10 @@ import {
   ALL_ENVIRONMENTS,
   environmentLiveStatus,
 } from '@/lib/project-environment-selection'
+import {
+  describeDockerSocket,
+  HOST_DOCKER_ACCESS_SHORT_LABEL,
+} from '@/lib/docker-socket'
 import { projectRoot } from '@/lib/project-navigation'
 import { useProjectEnvironment } from './project-environment-context'
 
@@ -31,9 +42,18 @@ const SCOPE_HINT = {
   project: 'Applies to every environment',
 } as const
 
+/** Whether Temps never deploys this project: it runs somewhere else. */
+function isExternallyHosted(project: ProjectResponse): boolean {
+  // `hosting` is the explicit flag; `source_type: 'external'` marks a
+  // monitoring-only project.
+  return project.hosting === 'external' || project.source_type === 'external'
+}
+
 /**
  * The one place a project page's environment is chosen:
  * `project › environment  ● Live · Visit <env> ↗` plus the project actions.
+ * It is also the project's identity: its name is the page's top heading,
+ * with the project (group) it belongs to and what it may do on its host.
  */
 export function ProjectEnvironmentBar({
   project,
@@ -56,6 +76,9 @@ export function ProjectEnvironmentBar({
   const status = environment ? environmentLiveStatus(environment) : undefined
   const isDefault = !!environment && environment.id === defaultEnvironment?.id
   const hint = SCOPE_HINT[scope]
+  const group = useServiceGroup(project.id).data?.group
+  const external = isExternallyHosted(project)
+  const dockerSocket = describeDockerSocket(project.docker_socket)
 
   return (
     // Same horizontal gutters as `PageContainer`, so the bar's left and right
@@ -65,13 +88,41 @@ export function ProjectEnvironmentBar({
         aria-label="Project and environment"
         className="flex min-w-0 items-center gap-1.5"
       >
-        <Link
-          to={`${projectRoot(project.slug)}/project`}
-          className="-ml-1 flex min-w-0 items-center gap-2 rounded-md px-1 py-1 text-sm font-semibold hover:bg-muted"
-        >
-          <ServiceIcon service={project} size="sm" className="shrink-0" />
-          <span className="truncate">{project.name}</span>
-        </Link>
+        {/* The icon stays outside the heading: it has its own name, which
+            would otherwise become part of the project's. */}
+        <ServiceIcon service={project} size="sm" className="shrink-0" />
+        <h1 className="min-w-0 truncate text-sm font-semibold">
+          {group ? (
+            <ProjectServiceSwitcher project={project} group={group}>
+              {project.name}
+            </ProjectServiceSwitcher>
+          ) : (
+            <Link
+              to={`${projectRoot(project.slug)}/project`}
+              className="block truncate rounded-md px-1 py-1 hover:bg-muted"
+            >
+              {project.name}
+            </Link>
+          )}
+        </h1>
+        <ServiceGroupControl project={project} />
+        {external && <ExternalBadge />}
+        {dockerSocket.state === 'granted' && (
+          // Stays at every width: this is where the console states that the
+          // project is root-equivalent on its host, so on a phone it shrinks
+          // to a short label instead of disappearing.
+          <Badge
+            role="img"
+            variant="outline"
+            className="inline-flex shrink-0 gap-1"
+            title={dockerSocket.detail}
+            aria-label={`${dockerSocket.label}: ${dockerSocket.detail}`}
+          >
+            <Plug aria-hidden="true" className="size-3" />
+            <span className="sm:hidden">{HOST_DOCKER_ACCESS_SHORT_LABEL}</span>
+            <span className="hidden sm:inline">{dockerSocket.label}</span>
+          </Badge>
+        )}
         <ChevronRight
           aria-hidden="true"
           className="size-4 shrink-0 text-muted-foreground"
@@ -128,10 +179,13 @@ export function ProjectEnvironmentBar({
             </a>
           </Button>
         )}
-        <Button size="sm" onClick={onDeploy}>
-          <Rocket className="size-4" aria-hidden="true" />
-          <span className="max-sm:sr-only">Deploy</span>
-        </Button>
+        {/* Temps never deploys an app hosted elsewhere. */}
+        {!external && (
+          <Button size="sm" onClick={onDeploy}>
+            <Rocket className="size-4" aria-hidden="true" />
+            <span className="max-sm:sr-only">Deploy</span>
+          </Button>
+        )}
       </div>
     </header>
   )

@@ -176,7 +176,7 @@ export function MonitoringProjectHeader({
         aria-label="Project and environment"
         className="flex min-w-0 flex-wrap items-center gap-3"
       >
-        <p className="truncate font-semibold">{project.name}</p>
+        <h1 className="truncate font-semibold">{project.name}</h1>
         <Badge variant="secondary">External</Badge>
         {isPending ? (
           <Skeleton className="h-8 w-36" />
