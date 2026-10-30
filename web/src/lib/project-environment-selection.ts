@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { defaultDeployEnvironment } from '@/lib/project-deploy-action'
+import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
 
 /** URL search parameter that carries the selected environment's slug. */
 export const ENVIRONMENT_PARAM = 'env'
@@ -110,20 +111,99 @@ export function resolveDefaultEnvironment<T extends SelectableEnvironment>(
 }
 
 export interface EnvironmentLiveStatus {
-  tone: 'ok' | 'idle'
+  tone: 'ok' | 'idle' | 'running' | 'warn' | 'error'
   label: string
+  /** What the state means: the tooltip, and what screen readers announce. */
+  detail: string
+  /** Where a problem is explained and fixed. Set for problem states only. */
+  explainedAt?: 'deployment' | 'environment' | 'monitors'
+}
+
+/** What else is known about an environment, beyond its own record. */
+export interface EnvironmentSignals {
+  /** The newest deployment *of this environment*, whatever its outcome. */
+  latestDeployment?: { status: string } | null
+  /** Live containers of this environment that are down or crash-looping. */
+  unhealthyContainers?: number
+  /**
+   * The uptime monitors' verdict (`operational`, `degraded`, `down`, …).
+   * Monitors are per project, so pass it only for the environment they
+   * watch: the one the project treats as production.
+   */
+  monitorStatus?: string
 }
 
 /**
- * One-word state for the environment bar. Coarse on purpose: the overview
- * and the environment's own page explain a failed or degraded deployment.
+ * The environment bar's one-word state. A problem outranks "Live": a failed
+ * latest deployment reads "Failed" even while an older version serves, and
+ * crashing containers or failing monitors read "Degraded" or "Down", each
+ * pointing at where the problem is explained.
  */
-export function environmentLiveStatus(environment: {
-  sleeping: boolean
-  current_deployment_id?: number | null
-}): EnvironmentLiveStatus {
-  if (!environment.current_deployment_id)
-    return { tone: 'idle', label: 'Not deployed' }
-  if (environment.sleeping) return { tone: 'idle', label: 'Sleeping' }
-  return { tone: 'ok', label: 'Live' }
+export function environmentLiveStatus(
+  environment: { sleeping: boolean; current_deployment_id?: number | null },
+  signals: EnvironmentSignals = {}
+): EnvironmentLiveStatus {
+  const latest = signals.latestDeployment?.status
+  const building = !!latest && isActiveDeploymentStatus(latest)
+  const live = !!environment.current_deployment_id
+  if (latest === 'failed')
+    return {
+      tone: 'error',
+      label: 'Failed',
+      detail: live
+        ? 'The latest deployment failed; the previous version is still serving. Open it for the reason.'
+        : 'The first deployment failed, so nothing is live yet. Open it for the reason.',
+      explainedAt: 'deployment',
+    }
+  if (building)
+    return {
+      tone: 'running',
+      label: 'Deploying',
+      detail: live
+        ? 'A new version is being deployed; the current one serves until it is replaced.'
+        : 'The first deployment is running.',
+      explainedAt: 'deployment',
+    }
+  if (!live)
+    return {
+      tone: 'idle',
+      label: 'Not deployed',
+      detail: 'Nothing has been deployed to this environment yet.',
+    }
+  if (environment.sleeping)
+    return {
+      tone: 'idle',
+      label: 'Sleeping',
+      detail: 'Stopped while idle; the next request wakes it up.',
+    }
+  const unhealthy = signals.unhealthyContainers ?? 0
+  if (unhealthy > 0)
+    return {
+      tone: 'warn',
+      label: 'Degraded',
+      detail: `${unhealthy} live ${unhealthy === 1 ? 'container is' : 'containers are'} down or restarting.`,
+      explainedAt: 'environment',
+    }
+  if (signals.monitorStatus === 'down')
+    return {
+      tone: 'error',
+      label: 'Down',
+      detail: 'Uptime monitors cannot reach this service.',
+      explainedAt: 'monitors',
+    }
+  if (signals.monitorStatus === 'degraded')
+    return {
+      tone: 'warn',
+      label: 'Degraded',
+      detail: 'Some uptime monitors are failing.',
+      explainedAt: 'monitors',
+    }
+  return {
+    tone: 'ok',
+    label: 'Live',
+    detail:
+      signals.monitorStatus === 'operational'
+        ? 'Serving its current deployment; uptime monitors are passing.'
+        : 'Serving its current deployment.',
+  }
 }

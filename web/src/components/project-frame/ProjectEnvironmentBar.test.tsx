@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render, within } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import type {
@@ -43,22 +43,36 @@ const group = {
   projects: [{ id: 7, name: 'synthetic-api', slug: 'synthetic-api' }],
 } as unknown as ProjectGroupResponse
 
+const liveProduction = {
+  ...production,
+  current_deployment_id: 40,
+  sleeping: false,
+  main_url: 'https://synthetic-api.example.test',
+} as EnvironmentResponse
+
+type Routes = Parameters<typeof mockApi>[0]
+
 function renderBar(
   project: ProjectResponse,
-  membership: ProjectGroupResponse | null = null
+  membership: ProjectGroupResponse | null = null,
+  {
+    environment = production,
+    routes = {},
+  }: { environment?: EnvironmentResponse; routes?: Routes } = {}
 ) {
   mockApi({
     'GET /projects/7/group': () => jsonResponse({ group: membership }),
+    ...routes,
   })
   const bar = {
-    environments: [production],
+    environments: [environment],
     isPending: false,
     isError: false,
     retry: () => {},
     scope: 'single',
-    selection: { environment: production, all: false, source: 'url' },
+    selection: { environment, all: false, source: 'url' },
     select: () => {},
-    defaultEnvironment: production,
+    defaultEnvironment: environment,
     setDefault: () => {},
   } as unknown as ProjectEnvironmentContextValue
   return render(
@@ -130,4 +144,121 @@ test('without the grant there is no host-access badge', () => {
   } as unknown as ProjectResponse)
 
   expect(view.queryByRole('img', { name: /Host Docker access/ })).toBeNull()
+})
+
+const deployments = (status: string) => () =>
+  jsonResponse({ deployments: [{ id: 91, status }], total: 1 })
+
+test('a failed latest deployment reads Failed and opens that deployment', async () => {
+  const view = renderBar(service, null, {
+    environment: liveProduction,
+    routes: { 'GET /projects/7/deployments': deployments('failed') },
+  })
+
+  const failed = await view.findByRole('link', { name: /^Failed: / })
+  expect(failed.getAttribute('href')).toBe(
+    '/projects/synthetic-api/deployments/91'
+  )
+  expect(failed.getAttribute('aria-label')).toContain(
+    'previous version is still serving'
+  )
+})
+
+test('monitors that cannot reach production read Down and open Uptime', async () => {
+  const view = renderBar(service, null, {
+    environment: liveProduction,
+    routes: {
+      'GET /projects/7/deployments': deployments('completed'),
+      'GET /monitors-health/projects': () =>
+        jsonResponse({ projects: { '7': { project_id: 7, status: 'down' } } }),
+    },
+  })
+
+  const down = await view.findByRole('link', { name: /^Down: / })
+  expect(down.getAttribute('href')).toBe('/projects/synthetic-api/monitors')
+})
+
+test('a healthy environment reads Live, without a link', async () => {
+  const view = renderBar(service, null, {
+    environment: liveProduction,
+    routes: { 'GET /projects/7/deployments': deployments('completed') },
+  })
+
+  expect(await view.findByRole('img', { name: /^Live: / })).toBeTruthy()
+  expect(view.queryByRole('link', { name: /^Live/ })).toBeNull()
+})
+
+test('the repository opens from the bar, without credentials in the link', () => {
+  const view = renderBar({
+    ...service,
+    git_url: 'https://token:secret@github.com/example/synthetic-api.git',
+  } as ProjectResponse)
+
+  expect(
+    view
+      .getByRole('link', { name: 'Open repository in a new window' })
+      .getAttribute('href')
+  ).toBe('https://github.com/example/synthetic-api')
+})
+
+test('a live environment says where visitors reach it', async () => {
+  const view = renderBar(service, null, {
+    environment: liveProduction,
+    routes: {
+      'GET /projects/7/environments/3/reachability': () =>
+        jsonResponse({
+          environment_id: 3,
+          state: 'reachable',
+          summary: 'Public on the internet.',
+          primary_address: { address: 'synthetic-api.example.test' },
+          addresses: [
+            {
+              address: 'synthetic-api.example.test',
+              state: 'reachable',
+              audience: 'public',
+              source: 'environment_domain',
+            },
+          ],
+        }),
+    },
+  })
+
+  expect(await view.findByText('synthetic-api.example.test')).toBeTruthy()
+})
+
+test('an app hosted elsewhere reports no deployment state of its own', async () => {
+  const view = renderBar(
+    { ...service, hosting: 'external' } as ProjectResponse,
+    null,
+    {
+      environment: liveProduction,
+      routes: { 'GET /projects/7/deployments': deployments('failed') },
+    }
+  )
+
+  await view.findByText('External', { exact: true })
+  expect(view.queryByRole('link', { name: /^Failed/ })).toBeNull()
+  expect(view.queryByRole('img', { name: /^Live/ })).toBeNull()
+})
+
+test('on a phone the actions are one menu', async () => {
+  const view = renderBar(
+    {
+      ...service,
+      git_url: 'https://github.com/example/synthetic-api.git',
+    } as ProjectResponse,
+    null,
+    { environment: liveProduction }
+  )
+
+  const trigger = view.getByRole('button', { name: 'Project actions' })
+  fireEvent.pointerDown(trigger, {
+    button: 0,
+    ctrlKey: false,
+    pointerType: 'mouse',
+  })
+  const menu = await view.findByRole('menu')
+  for (const name of ['Deploy', 'Visit production', 'Open repository'])
+    expect(within(menu).getByRole('menuitem', { name })).toBeTruthy()
+  expect(within(menu).getAllByRole('menuitem')).toHaveLength(3)
 })

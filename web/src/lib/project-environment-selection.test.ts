@@ -100,16 +100,80 @@ describe('resolveDefaultEnvironment', () => {
 })
 
 describe('environmentLiveStatus', () => {
+  const live = { sleeping: false, current_deployment_id: 4 }
+  const label = (
+    environment: { sleeping: boolean; current_deployment_id: number | null },
+    signals?: Parameters<typeof environmentLiveStatus>[1]
+  ) => {
+    const status = environmentLiveStatus(environment, signals)
+    return [status.tone, status.label, status.explainedAt]
+  }
+
   test('distinguishes live, sleeping and never-deployed environments', () => {
+    expect(label(live)).toEqual(['ok', 'Live', undefined])
+    expect(label({ ...live, sleeping: true })).toEqual([
+      'idle',
+      'Sleeping',
+      undefined,
+    ])
+    expect(label({ ...live, current_deployment_id: null })).toEqual([
+      'idle',
+      'Not deployed',
+      undefined,
+    ])
+  })
+
+  test('a failed latest deployment reads Failed even while an older one serves', () => {
+    const failed = { latestDeployment: { status: 'failed' } }
+    expect(label(live, failed)).toEqual(['error', 'Failed', 'deployment'])
+    expect(environmentLiveStatus(live, failed).detail).toContain(
+      'previous version is still serving'
+    )
+    expect(label({ ...live, current_deployment_id: null }, failed)).toEqual([
+      'error',
+      'Failed',
+      'deployment',
+    ])
+  })
+
+  test('a running deployment reads Deploying', () => {
+    expect(label(live, { latestDeployment: { status: 'running' } })).toEqual([
+      'running',
+      'Deploying',
+      'deployment',
+    ])
+  })
+
+  test('crashing containers and failing monitors are problems, in that order', () => {
+    expect(label(live, { unhealthyContainers: 2 })).toEqual([
+      'warn',
+      'Degraded',
+      'environment',
+    ])
     expect(
-      environmentLiveStatus({ sleeping: false, current_deployment_id: 4 })
-    ).toEqual({ tone: 'ok', label: 'Live' })
+      label(live, { unhealthyContainers: 1, monitorStatus: 'down' })
+    ).toEqual(['warn', 'Degraded', 'environment'])
+    expect(label(live, { monitorStatus: 'down' })).toEqual([
+      'error',
+      'Down',
+      'monitors',
+    ])
+    expect(label(live, { monitorStatus: 'degraded' })).toEqual([
+      'warn',
+      'Degraded',
+      'monitors',
+    ])
+    expect(label(live, { monitorStatus: 'operational' })).toEqual([
+      'ok',
+      'Live',
+      undefined,
+    ])
+  })
+
+  test('a sleeping environment is not degraded for having stopped containers', () => {
     expect(
-      environmentLiveStatus({ sleeping: true, current_deployment_id: 4 })
-    ).toEqual({ tone: 'idle', label: 'Sleeping' })
-    expect(
-      environmentLiveStatus({ sleeping: false, current_deployment_id: null })
-    ).toEqual({ tone: 'idle', label: 'Not deployed' })
+      label({ ...live, sleeping: true }, { unhealthyContainers: 3 })
+    ).toEqual(['idle', 'Sleeping', undefined])
   })
 })
 
