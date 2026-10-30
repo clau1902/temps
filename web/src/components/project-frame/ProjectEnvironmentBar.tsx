@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { ChevronRight, ExternalLink, Rocket, Star, Undo2 } from 'lucide-react'
-import { Link, useLocation, useNavigate } from 'react-router'
+import { ChevronRight, ExternalLink, Rocket, Star } from 'lucide-react'
+import { Link } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
 import { Status } from '@temps-sdk/ds'
 import { Button } from '@/components/ui/button'
@@ -22,11 +22,7 @@ import {
   ALL_ENVIRONMENTS,
   environmentLiveStatus,
 } from '@/lib/project-environment-selection'
-import {
-  projectV2Root,
-  toClassicProjectPath,
-} from '@/lib/project-navigation-v2'
-import { setPrefersProjectV2 } from '@/lib/project-layout-preference'
+import { projectRoot } from '@/lib/project-navigation'
 import { useProjectEnvironment } from './project-environment-context'
 
 const SCOPE_HINT = {
@@ -46,8 +42,6 @@ export function ProjectEnvironmentBar({
   project: ProjectResponse
   onDeploy: () => void
 }) {
-  const location = useLocation()
-  const navigate = useNavigate()
   const {
     environments,
     isPending,
@@ -69,13 +63,6 @@ export function ProjectEnvironmentBar({
   const isDefault = !!environment && environment.id === defaultEnvironment?.id
   const hint = SCOPE_HINT[scope]
 
-  const openClassic = () => {
-    setPrefersProjectV2(false)
-    navigate(
-      `${toClassicProjectPath(project.slug, location.pathname)}${location.search}`
-    )
-  }
-
   return (
     // Same horizontal gutters as `PageContainer`, so the bar's left and right
     // edges line up with the page below it at every breakpoint.
@@ -85,7 +72,7 @@ export function ProjectEnvironmentBar({
         className="flex min-w-0 items-center gap-1.5"
       >
         <Link
-          to={`${projectV2Root(project.slug)}/project`}
+          to={`${projectRoot(project.slug)}/project`}
           className="-ml-1 flex min-w-0 items-center gap-2 rounded-md px-1 py-1 text-sm font-semibold hover:bg-muted"
         >
           <ServiceIcon service={project} size="sm" className="shrink-0" />
@@ -103,7 +90,7 @@ export function ProjectEnvironmentBar({
           </Button>
         ) : environments.length === 0 ? (
           <Link
-            to={`${projectV2Root(project.slug)}/environments`}
+            to={`${projectRoot(project.slug)}/environments`}
             className="text-sm text-muted-foreground underline underline-offset-4"
           >
             No environments yet
@@ -184,10 +171,6 @@ export function ProjectEnvironmentBar({
             </a>
           </Button>
         )}
-        <Button variant="ghost" size="sm" onClick={openClassic}>
-          <Undo2 className="size-4" aria-hidden="true" />
-          <span className="max-sm:sr-only">Classic layout</span>
-        </Button>
         <Button size="sm" onClick={onDeploy}>
           <Rocket className="size-4" aria-hidden="true" />
           <span className="max-sm:sr-only">Deploy</span>

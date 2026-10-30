@@ -14,9 +14,9 @@ import {
 } from '@/components/command/CommandPalette'
 import {
   isExternalProjectPage,
-  PROJECT_SECTION_LINKS,
+  PROJECT_NAV_SECTIONS,
+  projectNavGroupsFor,
 } from '@/lib/project-navigation'
-import { PROJECT_V2_SECTIONS } from '@/lib/project-navigation-v2'
 import { LEGACY_PROJECT_ROUTES } from '@/lib/project-settings-sections'
 
 /**
@@ -271,14 +271,11 @@ function duplicatePaths(routes: ParsedRoute[], prefix = ''): string[] {
   return duplicates
 }
 
-/** The section-nav links ProjectSectionLayout renders for an external project. */
+/** Every menu entry and tab a monitoring-only project is offered. */
 function externalSectionUrls(): string[] {
-  const hidden = ['analytics/api-traffic', 'ai-crawlers']
-  return (['analytics', 'errors', 'traces', 'monitoring'] as const)
-    .flatMap((section) => PROJECT_SECTION_LINKS[section] ?? [])
-    .map((link) => link.url)
-    .filter((url) => !hidden.includes(url))
-    .concat(['settings/general', 'settings/telemetry'])
+  return projectNavGroupsFor({ source_type: 'external' }).flatMap((group) =>
+    group.sections.flatMap((section) => section.tabs.map((tab) => tab.url))
+  )
 }
 
 describe('project route tables', () => {
@@ -304,19 +301,8 @@ describe('project route tables', () => {
 })
 
 describe('section navigation', () => {
-  test('every hosted section link opens a registered page', () => {
-    const urls = Object.values(PROJECT_SECTION_LINKS).flatMap((links) =>
-      links.map((link) => link.url)
-    )
-    expect(
-      urls
-        .map((url) => resolveUrl(PROJECT_ROUTES.hosted, url))
-        .filter((r) => r !== 'ok')
-    ).toEqual([])
-  })
-
-  test('every v2 menu entry and tab opens a registered page', () => {
-    const urls = PROJECT_V2_SECTIONS.flatMap((section) =>
+  test('every menu entry and tab opens a registered page', () => {
+    const urls = PROJECT_NAV_SECTIONS.flatMap((section) =>
       section.tabs.map((tab) => tab.url)
     )
     expect(urls).toContain('build-deploy')

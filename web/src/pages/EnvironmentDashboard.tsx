@@ -13,8 +13,6 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { ContainerList } from '@/components/containers/ContainerList'
 import { ContainerActionDialog } from '@/components/containers/ContainerActionDialog'
 import { EnvironmentSettingsContent } from '@/components/environments/EnvironmentSettingsContent'
-import { EnvironmentNavigation } from '@/components/environments/EnvironmentNavigation'
-import { EnvironmentHeaderBar } from '@/components/environments/EnvironmentHeaderBar'
 import { EnvironmentMetricsCharts } from '@/components/monitoring/EnvironmentMetricsCard'
 import { EnvironmentShieldView } from '@/components/environments/shield/EnvironmentShieldView'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
@@ -30,25 +28,20 @@ import {
 interface EnvironmentDashboardProps {
   project: ProjectResponse
   environmentId: number
-  environments?: EnvironmentResponse[]
-  onEnvironmentChange?: (id: number) => void
   onCreateEnvironment?: () => void
   onDelete?: () => void
-  /**
-   * Inside the v2 project layout: the project bar already picks the
-   * environment, so drop the side column and show the views as tabs.
-   */
-  embedded?: boolean
 }
+
+/**
+ * One environment's pages as tabs. The project bar picks the environment and
+ * shows its name, so the page names itself for screen readers only.
+ */
 
 export function EnvironmentDashboard({
   project,
   environmentId,
-  environments,
-  onEnvironmentChange,
   onCreateEnvironment,
   onDelete,
-  embedded = false,
 }: EnvironmentDashboardProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const activeView = resolveEnvironmentView(searchParams.get('view'))
@@ -110,84 +103,55 @@ export function EnvironmentDashboard({
 
   const isStatic = project?.source_type === 'static_files'
 
-  if (embedded) {
-    return (
-      <div className="min-w-0 space-y-6">
-        {/* The project bar already shows the environment's name. */}
-        <h1 className="sr-only">{environment.name}</h1>
-        <div className="flex items-center gap-3 border-b">
-          <Tabs
-            className="min-w-0 flex-1"
-            value={activeView}
-            onValueChange={(value) =>
-              handleViewChange(resolveEnvironmentView(value))
-            }
-          >
-            <TabsList
-              className="border-b-0"
-              aria-label={`${environment.name} pages`}
-            >
-              {EMBEDDED_VIEWS.map((view) => (
-                <TabsTrigger key={view.value} value={view.value}>
-                  {view.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-          {onCreateEnvironment && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="shrink-0"
-              onClick={onCreateEnvironment}
-            >
-              <Plus className="size-4" aria-hidden="true" />
-              <span className="max-sm:sr-only">New environment</span>
-            </Button>
-          )}
-        </div>
-        <EnvironmentViewContent
-          project={project}
-          environment={environment}
-          environmentId={environmentId}
-          activeView={activeView}
-          isStatic={isStatic}
-          onViewChange={handleViewChange}
-          onDelete={onDelete}
-        />
-      </div>
-    )
-  }
-
   return (
-    <div className="grid min-w-0 flex-1 content-start bg-background lg:content-stretch lg:grid-cols-[200px_minmax(0,1fr)]">
-      <EnvironmentNavigation
-        environment={environment}
-        activeView={activeView}
-        onViewChange={handleViewChange}
-        environments={environments}
-        onEnvironmentChange={onEnvironmentChange}
-        onCreateEnvironment={onCreateEnvironment}
-      />
-      <div className="min-w-0">
-        <EnvironmentHeaderBar environment={environment} project={project} />
-        <div className="w-full px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-          <EnvironmentViewContent
-            project={project}
-            environment={environment}
-            environmentId={environmentId}
-            activeView={activeView}
-            isStatic={isStatic}
-            onViewChange={handleViewChange}
-            onDelete={onDelete}
-          />
-        </div>
+    <div className="min-w-0 space-y-6">
+      {/* The project bar already shows the environment's name. */}
+      <h1 className="sr-only">{environment.name}</h1>
+      <div className="flex items-center gap-3 border-b">
+        <Tabs
+          className="min-w-0 flex-1"
+          value={activeView}
+          onValueChange={(value) =>
+            handleViewChange(resolveEnvironmentView(value))
+          }
+        >
+          <TabsList
+            className="border-b-0"
+            aria-label={`${environment.name} pages`}
+          >
+            {ENVIRONMENT_VIEWS.map((view) => (
+              <TabsTrigger key={view.value} value={view.value}>
+                {view.label}
+              </TabsTrigger>
+            ))}
+          </TabsList>
+        </Tabs>
+        {onCreateEnvironment && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="shrink-0"
+            onClick={onCreateEnvironment}
+          >
+            <Plus className="size-4" aria-hidden="true" />
+            <span className="max-sm:sr-only">New environment</span>
+          </Button>
+        )}
       </div>
+      <EnvironmentViewContent
+        project={project}
+        environment={environment}
+        environmentId={environmentId}
+        activeView={activeView}
+        isStatic={isStatic}
+        onViewChange={handleViewChange}
+        onDelete={onDelete}
+      />
     </div>
   )
 }
 
-const EMBEDDED_VIEWS: { value: EnvironmentView; label: string }[] = [
+const ENVIRONMENT_VIEWS: { value: EnvironmentView; label: string }[] = [
   { value: 'containers', label: 'Containers' },
   { value: 'metrics', label: 'Metrics' },
   { value: 'shield', label: 'Shield' },
@@ -250,26 +214,15 @@ export function EnvironmentDashboardSkeleton() {
   return (
     <div
       role="status"
-      className="grid min-w-0 flex-1 content-start lg:grid-cols-[200px_minmax(0,1fr)] lg:content-stretch"
+      className="min-w-0 space-y-6"
       aria-label="Loading environment"
     >
-      <div className="border-b p-4 lg:border-b-0 lg:border-r lg:px-3 lg:py-5">
-        <Skeleton className="h-16 w-full" />
-        <div className="mt-5 hidden space-y-2 lg:block">
-          {[0, 1, 2].map((item) => (
-            <Skeleton key={item} className="h-9 w-full" />
-          ))}
-        </div>
+      <div className="flex items-center gap-3 border-b pb-2">
+        {ENVIRONMENT_VIEWS.map((view) => (
+          <Skeleton key={view.value} className="h-7 w-20" />
+        ))}
       </div>
-      <div className="min-w-0">
-        <div className="space-y-3 border-b px-4 py-5 sm:px-6 lg:px-8">
-          <Skeleton className="h-7 w-48" />
-          <Skeleton className="h-4 w-56" />
-        </div>
-        <div className="px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-          <Skeleton className="h-24 w-full" />
-        </div>
-      </div>
+      <Skeleton className="h-24 w-full" />
     </div>
   )
 }

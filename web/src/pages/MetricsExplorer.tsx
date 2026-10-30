@@ -4,13 +4,8 @@
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
+import { HistogramSummary, ProjectResponse } from '@/api/client'
 import {
-  EnvironmentResponse,
-  HistogramSummary,
-  ProjectResponse,
-} from '@/api/client'
-import {
-  getEnvironmentsOptions,
   listMetricNamesOptions,
   queryMetricsOptions,
   queryMetricsQueryKey,
@@ -74,9 +69,8 @@ import {
   RefreshCw,
   Search,
 } from 'lucide-react'
-import { ProjectEnvironmentContext } from '@/components/project-v2/project-environment-context'
-import { cn } from '@/lib/utils'
-import { useContext, useEffect, useMemo, useState } from 'react'
+import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
+import { useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
 interface MetricsExplorerProps {
@@ -252,14 +246,9 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     const r = searchParams.get('range') as TimeRange | null
     return r && TIME_RANGES.some((t) => t.value === r) ? r : '24h'
   })()
-  // In the v2 layout the project bar chooses the environment for the whole
-  // section; this page follows it instead of keeping a second picker.
-  const barEnvironment = useContext(ProjectEnvironmentContext)
-  const environmentId = barEnvironment
-    ? (barEnvironment.selection.environment?.id ?? null)
-    : searchParams.get('environment_id')
-      ? Number(searchParams.get('environment_id'))
-      : null
+  // The project bar chooses the environment for the whole section.
+  const { selection } = useProjectEnvironment()
+  const environmentId = selection.environment?.id ?? null
   const aggregation = ((): AggKind => {
     const a = searchParams.get('agg') as AggKind | null
     return a && AGGREGATIONS.some((x) => x.value === a) ? a : 'avg'
@@ -318,12 +307,6 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
       p.set('end', to.toISOString())
       p.delete('range')
     })
-  const setEnvironmentId = (v: number | null) =>
-    patchParams((p) =>
-      v == null
-        ? p.delete('environment_id')
-        : p.set('environment_id', String(v))
-    )
   const setAggregation = (v: AggKind) =>
     patchParams((p) => (v === 'avg' ? p.delete('agg') : p.set('agg', v)))
   const setLabelFilters = (next: LabelFilter[]) =>
@@ -344,12 +327,6 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
         p.delete('group_by')
       }
     })
-
-  // ── Environments (for the env selector, mirrors TracesList) ──
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
-    enabled: !!project.id,
-  })
 
   // ── Metric-name catalogue ──
   const namesQuery = useQuery({
@@ -391,7 +368,7 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   const bucketInterval = isCustom
     ? bucketForSpan(toDate.getTime() - fromDate.getTime())
     : RANGE_BUCKET[timeRange]
-  const selectedEnv = environments?.find((e) => e.id === environmentId) ?? null
+  const selectedEnv = selection.environment ?? null
 
   const metricsQuery = useQuery({
     ...queryMetricsOptions({
@@ -753,36 +730,6 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
                     {AGGREGATIONS.map((a) => (
                       <SelectItem key={a.value} value={a.value}>
                         {a.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              {/* Environment (the v2 bar picks it there) */}
-              <div
-                className={cn(
-                  'flex flex-col gap-1',
-                  barEnvironment && 'hidden'
-                )}
-              >
-                <label className="text-xs font-medium text-muted-foreground">
-                  Environment
-                </label>
-                <Select
-                  value={environmentId != null ? String(environmentId) : 'all'}
-                  onValueChange={(v) =>
-                    setEnvironmentId(v === 'all' ? null : Number(v))
-                  }
-                >
-                  <SelectTrigger className="w-full sm:w-[160px]">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="all">All environments</SelectItem>
-                    {(environments ?? []).map((env: EnvironmentResponse) => (
-                      <SelectItem key={env.id} value={String(env.id)}>
-                        {env.name}
                       </SelectItem>
                     ))}
                   </SelectContent>

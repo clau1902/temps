@@ -8,12 +8,12 @@ import { EnvironmentsTabsView } from '@/pages/EnvironmentsTabsView'
 import { useProjectEnvironment } from './project-environment-context'
 
 /*
- * The classic pages, fed the environment chosen in the v2 project bar instead
- * of picking one themselves. Each is keyed by the selection so paging and
- * other per-environment state start fresh when the environment changes.
+ * Project pages fed the environment chosen in the project bar instead of
+ * picking one themselves. Each is keyed by the selection so paging and other
+ * per-environment state start fresh when the environment changes.
  */
 
-export function ProjectOverviewV2({
+export function ProjectOverviewPage({
   project,
   lastDeployment,
 }: {
@@ -30,7 +30,7 @@ export function ProjectOverviewV2({
   )
 }
 
-export function ProjectDeploymentsV2({
+export function ProjectDeploymentsPage({
   project,
 }: {
   project: ProjectResponse
@@ -46,7 +46,7 @@ export function ProjectDeploymentsV2({
   )
 }
 
-export function ProjectEnvironmentsV2({
+export function ProjectEnvironmentsPage({
   project,
 }: {
   project: ProjectResponse
@@ -56,7 +56,6 @@ export function ProjectEnvironmentsV2({
     <EnvironmentsTabsView
       project={project}
       selectedEnvironmentId={selection.environment?.id}
-      embedded
     />
   )
 }

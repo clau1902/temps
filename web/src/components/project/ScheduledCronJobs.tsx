@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useContext, useState } from 'react'
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { CalendarClock, FileCode } from 'lucide-react'
 import {
@@ -11,18 +11,8 @@ import {
   PageState,
   RecordLink,
 } from '@temps-sdk/ds'
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@temps-sdk/ui'
 import type { CronInfo, ProjectResponse } from '@/api/client'
-import {
-  getEnvironmentCronsOptions,
-  getEnvironmentsOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getEnvironmentCronsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { CodeBlock } from '@/components/ui/code-block'
 import {
   Dialog,
@@ -31,7 +21,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { ProjectEnvironmentContext } from '@/components/project-v2/project-environment-context'
+import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
 import { readFailureServerDetail } from '@/lib/read-failure'
 
 function InlineCode({ children }: { children: string }) {
@@ -82,23 +72,12 @@ function formatRun(value: string | null | undefined) {
 
 /**
  * Jobs Temps runs itself: the `cron:` entries of `.temps.yaml`, registered
- * per environment on deploy. In the v2 layout the environment comes from the
- * project bar; the classic layout keeps a picker of its own.
+ * per environment on deploy, for the environment chosen in the project bar.
  */
 export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
-  const bar = useContext(ProjectEnvironmentContext)
-  const [pickedEnvironment, setPickedEnvironment] = useState('')
+  const bar = useProjectEnvironment()
   const [showInstructions, setShowInstructions] = useState(false)
-
-  const environments = useQuery({
-    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
-    enabled: !bar,
-  })
-  const environment = bar
-    ? bar.selection.environment
-    : (environments.data?.find(
-        (env) => env.id.toString() === pickedEnvironment
-      ) ?? environments.data?.[0])
+  const environment = bar.selection.environment
 
   const crons = useQuery({
     ...getEnvironmentCronsOptions({
@@ -107,8 +86,7 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
     enabled: environment !== undefined,
   })
   const loading =
-    (bar ? bar.isPending : environments.isPending) ||
-    (environment !== undefined && crons.isPending)
+    bar.isPending || (environment !== undefined && crons.isPending)
   const rows = crons.data ?? []
 
   return (
@@ -126,27 +104,6 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
           </p>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
-          {!bar && (
-            <Select
-              value={environment?.id.toString() ?? ''}
-              onValueChange={setPickedEnvironment}
-              disabled={!environments.data?.length}
-            >
-              <SelectTrigger
-                className="w-full sm:w-[200px]"
-                aria-label="Environment"
-              >
-                <SelectValue placeholder="Environment" />
-              </SelectTrigger>
-              <SelectContent>
-                {environments.data?.map((env) => (
-                  <SelectItem key={env.id} value={env.id.toString()}>
-                    {env.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
           <Button variant="outline" onClick={() => setShowInstructions(true)}>
             <FileCode className="size-4" />
             How to add a job

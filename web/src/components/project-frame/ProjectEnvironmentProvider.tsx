@@ -11,7 +11,7 @@ import {
   resolveDefaultEnvironment,
   resolveEnvironmentSelection,
 } from '@/lib/project-environment-selection'
-import type { EnvironmentScope } from '@/lib/project-navigation-v2'
+import type { EnvironmentScope } from '@/lib/project-navigation'
 import {
   ProjectEnvironmentContext,
   defaultEnvironmentKey,
@@ -36,7 +36,7 @@ function writeStorage(key: string, value: string) {
 }
 
 /**
- * Owns the environment chosen in the v2 project bar: `?env=<slug>` in the
+ * Owns the environment chosen in the project bar: `?env=<slug>` in the
  * URL, remembered per project in this browser, and a per-project default.
  *
  * Prototype note: the default lives in localStorage. Shipping it needs a

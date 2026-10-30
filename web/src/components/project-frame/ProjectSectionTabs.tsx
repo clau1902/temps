@@ -4,10 +4,7 @@
 import { Link, useSearchParams } from 'react-router'
 import { cn } from '@/lib/utils'
 import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
-import {
-  projectV2Root,
-  type ProjectV2Location,
-} from '@/lib/project-navigation-v2'
+import { projectRoot, type ProjectNavLocation } from '@/lib/project-navigation'
 
 /**
  * A section's pages as underline tabs above the content. These navigate
@@ -20,7 +17,7 @@ export function ProjectSectionTabs({
   location,
 }: {
   projectSlug: string
-  location: ProjectV2Location
+  location: ProjectNavLocation
 }) {
   const [searchParams] = useSearchParams()
   const { section, tab } = location
@@ -37,7 +34,7 @@ export function ProjectSectionTabs({
         return (
           <Link
             key={item.url}
-            to={`${projectV2Root(projectSlug)}/${item.url}${query}`}
+            to={`${projectRoot(projectSlug)}/${item.url}${query}`}
             aria-current={active ? 'page' : undefined}
             className={cn(
               'inline-flex min-h-10 shrink-0 items-center whitespace-nowrap border-b-2 border-transparent py-3 text-sm font-medium hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',

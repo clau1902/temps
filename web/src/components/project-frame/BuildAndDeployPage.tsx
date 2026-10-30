@@ -12,7 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { CombinedProjectSettings } from '@/components/project/settings/CombinedProjectSettings'
 import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
-import { projectV2Root } from '@/lib/project-navigation-v2'
+import { projectRoot } from '@/lib/project-navigation'
 import { useProjectEnvironment } from './project-environment-context'
 
 const BUILD_LOCATION_LABEL: Record<BuildLocation, string> = {
@@ -76,7 +76,7 @@ function EnvironmentRuntimeSummary({ project }: { project: ProjectResponse }) {
       </section>
     )
   if (!environment) return null
-  const settingsHref = `${projectV2Root(project.slug)}/environments?view=settings&${ENVIRONMENT_PARAM}=${encodeURIComponent(environment.slug)}`
+  const settingsHref = `${projectRoot(project.slug)}/environments?view=settings&${ENVIRONMENT_PARAM}=${encodeURIComponent(environment.slug)}`
   // Laid out like every other group on the page: what it is on the left,
   // the values on the right as label/value rows.
   return (

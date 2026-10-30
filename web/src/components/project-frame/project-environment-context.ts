@@ -4,7 +4,7 @@
 import { createContext, useContext } from 'react'
 import type { EnvironmentResponse } from '@/api/client'
 import type { EnvironmentSelection } from '@/lib/project-environment-selection'
-import type { EnvironmentScope } from '@/lib/project-navigation-v2'
+import type { EnvironmentScope } from '@/lib/project-navigation'
 
 export interface ProjectEnvironmentContextValue {
   environments: EnvironmentResponse[]
@@ -24,7 +24,7 @@ export interface ProjectEnvironmentContextValue {
 export const ProjectEnvironmentContext =
   createContext<ProjectEnvironmentContextValue | null>(null)
 
-/** The environment chosen in the v2 project bar. */
+/** The environment chosen in the project bar. */
 export function useProjectEnvironment(): ProjectEnvironmentContextValue {
   const value = useContext(ProjectEnvironmentContext)
   if (!value)

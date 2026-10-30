@@ -18,7 +18,7 @@ import type { ProjectResponse } from '@/api/client'
 import {
   ProjectEnvironmentContext,
   type ProjectEnvironmentContextValue,
-} from '@/components/project-v2/project-environment-context'
+} from '@/components/project-frame/project-environment-context'
 import CronMonitors from './CronMonitors'
 
 installBrowserWindow()
@@ -161,15 +161,27 @@ function serveCronList(paths: string[]) {
   })
 }
 
-function renderCronList(wrap: (page: React.ReactNode) => React.ReactNode) {
+/** Renders the cron list under a project bar set to `environment`. */
+function renderCronList(environment: {
+  id: number
+  name: string
+  slug: string
+}) {
   const query = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   const project = { id: 17, slug: 'synthetic', name: 'Synthetic' }
+  const bar = {
+    environments: [environment],
+    isPending: false,
+    selection: { environment, all: false, source: 'url' },
+  } as unknown as ProjectEnvironmentContextValue
   return render(
     <QueryClientProvider client={query}>
       <MemoryRouter initialEntries={['/']}>
-        {wrap(<CronMonitors project={project as ProjectResponse} />)}
+        <ProjectEnvironmentContext.Provider value={bar}>
+          <CronMonitors project={project as ProjectResponse} />
+        </ProjectEnvironmentContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
   )
@@ -178,7 +190,7 @@ function renderCronList(wrap: (page: React.ReactNode) => React.ReactNode) {
 test('the cron page lists the .temps.yaml jobs Temps runs, next to check-in monitors', async () => {
   const paths: string[] = []
   serveCronList(paths)
-  const view = renderCronList((page) => page)
+  const view = renderCronList({ id: 3, name: 'production', slug: 'production' })
 
   expect(view.getByRole('heading', { name: 'Scheduled by Temps' })).toBeTruthy()
   expect(view.getByRole('heading', { name: 'Check-in monitors' })).toBeTruthy()
@@ -186,7 +198,6 @@ test('the cron page lists the .temps.yaml jobs Temps runs, next to check-in moni
   expect(job.getAttribute('href')).toBe(
     '/projects/synthetic/settings/cron-jobs/3/9'
   )
-  expect(paths).toContain('/projects/17/environments/3/crons')
   expect(
     view
       .getAllByRole('link', { name: 'Create monitor' })
@@ -194,20 +205,10 @@ test('the cron page lists the .temps.yaml jobs Temps runs, next to check-in moni
   ).toContain('/projects/synthetic/cron-jobs/new')
 })
 
-test('in the v2 layout the jobs follow the environment bar', async () => {
+test('the jobs follow the environment chosen in the project bar', async () => {
   const paths: string[] = []
   serveCronList(paths)
-  const staging = { id: 5, name: 'staging', slug: 'staging' }
-  const bar = {
-    environments: [staging],
-    isPending: false,
-    selection: { environment: staging, all: false, source: 'url' },
-  } as unknown as ProjectEnvironmentContextValue
-  const view = renderCronList((page) => (
-    <ProjectEnvironmentContext.Provider value={bar}>
-      {page}
-    </ProjectEnvironmentContext.Provider>
-  ))
+  const view = renderCronList({ id: 5, name: 'staging', slug: 'staging' })
 
   await view.findByRole('link', { name: /\/api\/tick-5/ })
   expect(paths).toContain('/projects/17/environments/5/crons')

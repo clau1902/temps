@@ -18,7 +18,7 @@ afterEach(() => {
   apiClient.setConfig(original)
 })
 
-test('embedded, the environment name is left to the project bar and "New environment" sits in the tab row', () => {
+test('the environment name is left to the project bar and "New environment" sits in the tab row', () => {
   // Every other read of the page (containers, metrics) gets an empty list.
   apiClient.setConfig({
     baseUrl: 'https://console.example.test/api',
@@ -43,11 +43,8 @@ test('embedded, the environment name is left to the project bar and "New environ
     <QueryClientProvider client={query}>
       <MemoryRouter>
         <EnvironmentDashboard
-          embedded
           project={{ id: 17, slug: 'synthetic' } as ProjectResponse}
           environmentId={3}
-          environments={[environment]}
-          onEnvironmentChange={() => {}}
           onCreateEnvironment={() => creates++}
           onDelete={() => {}}
         />

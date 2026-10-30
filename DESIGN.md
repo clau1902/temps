@@ -55,8 +55,8 @@ in a narrower column.
 - Use [PageContainer and PageHeader](web/src/components/layout/PageContainer.tsx).
   `PageContainer` takes `width="form" | "full"` (default `full`).
 - The route shell owns the width and the gutters (`px-4 py-6 sm:px-6 lg:px-8`),
-  not the page. In the v2 project layout each section declares its width in
-  `web/src/lib/project-navigation-v2.ts`, and a tab can override it. Pages do
+  not the page. In a project each section declares its width in
+  `web/src/lib/project-navigation.ts`, and a tab can override it. Pages do
   not add their own `max-w-*`, `container` or `mx-auto` wrappers, so the width
   is decided in one place.
 - The page header and section tabs sit inside the same column as the content,

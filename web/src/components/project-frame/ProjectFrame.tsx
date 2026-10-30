@@ -5,31 +5,28 @@ import { PageNamedByChromeContext } from '@temps-sdk/ds'
 import type { ReactNode } from 'react'
 import type { ProjectResponse } from '@/api/client'
 import {
-  useProjectV2Location,
-  useProjectV2TabNamesPage,
-} from './use-project-v2-location'
+  useProjectLocation,
+  useProjectTabNamesPage,
+} from './use-project-location'
 import { ProjectEnvironmentProvider } from './ProjectEnvironmentProvider'
-import { ProjectV2LayoutContext } from './project-v2-layout-context'
 import { ProjectSectionTabs } from './ProjectSectionTabs'
 
-/** Shares the environment chosen in the bar with every v2 project page. */
-export function ProjectV2Frame({
+/** Shares the environment chosen in the bar with every project page. */
+export function ProjectFrame({
   project,
   children,
 }: {
   project: ProjectResponse
   children: ReactNode
 }) {
-  const location = useProjectV2Location(project.slug)
+  const location = useProjectLocation(project)
   return (
-    <ProjectV2LayoutContext.Provider value={true}>
-      <ProjectEnvironmentProvider
-        project={project}
-        scope={location.section.environmentScope}
-      >
-        {children}
-      </ProjectEnvironmentProvider>
-    </ProjectV2LayoutContext.Provider>
+    <ProjectEnvironmentProvider
+      project={project}
+      scope={location.section.environmentScope}
+    >
+      {children}
+    </ProjectEnvironmentProvider>
   )
 }
 
@@ -37,15 +34,15 @@ export function ProjectV2Frame({
  * The current section's tabs above its page. When the selected tab already
  * names the page, the page's own title is kept for screen readers only.
  */
-export function ProjectV2Section({
+export function ProjectSectionChrome({
   project,
   children,
 }: {
   project: ProjectResponse
   children: ReactNode
 }) {
-  const location = useProjectV2Location(project.slug)
-  const tabNamesPage = useProjectV2TabNamesPage(project.slug)
+  const location = useProjectLocation(project)
+  const tabNamesPage = useProjectTabNamesPage(project)
   return (
     <>
       <ProjectSectionTabs projectSlug={project.slug} location={location} />

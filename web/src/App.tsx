@@ -278,13 +278,8 @@ const ImportProject = lazy(() =>
 )
 const Import = lazy(() => import('./pages/Import'))
 const ProjectDetail = lazy(() =>
-  import('./pages/ProjectDetailRoutes').then((m) => ({
-    default: m.ProjectDetailClassicRoute,
-  }))
-)
-const ProjectDetailV2 = lazy(() =>
-  import('./pages/ProjectDetailRoutes').then((m) => ({
-    default: m.ProjectDetailV2Route,
+  import('./pages/ProjectDetail').then((m) => ({
+    default: m.ProjectDetail,
   }))
 )
 const Settings = lazy(() =>
@@ -1254,10 +1249,6 @@ const FullAppRoutes = () => {
                         <Route
                           path="/projects/import/:repositoryId"
                           element={<ImportProject />}
-                        />
-                        <Route
-                          path="/projects/:slug/v2/*"
-                          element={<ProjectDetailV2 />}
                         />
                         <Route
                           path="/projects/:slug/*"
