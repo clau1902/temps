@@ -140,7 +140,8 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'errors',
         title: 'Errors',
-        environmentScope: 'single',
+        // Its pages filter by the bar, "All environments" included.
+        environmentScope: 'all',
         width: 'full',
         tabs: [
           { title: 'Issues', url: 'errors' },
@@ -155,7 +156,8 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'traces',
         title: 'Traces',
-        environmentScope: 'single',
+        // Its pages filter by the bar, "All environments" included.
+        environmentScope: 'all',
         width: 'full',
         tabs: [
           { title: 'Traces', url: 'traces' },
@@ -165,7 +167,8 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'analytics',
         title: 'Analytics',
-        environmentScope: 'single',
+        // Its pages filter by the bar, "All environments" included.
+        environmentScope: 'all',
         width: 'full',
         tabs: [
           { title: 'Overview', url: 'analytics' },

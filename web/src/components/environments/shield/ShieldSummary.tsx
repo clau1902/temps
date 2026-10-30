@@ -35,7 +35,11 @@ import { ShieldSection } from './ShieldSection'
 
 const numberFormat = new Intl.NumberFormat()
 
-/** The summary for one window; every part of the tab shares one request. */
+/**
+ * The summary for one window; every part of the tab shares one request.
+ * While another window loads, the previous one stays as placeholder data:
+ * the mode (whose sentence names its own window) keeps it, the counts do not.
+ */
 function useShieldSummary(
   path: ShieldEnvironmentPath,
   timeWindow: ShieldWindowValue
@@ -94,13 +98,32 @@ export function ShieldModeStatus({
   timeWindow: ShieldWindowValue
   onOpenSettings?: () => void
 }) {
-  const summary = useShieldSummary(path, timeWindow).data
+  const query = useShieldSummary(path, timeWindow)
+  const summary = query.data
   return (
     <section
       aria-labelledby="shield-mode-heading"
       className="flex flex-col gap-3 border-b pb-6 sm:flex-row sm:items-start sm:justify-between"
     >
-      {summary ? (
+      {!summary && query.isError ? (
+        <div className="min-w-0 space-y-1">
+          <h2 id="shield-mode-heading" className="text-lg font-semibold">
+            Mode unknown
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            Shield&apos;s summary for this environment did not load, so its mode
+            is not known.{' '}
+            <button
+              type="button"
+              className="underline underline-offset-4"
+              disabled={query.isFetching}
+              onClick={() => void query.refetch()}
+            >
+              {query.isFetching ? 'Retrying…' : 'Retry'}
+            </button>
+          </p>
+        </div>
+      ) : summary ? (
         <div className="min-w-0 space-y-1">
           <h2 id="shield-mode-heading" className="text-lg font-semibold">
             Mode: {shieldModeLabel(summary.mode)}{' '}
@@ -165,7 +188,8 @@ export function ShieldVerdictStats({
   timeWindow: ShieldWindowValue
 }) {
   const summary = useShieldSummary(path, timeWindow)
-  if (!summary.data)
+  // The previous window's counts would read as this window's.
+  if (!summary.data || summary.isPlaceholderData)
     return summary.error ? (
       <ReadFailure
         resource="Shield summary"
@@ -233,7 +257,8 @@ export function ShieldSources({
   timeWindow: ShieldWindowValue
 }) {
   // A failed read is reported once, by the counts above.
-  const sources = useShieldSummary(path, timeWindow).data?.sources
+  const summary = useShieldSummary(path, timeWindow)
+  const sources = summary.isPlaceholderData ? undefined : summary.data?.sources
   return (
     <ShieldSection
       id="shield-sources"

@@ -50,7 +50,7 @@ export function ShieldEventsPanel({
     <ShieldSection
       id="shield-events"
       title="Recent events"
-      description={`The ${PREVIEW_SIZE} newest requests with a verdict, and challenges served.`}
+      description={`The ${PREVIEW_SIZE} newest requests with a verdict, and challenges served, whatever the time window.`}
       actions={
         <Button type="button" variant="outline" size="sm" onClick={onShowAll}>
           All events

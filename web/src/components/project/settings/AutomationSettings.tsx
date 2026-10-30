@@ -4,6 +4,7 @@
 import { SettingsGroup, StatusDot } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { MessageSquare } from 'lucide-react'
+import { nanoid } from 'nanoid'
 import type { ReactNode } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -182,10 +183,13 @@ function AutomationList({ project }: { project: ProjectResponse }) {
 
   const cap = autofix.data
   const lastRun = latestRunBySlug(runs.data?.items ?? [])
-  // Show the value being saved while the request is in flight.
+  // Show the value being saved while the request is in flight. A setting
+  // that did not load is shown off, not on.
   const autofixOn = pause.isPending
     ? !pause.variables?.body.paused
-    : !(cap?.settings.paused ?? false)
+    : cap
+      ? !cap.settings.paused
+      : false
 
   return (
     <div id="agents" className="divide-y">
@@ -299,7 +303,9 @@ function TemplateRow({
         // A plain project chat: the prompt, not a context type, decides
         // what it does. Each try is a new chat.
         contextType: 'project',
-        contextId: crypto.randomUUID(),
+        // `crypto.randomUUID` needs a secure context; a console served over
+        // plain HTTP has none.
+        contextId: nanoid(),
         title: template.title,
         description: `The "${template.title}" prompt is in the box below. Edit it if you like, then send.`,
         startPrompt: prompt,

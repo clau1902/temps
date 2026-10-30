@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  useBarPicksEnvironment,
+  useEnvironmentFilter,
+} from '@/components/project-frame/use-environment-filter'
 import { ActivityReportPage } from '@/components/analytics/ActivityReport'
 import { PageHeader } from '@/components/layout/PageContainer'
 
@@ -248,35 +252,41 @@ export function AnalyticsFilters({
   actions,
   leftActions,
 }: AnalyticsFiltersProps) {
+  // In a project the bar above picks the environment; a second picker here
+  // would disagree with it.
+  const barPicksEnvironment = useBarPicksEnvironment()
   const { data: environments } = useQuery({
     ...getEnvironmentsOptions({
       path: {
         project_id: project.id,
       },
     }),
+    enabled: !barPicksEnvironment,
   })
 
   return (
     <div className="flex flex-wrap items-center justify-between gap-2">
       <div className="flex flex-wrap items-center gap-2">
         {leftActions}
-        <Select
-          value={selectedEnvironment?.toString()}
-          onValueChange={(value) =>
-            onEnvironmentChange(value ? parseInt(value) : undefined)
-          }
-        >
-          <SelectTrigger aria-label="Environment" className="w-[200px]">
-            <SelectValue placeholder="All environments" />
-          </SelectTrigger>
-          <SelectContent>
-            {environments?.map((env) => (
-              <SelectItem key={env.id} value={env.id.toString()}>
-                {env.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {!barPicksEnvironment && (
+          <Select
+            value={selectedEnvironment?.toString()}
+            onValueChange={(value) =>
+              onEnvironmentChange(value ? parseInt(value) : undefined)
+            }
+          >
+            <SelectTrigger aria-label="Environment" className="w-[200px]">
+              <SelectValue placeholder="All environments" />
+            </SelectTrigger>
+            <SelectContent>
+              {environments?.map((env) => (
+                <SelectItem key={env.id} value={env.id.toString()}>
+                  {env.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
       </div>
 
       <div className="flex flex-wrap items-center gap-2">
@@ -354,9 +364,7 @@ function PagesTab({ project }: PagesTabProps) {
     () => dateFilterFromParams(filterParam, fromParam, toParam),
     [filterParam, fromParam, toParam]
   )
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
@@ -496,9 +504,7 @@ function EventDetailTab({ project }: EventDetailTabProps) {
       return { quickFilter: '24hours', dateRange: undefined }
     }
   )
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
@@ -628,9 +634,7 @@ function DimensionTab({ project }: DimensionTabProps) {
       return { quickFilter: '24hours', dateRange: undefined }
     }
   )
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
@@ -765,9 +769,7 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
       return { quickFilter: '24hours', dateRange: undefined }
     }
   )
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
@@ -923,9 +925,7 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
       return { quickFilter: '24hours', dateRange: undefined }
     }
   )
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
@@ -1048,9 +1048,7 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
     quickFilter: '24hours',
     dateRange: undefined,
   })
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
@@ -1116,9 +1114,7 @@ function JourneyTab({ project }: JourneyTabProps) {
     quickFilter: '24hours',
     dateRange: undefined,
   })
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const queryClient = useQueryClient()
 
@@ -1282,9 +1278,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
     [patchUrl]
   )
 
-  const [selectedEnvironment, setSelectedEnvironment] = React.useState<
-    number | undefined
-  >(undefined)
+  const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = React.useState(false)
   const [dateRangeRefreshKey, setDateRangeRefreshKey] = React.useState(0)
   // While the guided tour is showing off this page, don't yank the user to

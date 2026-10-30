@@ -3,12 +3,21 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, within } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from '@testing-library/react'
+import { useState } from 'react'
 import { MemoryRouter } from 'react-router'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import type { ShieldWindowValue } from '@/lib/shield'
 import { EnvironmentShieldView } from './EnvironmentShieldView'
+import { ShieldVerdictStats } from './ShieldSummary'
 
 installBrowserWindow()
 afterEach(cleanup)
@@ -32,13 +41,13 @@ const SUMMARY = {
   would_have: { blocked: 4, challenged: 2 },
 }
 
-function renderView() {
+function renderView(url = '/') {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   return render(
     <QueryClientProvider client={client}>
-      <MemoryRouter>
+      <MemoryRouter initialEntries={[url]}>
         <EnvironmentShieldView
           project={{ id: 3, slug: 'synthetic' } as ProjectResponse}
           environment={{ id: 7, name: 'staging' } as EnvironmentResponse}
@@ -91,5 +100,76 @@ test('the tab reads in three levels: mode, then Activity, then Tools', async () 
   expect(view.queryByRole('alert')).toBeNull()
   view.getByText(/Selective mode would have blocked/)
   expect(await view.findByText('synthetic-list')).toBeTruthy()
+  api.restore()
+})
+
+test('a failed summary says the mode is unknown and offers a retry', async () => {
+  let reads = 0
+  const api = mockApi({
+    [`GET ${SHIELD}/summary`]: () => {
+      reads++
+      return jsonResponse({ title: 'Unavailable', status: 503 }, 503)
+    },
+    [`GET ${SHIELD}/events`]: () => jsonResponse({ events: [] }),
+    [`GET ${SHIELD}/tokens`]: () => jsonResponse([]),
+  })
+  const view = renderView()
+
+  await view.findByRole('heading', { level: 2, name: 'Mode unknown' })
+  expect(view.queryByRole('status', { name: 'Loading Shield mode' })).toBeNull()
+  const before = reads
+  fireEvent.click(view.getAllByRole('button', { name: 'Retry' })[0])
+  await waitFor(() => expect(reads).toBeGreaterThan(before))
+  api.restore()
+})
+
+test('every event, shown on its own, heads the page with an h2', async () => {
+  const api = mockApi({
+    [`GET ${SHIELD}/events`]: () => jsonResponse({ events: [] }),
+  })
+  const view = renderView('/?shield=events')
+
+  expect(
+    await view.findByRole('heading', { level: 2, name: 'All events' })
+  ).toBeTruthy()
+  api.restore()
+})
+
+test('while another window loads, the previous counts are not shown under it', async () => {
+  const api = mockApi({
+    [`GET ${SHIELD}/summary`]: (request) =>
+      new URL(request.url).searchParams.get('window') === '1h'
+        ? new Promise<Response>(() => {})
+        : jsonResponse(SUMMARY),
+  })
+  function Harness() {
+    const [timeWindow, setTimeWindow] = useState<ShieldWindowValue>('24h')
+    return (
+      <>
+        <button type="button" onClick={() => setTimeWindow('1h')}>
+          Last hour
+        </button>
+        <ShieldVerdictStats
+          path={{ project_id: 3, environment_id: 7 }}
+          timeWindow={timeWindow}
+        />
+      </>
+    )
+  }
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = render(
+    <QueryClientProvider client={client}>
+      <Harness />
+    </QueryClientProvider>
+  )
+
+  expect(await view.findByText('597')).toBeTruthy()
+  fireEvent.click(view.getByRole('button', { name: 'Last hour' }))
+  expect(
+    await view.findByRole('status', { name: 'Loading Shield summary' })
+  ).toBeTruthy()
+  expect(view.queryByText('597')).toBeNull()
   api.restore()
 })

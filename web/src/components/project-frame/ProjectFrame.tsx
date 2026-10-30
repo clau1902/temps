@@ -21,7 +21,10 @@ export function ProjectFrame({
 }) {
   const location = useProjectLocation(project)
   return (
+    // Keyed: the remembered and default environments are read from storage
+    // on mount, so going from one project to another must remount it.
     <ProjectEnvironmentProvider
+      key={project.id}
       project={project}
       scope={location.section.environmentScope}
     >

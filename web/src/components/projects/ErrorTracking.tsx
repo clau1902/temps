@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { ProjectResponse } from '@/api/client'
 import {
@@ -135,9 +136,7 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
       return params
     })
   }
-  const [environmentFilter, setEnvironmentFilter] = useState<
-    number | undefined
-  >(undefined)
+  const [environmentFilter, setEnvironmentFilter] = useEnvironmentFilter()
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [statusFilter, setStatusFilter] = useState<
     'unresolved' | 'resolved' | 'all'

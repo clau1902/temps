@@ -162,18 +162,20 @@ function serveCronList(paths: string[]) {
 }
 
 /** Renders the cron list under a project bar set to `environment`. */
-function renderCronList(environment: {
-  id: number
-  name: string
-  slug: string
-}) {
+function renderCronList(
+  environment: { id: number; name: string; slug: string } | undefined,
+  barState: { isError?: boolean; retry?: () => void } = {}
+) {
   const query = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   })
   const project = { id: 17, slug: 'synthetic', name: 'Synthetic' }
   const bar = {
-    environments: [environment],
+    environments: environment ? [environment] : [],
     isPending: false,
+    isError: false,
+    retry: () => {},
+    ...barState,
     selection: { environment, all: false, source: 'url' },
   } as unknown as ProjectEnvironmentContextValue
   return render(
@@ -215,4 +217,18 @@ test('the jobs follow the environment chosen in the project bar', async () => {
   expect(paths).not.toContain('/projects/17/environments/3/crons')
   // The bar picks the environment; the section has no picker of its own.
   expect(view.queryByLabelText('Environment')).toBeNull()
+})
+
+test('a failed environments read is reported with a retry, not as "no environments"', () => {
+  serveCronList([])
+  let retries = 0
+  const view = renderCronList(undefined, {
+    isError: true,
+    retry: () => retries++,
+  })
+
+  expect(view.getByText('Could not load environments')).toBeTruthy()
+  expect(view.queryByText('This service has no environments yet.')).toBeNull()
+  fireEvent.click(view.getByRole('button', { name: 'Retry' }))
+  expect(retries).toBe(1)
 })

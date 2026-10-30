@@ -111,7 +111,19 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
         </div>
       </div>
 
-      {crons.isError ? (
+      {bar.isError ? (
+        <Callout tone="error" title="Could not load environments">
+          The scheduled jobs are listed per environment, and this service&apos;s
+          environments did not load.{' '}
+          <button
+            type="button"
+            className="underline underline-offset-4"
+            onClick={bar.retry}
+          >
+            Retry
+          </button>
+        </Callout>
+      ) : crons.isError ? (
         <Callout tone="error" title="Could not load scheduled jobs">
           {readFailureServerDetail(crons.error) ??
             `The scheduled jobs of ${environment?.name ?? 'this environment'} did not load.`}{' '}

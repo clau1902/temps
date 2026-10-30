@@ -26,12 +26,29 @@ export function openSettingsSection(id: string): boolean {
   if (!element) return false
   if (element instanceof HTMLDetailsElement) element.open = true
   element.scrollIntoView({ block: 'start' })
-  element.classList.add(...HIGHLIGHT_CLASSES)
-  window.setTimeout(
-    () => element.classList.remove(...HIGHLIGHT_CLASSES),
-    HIGHLIGHT_MS
-  )
+  highlight(element)
   return true
+}
+
+/** Highlights in progress, so a repeat restarts the timer instead of racing it. */
+const highlights = new WeakMap<Element, { added: string[]; timer: number }>()
+
+/**
+ * Adds the highlight for `HIGHLIGHT_MS`, then removes only the classes it
+ * added: a card that is already `rounded-lg` keeps its corners.
+ */
+function highlight(element: Element) {
+  const active = highlights.get(element)
+  if (active) window.clearTimeout(active.timer)
+  const added =
+    active?.added ??
+    HIGHLIGHT_CLASSES.filter((name) => !element.classList.contains(name))
+  element.classList.add(...added)
+  const timer = window.setTimeout(() => {
+    element.classList.remove(...added)
+    highlights.delete(element)
+  }, HIGHLIGHT_MS)
+  highlights.set(element, { added, timer })
 }
 
 /**
@@ -49,8 +66,11 @@ export function openSettingsSection(id: string): boolean {
  */
 export function useScrollToLinkedSection() {
   const { pathname, search, hash } = useLocation()
+  // Only the sections the URL names: another query parameter changing
+  // (`?section=agents&tab=runs`) must not scroll the reader back.
+  const targets = JSON.stringify(linkedSectionTargets(search, hash))
   useEffect(() => {
-    const [primary, ...fallbacks] = linkedSectionTargets(search, hash)
+    const [primary, ...fallbacks] = JSON.parse(targets) as string[]
     if (!primary) return
     if (openSettingsSection(primary)) return
     let onFallback = fallbacks.some((id) => openSettingsSection(id))
@@ -69,5 +89,5 @@ export function useScrollToLinkedSection() {
     }
     observer.observe(document.body, { childList: true, subtree: true })
     return stop
-  }, [pathname, search, hash])
+  }, [pathname, targets])
 }
