@@ -5,6 +5,7 @@
 name = "temps-query-redis"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 temps-query = { path = "../temps-query" }
@@ -34,3 +35,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 testcontainers = { workspace = true }
+
+[lints]
+workspace = true
