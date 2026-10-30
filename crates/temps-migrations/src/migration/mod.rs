@@ -416,6 +416,9 @@ mod m20261028_000001_domain_certificate_settings;
 mod m20261029_000001_completed_dns_cleanup_orders;
 mod m20261102_000001_status_page_appearance;
 mod m20261103_000001_platform_status_pages;
+mod m20261104_000001_add_ip_geolocations_asn_number;
+mod m20261104_000002_create_project_analytics_settings;
+mod m20261104_000003_create_analytics_traffic_filters;
 
 pub struct Migrator;
 
@@ -933,6 +936,11 @@ impl MigratorTrait for Migrator {
             // Status page appearance and public incident titles.
             Box::new(m20261102_000001_status_page_appearance::Migration),
             Box::new(m20261103_000001_platform_status_pages::Migration),
+            // Analytics traffic quality: ASN numbers on IP rows, per-project
+            // traffic settings, and user-defined traffic filters.
+            Box::new(m20261104_000001_add_ip_geolocations_asn_number::Migration),
+            Box::new(m20261104_000002_create_project_analytics_settings::Migration),
+            Box::new(m20261104_000003_create_analytics_traffic_filters::Migration),
         ]
     }
 }
