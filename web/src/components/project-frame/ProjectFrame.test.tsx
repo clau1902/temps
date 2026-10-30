@@ -56,3 +56,25 @@ test('going straight to another project reads that project’s remembered enviro
   view.rerender(frame({ id: 2, slug: 'second' }))
   expect(view.getByText('Selected: preview')).toBeTruthy()
 })
+
+test('a link that still names the environment by id opens that environment', () => {
+  const query = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  query.setQueryData(
+    getEnvironmentsOptions({ path: { project_id: 1 } }).queryKey,
+    environments
+  )
+  const view = render(
+    <QueryClientProvider client={query}>
+      <MemoryRouter
+        initialEntries={['/projects/first/environments?environment=2']}
+      >
+        <ProjectFrame project={{ id: 1, slug: 'first' } as ProjectResponse}>
+          <Selected />
+        </ProjectFrame>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  expect(view.getByText('Selected: staging')).toBeTruthy()
+})

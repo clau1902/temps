@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   ALL_ENVIRONMENTS,
   environmentLiveStatus,
+  legacyEnvironmentSlug,
   resolveDefaultEnvironment,
   resolveEnvironmentSelection,
 } from './project-environment-selection'
@@ -110,4 +111,15 @@ describe('environmentLiveStatus', () => {
       environmentLiveStatus({ sleeping: false, current_deployment_id: null })
     ).toEqual({ tone: 'idle', label: 'Not deployed' })
   })
+})
+
+test('a legacy ?environment= value is read as an id or a slug', () => {
+  const environments = [
+    { id: 3, slug: 'production' },
+    { id: 5, slug: 'staging' },
+  ]
+  expect(legacyEnvironmentSlug(environments, '5')).toBe('staging')
+  expect(legacyEnvironmentSlug(environments, 'production')).toBe('production')
+  expect(legacyEnvironmentSlug(environments, '99')).toBeNull()
+  expect(legacyEnvironmentSlug(environments, null)).toBeNull()
 })

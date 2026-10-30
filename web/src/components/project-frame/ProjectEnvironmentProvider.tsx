@@ -8,6 +8,8 @@ import type { ProjectResponse } from '@/api/client'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import {
   ENVIRONMENT_PARAM,
+  LEGACY_ENVIRONMENT_PARAM,
+  legacyEnvironmentSlug,
   resolveDefaultEnvironment,
   resolveEnvironmentSelection,
 } from '@/lib/project-environment-selection'
@@ -66,7 +68,13 @@ export function ProjectEnvironmentProvider({
     () => environmentsQuery.data ?? [],
     [environmentsQuery.data]
   )
-  const urlParam = searchParams.get(ENVIRONMENT_PARAM)
+  // `?env=` wins; a link that still says `?environment=<id>` is honoured.
+  const urlParam =
+    searchParams.get(ENVIRONMENT_PARAM) ??
+    legacyEnvironmentSlug(
+      environments,
+      searchParams.get(LEGACY_ENVIRONMENT_PARAM)
+    )
 
   const selection = useMemo(
     () =>

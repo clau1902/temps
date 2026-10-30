@@ -9,6 +9,25 @@ export const ENVIRONMENT_PARAM = 'env'
 /** Value of {@link ENVIRONMENT_PARAM} that selects every environment. */
 export const ALL_ENVIRONMENTS = 'all'
 
+/**
+ * `?environment=` from links made before the project bar (alarms, Shield,
+ * reachability, older bookmarks): an environment id, or sometimes a slug.
+ */
+export const LEGACY_ENVIRONMENT_PARAM = 'environment'
+
+/** The slug a legacy `?environment=` value names, if it names one. */
+export function legacyEnvironmentSlug(
+  environments: ReadonlyArray<{ id: number; slug: string }>,
+  value: string | null
+): string | null {
+  if (!value) return null
+  const match = environments.find(
+    (environment) =>
+      String(environment.id) === value || environment.slug === value
+  )
+  return match?.slug ?? null
+}
+
 interface SelectableEnvironment {
   id: number
   slug: string
