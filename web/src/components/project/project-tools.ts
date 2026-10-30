@@ -12,7 +12,6 @@ import {
   FileText,
   Filter,
   Flag,
-  Globe,
   KeyRound,
   LineChart,
   Play,
@@ -127,12 +126,6 @@ export const projectToolGroups: ProjectToolGroup[] = [
       },
       { title: 'Uptime', url: 'monitors', icon: Activity },
       { title: 'Cron jobs', url: 'cron-jobs', icon: Activity },
-      {
-        title: 'Status Pages',
-        url: 'status-pages',
-        icon: Globe,
-        featureKey: 'status-pages',
-      },
       { title: 'Request Logs', url: 'request-logs', icon: Rss },
       {
         title: 'AI Crawlers',

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useInProjectV2Layout } from '@/components/project-v2/project-v2-layout-context'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
@@ -165,13 +167,21 @@ export function ErrorTracking({ project }: ErrorTrackingProps) {
   const [page, setPage] = useState(1)
   const pageSize = 25
 
+  // In the v2 layout source maps and SDK setup are tabs of the Errors
+  // section, so this page shows only the issues, with their trend on top.
+  const inV2 = useInProjectV2Layout()
   // Get tab from URL or default to 'errors'
-  const selectedTab =
-    (searchParams.get('tab') as
-      'errors' | 'analytics' | 'sourcemaps' | 'setup') || 'errors'
+  const selectedTab = inV2
+    ? 'errors'
+    : (searchParams.get('tab') as
+        'errors' | 'analytics' | 'sourcemaps' | 'setup') || 'errors'
   const setSelectedTab = (
     tab: 'errors' | 'analytics' | 'sourcemaps' | 'setup'
   ) => {
+    if (inV2 && tab === 'setup') {
+      navigate(`/projects/${project.slug}/errors/setup`)
+      return
+    }
     setSearchParams((prev) => {
       const params = new URLSearchParams(prev)
       params.set('tab', tab)
@@ -759,51 +769,51 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
 
   return (
     <div className="space-y-5">
-      <div className="space-y-1">
-        <h2 className="text-2xl font-semibold tracking-tight">Errors</h2>
-        {hasErrors && dashboardStats ? (
-          <p className="text-sm text-muted-foreground">
-            <span className="font-medium text-foreground tabular-nums">
-              {dashboardStats.total_errors.toLocaleString()}
-            </span>{' '}
-            events across{' '}
-            <span className="font-medium text-foreground tabular-nums">
-              {dashboardStats.error_groups.toLocaleString()}
-            </span>{' '}
-            groups in the {rangeLabel}
-            {environmentFilter != null && (
-              <>
-                {' '}
-                (
-                {environments?.find((e) => e.id === environmentFilter)?.name ??
-                  'selected environment'}
-                )
-              </>
-            )}
-            {trendDelta !== 0 && (
-              <span
-                className={cn(
-                  'ml-2 inline-flex items-center gap-0.5 text-xs font-medium tabular-nums',
-                  trendUp
-                    ? 'text-red-700 dark:text-red-500'
-                    : 'text-green-700 dark:text-green-500'
-                )}
-              >
-                {trendUp ? (
-                  <TrendingUp className="h-3 w-3" />
-                ) : (
-                  <TrendingDown className="h-3 w-3" />
-                )}
-                {Math.abs(trendDelta).toFixed(1)}% vs previous
-              </span>
-            )}
-          </p>
-        ) : (
-          <p className="text-sm text-muted-foreground">
-            Track exceptions and stack traces from your applications.
-          </p>
-        )}
-      </div>
+      <PageHeader
+        title="Errors"
+        description={
+          hasErrors && dashboardStats ? (
+            <span>
+              <span className="font-medium text-foreground tabular-nums">
+                {dashboardStats.total_errors.toLocaleString()}
+              </span>{' '}
+              events across{' '}
+              <span className="font-medium text-foreground tabular-nums">
+                {dashboardStats.error_groups.toLocaleString()}
+              </span>{' '}
+              groups in the {rangeLabel}
+              {environmentFilter != null && (
+                <>
+                  {' '}
+                  (
+                  {environments?.find((e) => e.id === environmentFilter)
+                    ?.name ?? 'selected environment'}
+                  )
+                </>
+              )}
+              {trendDelta !== 0 && (
+                <span
+                  className={cn(
+                    'ml-2 inline-flex items-center gap-0.5 text-xs font-medium tabular-nums',
+                    trendUp
+                      ? 'text-red-700 dark:text-red-500'
+                      : 'text-green-700 dark:text-green-500'
+                  )}
+                >
+                  {trendUp ? (
+                    <TrendingUp className="h-3 w-3" />
+                  ) : (
+                    <TrendingDown className="h-3 w-3" />
+                  )}
+                  {Math.abs(trendDelta).toFixed(1)}% vs previous
+                </span>
+              )}
+            </span>
+          ) : (
+            'Track exceptions and stack traces from your applications.'
+          )
+        }
+      />
 
       {hasErrors && (
         <AnalyticsFilters
@@ -890,7 +900,10 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           setSelectedTab(v as 'errors' | 'analytics' | 'sourcemaps' | 'setup')
         }
       >
-        <ScrollableTabsList aria-label="Error tracking sections">
+        <ScrollableTabsList
+          aria-label="Error tracking sections"
+          className={cn(inV2 && 'hidden')}
+        >
           <TabsTrigger value="errors">
             Error Groups
             {hasErrors && (
@@ -914,7 +927,18 @@ After setup, trigger a test error and check the Temps error tracking dashboard t
           </TabsTrigger>
         </ScrollableTabsList>
 
-        <TabsContent value="errors" className="mt-5 space-y-3">
+        <TabsContent
+          value="errors"
+          className={cn('space-y-3', inV2 ? 'mt-0' : 'mt-5')}
+        >
+          {inV2 && hasErrors && (
+            <ErrorTimeSeriesChart
+              project={project}
+              startDate={startDate ?? new Date()}
+              endDate={endDate ?? new Date()}
+              environmentId={environmentFilter}
+            />
+          )}
           {hasErrors ? (
             isLoadingGroups ? (
               <div className="space-y-3">

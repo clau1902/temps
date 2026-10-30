@@ -1527,6 +1527,13 @@ export function DockBody({
               }
               autoStart={active!.autoStart}
               lazyCreate={active!.contextType === 'project'}
+              // A free-form project chat never auto-starts, so a prompt the
+              // opener gave it goes in the composer for the user to send.
+              initialDraft={
+                active!.contextType === 'project'
+                  ? active!.startPrompt
+                  : undefined
+              }
               emptyHint="Ask anything about this project — deployments, logs, traces, and errors."
               placeholder={
                 active!.contextType === 'project'

@@ -10,9 +10,7 @@ import {
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { SHIELD_MODES } from '@/lib/shield'
 import { ShieldEntriesPanel } from '@/components/shield/ShieldEntriesPanel'
-import { useOpenSectionFromHash } from '@/hooks/useOpenSectionFromHash'
 import { ShieldWouldHaveCounts } from './ShieldWouldHaveCounts'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { Input } from '@/components/ui/input'
@@ -28,7 +26,6 @@ import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import {
   Bot,
-  InfoIcon,
   ListChecks,
   ScanSearch,
   Shield,
@@ -41,7 +38,6 @@ import { toast } from 'sonner'
 import { useMutation } from '@tanstack/react-query'
 
 /** Sections other pages link to, such as an environment's Shield tab. */
-const SHIELD_SECTIONS = ['shield', 'shield-entries'] as const
 
 interface ProjectSecuritySettingsProps {
   project: ProjectResponse
@@ -81,7 +77,6 @@ export function ProjectSecuritySettings({
   project,
   refetch,
 }: ProjectSecuritySettingsProps) {
-  useOpenSectionFromHash(SHIELD_SECTIONS)
   const updateDeploymentConfig = useMutation({
     ...updateProjectDeploymentConfigMutation(),
     meta: {
@@ -339,15 +334,6 @@ export function ProjectSecuritySettings({
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <Alert>
-        <InfoIcon className="h-4 w-4" />
-        <AlertTitle>Configuration Inheritance</AlertTitle>
-        <AlertDescription>
-          Service-level security settings override global settings. Leave fields
-          empty to inherit from global configuration.
-        </AlertDescription>
-      </Alert>
-
       {/* Shield Card (ADR 066): replaces the Attack Mode card */}
       <SettingsSection
         id="shield"
@@ -421,6 +407,7 @@ export function ProjectSecuritySettings({
 
       {/* AI Assistance Card */}
       <SettingsSection
+        id="ai-assistance"
         title="AI Assistance"
         description="Configure AI summaries and assistance for this service"
         icon={Bot}
@@ -476,6 +463,7 @@ export function ProjectSecuritySettings({
 
       {/* Vulnerability Scanning Card */}
       <SettingsSection
+        id="vulnerability-scanning"
         title="Vulnerability Scanning"
         description="Automatically scan deployed images for known vulnerabilities after every deployment and daily"
         icon={ScanSearch}
@@ -483,7 +471,7 @@ export function ProjectSecuritySettings({
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <Label htmlFor="vulnerability-scanning">
+              <Label htmlFor="vulnerability-scanning-enabled">
                 Enable vulnerability scanning
               </Label>
               <p className="text-sm text-muted-foreground">
@@ -493,7 +481,7 @@ export function ProjectSecuritySettings({
               </p>
             </div>
             <Switch
-              id="vulnerability-scanning"
+              id="vulnerability-scanning-enabled"
               checked={vulnerabilityScanningEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('vulnerability_scanning_enabled', checked, {
@@ -512,6 +500,7 @@ export function ProjectSecuritySettings({
 
       {/* Security Headers Card */}
       <SettingsSection
+        id="security-headers"
         title="Security Headers"
         description="Configure service HTTP security headers that override global settings"
         icon={ShieldCheck}
@@ -636,6 +625,7 @@ export function ProjectSecuritySettings({
 
       {/* Rate Limiting Card */}
       <SettingsSection
+        id="rate-limiting"
         title="Rate Limiting"
         description="Configure service rate limits that override global settings"
         icon={TrafficCone}

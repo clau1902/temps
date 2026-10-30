@@ -63,25 +63,20 @@ import {
   type AlertStatusLevel,
 } from '@/components/metrics/alert-status'
 import { SuggestAlertsButton } from '@/components/metrics/SuggestAlertsButton'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   ArrowLeft,
   BarChart3,
-  ChevronDown,
-  Gauge,
   LineChart as LineChartIcon,
   RefreshCw,
   Search,
-  SlidersHorizontal,
 } from 'lucide-react'
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible'
-import { useEffect, useMemo, useState } from 'react'
+import { ProjectEnvironmentContext } from '@/components/project-v2/project-environment-context'
+import { cn } from '@/lib/utils'
+import { useContext, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 
 interface MetricsExplorerProps {
@@ -257,9 +252,14 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     const r = searchParams.get('range') as TimeRange | null
     return r && TIME_RANGES.some((t) => t.value === r) ? r : '24h'
   })()
-  const environmentId = searchParams.get('environment_id')
-    ? Number(searchParams.get('environment_id'))
-    : null
+  // In the v2 layout the project bar chooses the environment for the whole
+  // section; this page follows it instead of keeping a second picker.
+  const barEnvironment = useContext(ProjectEnvironmentContext)
+  const environmentId = barEnvironment
+    ? (barEnvironment.selection.environment?.id ?? null)
+    : searchParams.get('environment_id')
+      ? Number(searchParams.get('environment_id'))
+      : null
   const aggregation = ((): AggKind => {
     const a = searchParams.get('agg') as AggKind | null
     return a && AGGREGATIONS.some((x) => x.value === a) ? a : 'avg'
@@ -287,7 +287,6 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
   const [nameSearch, setNameSearch] = useState('')
   // The filter controls collapse by default so the metric grid / chart sits high
   // on the page; the collapsed header still summarizes the active selection.
-  const [filtersOpen, setFiltersOpen] = useState(false)
   const [queryClock, setQueryClock] = useState(Date.now)
   const queryClient = useQueryClient()
 
@@ -358,8 +357,10 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     enabled: !!project.id,
   })
 
+  // One tile per name, even if the API reports a name more than once (the
+  // same metric from two SDKs or instrument types).
   const allNames = useMemo(
-    () => namesQuery.data?.names ?? [],
+    () => [...new Set(namesQuery.data?.names ?? [])],
     [namesQuery.data]
   )
   const filteredNames = useMemo(() => {
@@ -639,96 +640,55 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
 
   const aggLabel =
     AGGREGATIONS.find((a) => a.value === aggregation)?.label ?? 'Average'
-  // Collapsed-header summary: what's currently narrowing the view.
-  const rangeLabel = isCustom
-    ? 'Custom range'
-    : (TIME_RANGES.find((r) => r.value === timeRange)?.label ?? 'Last 24 hours')
-  const envLabel = selectedEnv?.name ?? 'All environments'
-  const activeFilterCount =
-    (serviceName.trim() ? 1 : 0) +
-    labelFilters.filter((f) => f.key.trim().length > 0).length
 
   return (
     <div className="flex w-full flex-col gap-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-col gap-1">
-          <div className="flex items-center gap-2">
-            <Gauge className="size-5 text-muted-foreground" />
-            <h1 className="text-lg font-semibold tracking-tight">Metrics</h1>
-          </div>
-          <p className="text-sm text-muted-foreground">
-            Explore application metrics from OpenTelemetry and Sentry SDKs.
-          </p>
-        </div>
-        <div className="flex flex-wrap items-center gap-2 self-start">
-          <SuggestAlertsButton
-            projectId={project.id}
-            projectSlug={project.slug}
-            projectName={project.name}
-            focusMetric={metricName || undefined}
-            disabled={!namesQuery.isPending && allNames.length === 0}
-          />
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => {
-              namesQuery.refetch()
-              setQueryClock(Date.now())
-              // Custom bounds stay fixed; refresh every visible metric tile too.
-              if (isCustom)
-                void queryClient.invalidateQueries({
-                  queryKey: queryMetricsQueryKey({
-                    query: { project_id: project.id },
-                  }),
-                })
-            }}
-            className="gap-1.5"
-          >
-            <RefreshCw
-              className={
-                metricsQuery.isFetching || namesQuery.isFetching
-                  ? 'size-3.5 animate-spin'
-                  : 'size-3.5'
-              }
+      <PageHeader
+        title="Metrics"
+        description="Application metrics from OpenTelemetry and Sentry SDKs."
+        actions={
+          <>
+            <SuggestAlertsButton
+              projectId={project.id}
+              projectSlug={project.slug}
+              projectName={project.name}
+              focusMetric={metricName || undefined}
+              disabled={!namesQuery.isPending && allNames.length === 0}
             />
-            Refresh
-          </Button>
-        </div>
-      </div>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                namesQuery.refetch()
+                setQueryClock(Date.now())
+                // Custom bounds stay fixed; refresh every visible metric tile too.
+                if (isCustom)
+                  void queryClient.invalidateQueries({
+                    queryKey: queryMetricsQueryKey({
+                      query: { project_id: project.id },
+                    }),
+                  })
+              }}
+              className="gap-1.5"
+            >
+              <RefreshCw
+                className={
+                  metricsQuery.isFetching || namesQuery.isFetching
+                    ? 'size-3.5 animate-spin'
+                    : 'size-3.5'
+                }
+              />
+              Refresh
+            </Button>
+          </>
+        }
+      />
 
-      {/* Filter bar — collapsed by default; the header summarizes the active
-          aggregation, environment, range, and any service/label filters. */}
-      <Collapsible
-        open={filtersOpen}
-        onOpenChange={setFiltersOpen}
-        className="rounded-lg border border-border bg-card"
-      >
-        <CollapsibleTrigger className="flex w-full items-center justify-between gap-2 px-3 py-2.5 text-left text-sm transition-colors hover:bg-muted/40">
-          <span className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
-            <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
-            <span className="font-medium">Filters</span>
-            <span className="text-muted-foreground">·</span>
-            <span className="text-muted-foreground">{aggLabel}</span>
-            <span className="text-muted-foreground">·</span>
-            <span className="text-muted-foreground">{envLabel}</span>
-            <span className="text-muted-foreground">·</span>
-            <span className="text-muted-foreground">{rangeLabel}</span>
-            {activeFilterCount > 0 && (
-              <Badge variant="secondary" className="ml-1 shrink-0">
-                {activeFilterCount} filter{activeFilterCount === 1 ? '' : 's'}
-              </Badge>
-            )}
-          </span>
-          <ChevronDown
-            className={[
-              'size-4 shrink-0 text-muted-foreground transition-transform',
-              filtersOpen ? 'rotate-180' : '',
-            ].join(' ')}
-          />
-        </CollapsibleTrigger>
-        <CollapsibleContent>
-          <div className="flex flex-col gap-3 border-t border-border p-3">
+      {/* Filters, always in view: what is charted and how is the page's
+          main control, not something to unfold first. */}
+      <div className="rounded-lg border border-border bg-card">
+        <div>
+          <div className="flex flex-col gap-3 p-3">
             <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-end">
               {/* Metric-name selector with inline search */}
               <div className="flex min-w-0 flex-1 flex-col gap-1">
@@ -799,8 +759,13 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
                 </Select>
               </div>
 
-              {/* Environment */}
-              <div className="flex flex-col gap-1">
+              {/* Environment (the v2 bar picks it there) */}
+              <div
+                className={cn(
+                  'flex flex-col gap-1',
+                  barEnvironment && 'hidden'
+                )}
+              >
                 <label className="text-xs font-medium text-muted-foreground">
                   Environment
                 </label>
@@ -889,8 +854,8 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
               />
             )}
           </div>
-        </CollapsibleContent>
-      </Collapsible>
+        </div>
+      </div>
 
       {metricName ? (
         <>

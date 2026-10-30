@@ -7,6 +7,7 @@ export {
   PageContainer,
   PageHeader,
   type PageContainerProps,
+  type PageWidth,
   type PageHeaderProps,
 } from './page-header'
 export { ProjectAvatar, type ProjectAvatarProps } from './project-avatar'
@@ -87,7 +88,13 @@ export { LogLevelBadge } from './log-level-badge'
 
 export { HelpPopover, Disclosure } from './help'
 
-export { SettingsSection } from './settings-section'
+export { SettingsSection, SettingsSurface } from './settings-section'
+export { useOnSettingsSurface } from './settings-surface-context'
+export {
+  InsidePageContainerContext,
+  PageNamedByChromeContext,
+  usePageNamedByChrome,
+} from './page-context'
 
 export { SettingsGroup } from './settings-group'
 

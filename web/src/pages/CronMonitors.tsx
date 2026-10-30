@@ -22,7 +22,8 @@ import {
   Detail,
   Field,
   FormErrors,
-  Ledger,
+  PageContainer,
+  PageHeader,
   PageState,
   RecordLink,
   Settings,
@@ -55,6 +56,7 @@ import {
   listCronMonitorRunsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { CodeBlock } from '@/components/ui/code-block'
+import { ScheduledCronJobs } from '@/components/project/ScheduledCronJobs'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { readFailureServerDetail } from '@/lib/read-failure'
 
@@ -186,120 +188,141 @@ function CronList({ project }: { project: ProjectResponse }) {
     }),
     refetchInterval: 15000,
   })
+  const rows = query.data?.items ?? []
   return (
-    <Ledger<CronMonitorView>
-      title="Cron jobs"
-      description="Detect scheduled jobs that fail, start late, or run too long."
-      actions={
-        <>
-          <Button
-            variant="outline"
-            busy={query.isFetching}
-            busyLabel="Refreshing…"
-            onClick={() => void query.refetch()}
-          >
-            <RefreshCw className="size-4" />
-            Refresh
-          </Button>
-          <Button asChild>
-            <Link to={`${basePath(project)}/new`}>Create monitor</Link>
-          </Button>
-        </>
-      }
-      toolbar={
-        query.isError ? (
-          <Callout tone="error" title="Could not load cron jobs">
+    <PageContainer>
+      <PageHeader
+        title="Cron jobs"
+        description="Jobs Temps runs for you, and check-ins from jobs you schedule elsewhere."
+      />
+      <ScheduledCronJobs project={project} />
+      <section aria-labelledby="cron-check-in-monitors" className="space-y-4">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div className="min-w-0">
+            <h2 id="cron-check-in-monitors" className="text-base font-semibold">
+              Check-in monitors
+            </h2>
+            <p className="text-sm text-muted-foreground">
+              Detect scheduled jobs that fail, start late, or run too long.
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              busy={query.isFetching}
+              busyLabel="Refreshing…"
+              onClick={() => void query.refetch()}
+            >
+              <RefreshCw className="size-4" />
+              Refresh
+            </Button>
+            <Button asChild>
+              <Link to={`${basePath(project)}/new`}>Create monitor</Link>
+            </Button>
+          </div>
+        </div>
+        {query.isError && (
+          <Callout tone="error" title="Could not load cron monitors">
             {failure(query.error)}
           </Callout>
-        ) : undefined
-      }
-      rows={query.data?.items ?? []}
-      rowKey={(m) => m.id}
-      isLoading={query.isPending}
-      columns={[
-        {
-          key: 'slug',
-          header: 'Job',
-          render: (m) => (
-            <RecordLink to={`${basePath(project)}/${m.id}`}>
-              {m.slug}
-            </RecordLink>
-          ),
-        },
-        {
-          key: 'status',
-          header: 'Health',
-          render: (m) => <Health value={m.status} />,
-        },
-        {
-          key: 'scope',
-          header: 'Scope',
-          render: (m) =>
-            m.environment_id ? `Environment #${m.environment_id}` : 'Project',
-        },
-        {
-          key: 'schedule',
-          header: 'Schedule',
-          render: (m) => schedule(m.config),
-        },
-        {
-          key: 'last',
-          header: 'Last check-in',
-          render: (m) =>
-            m.last_check_in_at ? stamp(m.last_check_in_at) : 'Never received',
-        },
-        {
-          key: 'next',
-          header: 'Next expected',
-          render: (m) => stamp(m.next_expected_at),
-        },
-      ]}
-      empty={
-        query.isError ? (
-          <PageState
-            variant="failed"
-            size="compact"
-            icon={Clock3}
-            title="Cron jobs unavailable"
-            description={failure(query.error)}
-            action={<Button onClick={() => void query.refetch()}>Retry</Button>}
-          />
-        ) : page > 1 ? (
-          <PageState
-            variant="empty"
-            size="compact"
-            icon={Clock3}
-            title="No jobs on this page"
-            action={<Button onClick={() => setPage(1)}>First page</Button>}
-          />
-        ) : (
-          <>
+        )}
+        {!query.isPending && rows.length === 0 ? (
+          query.isError ? (
             <PageState
-              variant="not-set-up"
+              variant="failed"
               size="compact"
               icon={Clock3}
-              title="Monitor your scheduled jobs"
-              requirement="No cron monitors are configured for this project."
-              example="Alert when a daily summary never starts, fails, or runs longer than 30 minutes."
-              settingsHref={`${basePath(project)}/new`}
-              settingsLabel="Create monitor"
+              title="Cron jobs unavailable"
+              description={failure(query.error)}
+              action={
+                <Button onClick={() => void query.refetch()}>Retry</Button>
+              }
             />
-            <Setup project={project} />
-          </>
-        )
-      }
-      pagination={
-        query.data
-          ? {
-              page,
-              pageSize: 20,
-              total: query.data.total,
-              totalPages: Math.max(1, Math.ceil(query.data.total / 20)),
-              onPageChange: setPage,
+          ) : page > 1 ? (
+            <PageState
+              variant="empty"
+              size="compact"
+              icon={Clock3}
+              title="No jobs on this page"
+              action={<Button onClick={() => setPage(1)}>First page</Button>}
+            />
+          ) : (
+            <>
+              <PageState
+                variant="not-set-up"
+                size="compact"
+                icon={Clock3}
+                title="Monitor your scheduled jobs"
+                requirement="No cron monitors are configured for this project."
+                example="Alert when a daily summary never starts, fails, or runs longer than 30 minutes."
+                settingsHref={`${basePath(project)}/new`}
+                settingsLabel="Create monitor"
+              />
+              <Setup project={project} />
+            </>
+          )
+        ) : (
+          <DataTable<CronMonitorView>
+            rows={rows}
+            rowKey={(m) => m.id}
+            isLoading={query.isPending}
+            columns={[
+              {
+                key: 'slug',
+                header: 'Job',
+                render: (m) => (
+                  <RecordLink to={`${basePath(project)}/${m.id}`}>
+                    {m.slug}
+                  </RecordLink>
+                ),
+              },
+              {
+                key: 'status',
+                header: 'Health',
+                render: (m) => <Health value={m.status} />,
+              },
+              {
+                key: 'scope',
+                header: 'Scope',
+                render: (m) =>
+                  m.environment_id
+                    ? `Environment #${m.environment_id}`
+                    : 'Project',
+              },
+              {
+                key: 'schedule',
+                header: 'Schedule',
+                render: (m) => schedule(m.config),
+              },
+              {
+                key: 'last',
+                header: 'Last check-in',
+                render: (m) =>
+                  m.last_check_in_at
+                    ? stamp(m.last_check_in_at)
+                    : 'Never received',
+              },
+              {
+                key: 'next',
+                header: 'Next expected',
+                render: (m) => stamp(m.next_expected_at),
+              },
+            ]}
+            pagination={
+              query.data
+                ? {
+                    page,
+                    pageSize: 20,
+                    total: query.data.total,
+                    totalPages: Math.max(1, Math.ceil(query.data.total / 20)),
+                    onPageChange: setPage,
+                  }
+                : undefined
             }
-          : undefined
-      }
-    />
+          />
+        )}
+      </section>
+    </PageContainer>
   )
 }
 function CronRecord({ project }: { project: ProjectResponse }) {

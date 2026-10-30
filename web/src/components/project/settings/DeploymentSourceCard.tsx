@@ -176,7 +176,7 @@ export function DeploymentSourceCard({
   }
 
   return (
-    <Card>
+    <Card id="setting-deployment-source" className="scroll-mt-4">
       <CardHeader>
         <CardTitle>Deployment source</CardTitle>
         <CardDescription>

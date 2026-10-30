@@ -396,7 +396,11 @@ export function EnvironmentConfigurationCard({
                 no branch to deploy from and no repository to push to, so both
                 controls here are inapplicable rather than unconfigured. */}
         {hasGitRepo && (
-          <SettingsSection title="Git & deployments" icon={GitBranch}>
+          <SettingsSection
+            id="setting-environment-git"
+            title="Git & deployments"
+            icon={GitBranch}
+          >
             <div>
               <Label>Branch Name</Label>
               <div className="mt-2">
@@ -445,7 +449,11 @@ export function EnvironmentConfigurationCard({
         )}
 
         {/* CPU Resources */}
-        <SettingsSection title="Compute resources" icon={Cpu}>
+        <SettingsSection
+          id="setting-environment-resources"
+          title="Compute resources"
+          icon={Cpu}
+        >
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div className="space-y-4">
               <h3 className="text-sm font-medium">CPU Resources</h3>
@@ -587,7 +595,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* Scaling & Network */}
-        <SettingsSection title="Scaling" icon={Network}>
+        <SettingsSection
+          id="setting-environment-scaling"
+          title="Scaling"
+          icon={Network}
+        >
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <Label>Replicas</Label>
@@ -615,7 +627,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* On-Demand (Scale-to-Zero) */}
-        <SettingsSection title="Scale to zero" icon={Moon}>
+        <SettingsSection
+          id="setting-environment-scale-to-zero"
+          title="Scale to zero"
+          icon={Moon}
+        >
           <div className="space-y-4">
             <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
               <div className="flex-1 min-w-0">
@@ -694,7 +710,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* Request Timeouts */}
-        <SettingsSection title="Request timeouts" icon={Clock}>
+        <SettingsSection
+          id="setting-environment-timeouts"
+          title="Request timeouts"
+          icon={Clock}
+        >
           <p className="text-xs text-muted-foreground mb-4">
             Override the global request timeout defaults for this environment.
             Leave blank to inherit the service/global default (no timeout,
@@ -755,7 +775,11 @@ export function EnvironmentConfigurationCard({
         </SettingsSection>
 
         {/* Concurrent Connection Limit */}
-        <SettingsSection title="Connection limits" icon={Gauge}>
+        <SettingsSection
+          id="setting-environment-connection-limits"
+          title="Connection limits"
+          icon={Gauge}
+        >
           <p className="text-xs text-muted-foreground mb-4">
             Cap on concurrent in-flight requests to this environment&apos;s
             upstream. Protects the proxy&apos;s own connection budget from a
@@ -784,7 +808,11 @@ export function EnvironmentConfigurationCard({
 
         {/* Build location: always visible so operators learn builds can
             move off the control plane, even before a worker has joined. */}
-        <SettingsSection title="Builds" icon={Hammer}>
+        <SettingsSection
+          id="setting-environment-builds"
+          title="Builds"
+          icon={Hammer}
+        >
           <div className="space-y-2">
             <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
               <div className="flex-1 min-w-0">
@@ -874,7 +902,11 @@ export function EnvironmentConfigurationCard({
 
         {/* Node Scheduling */}
         {activeNodes.length > 0 && (
-          <SettingsSection title="Node scheduling" icon={Network}>
+          <SettingsSection
+            id="setting-environment-node-scheduling"
+            title="Node scheduling"
+            icon={Network}
+          >
             <div className="space-y-4">
               {/* Protected environment toggle */}
               <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
@@ -1090,7 +1122,11 @@ export function EnvironmentConfigurationCard({
         )}
 
         {/* Security Configuration */}
-        <SettingsSection title="Security" icon={Shield}>
+        <SettingsSection
+          id="setting-environment-security"
+          title="Security"
+          icon={Shield}
+        >
           <div className="space-y-4">
             <div className="space-y-3 p-3 border rounded-lg">
               <div className="flex items-start sm:items-center gap-3">

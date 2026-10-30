@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   listMonitorsOptions,
   getProjectRuntimeHealthOptions,
@@ -435,7 +436,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
 
   if (error) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Failed to load monitors"
           description={
@@ -451,19 +452,14 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">
-            {runtimeEnabled ? 'Uptime and health' : 'Monitors'}
-          </h2>
-          <p className="text-muted-foreground">
-            Monitor your service&apos;s uptime and performance
-          </p>
-        </div>
+      <div className="flex items-start justify-between gap-3">
+        <PageHeader
+          title={runtimeEnabled ? 'Uptime and health' : 'Monitors'}
+          description="Whether this service is up, and how fast it answers."
+        />
         <div className="flex items-center gap-2">
           <Button variant="outline" asChild>
-            <Link to={`/projects/${project.slug}/status-pages`}>
+            <Link to="/status-pages">
               <Globe className="size-4 sm:mr-2" />
               <span className="max-sm:sr-only">Status pages</span>
             </Link>

@@ -99,7 +99,10 @@ export function EnvironmentPortOverrideCard({
   }
 
   return (
-    <Card className="bg-background text-foreground">
+    <Card
+      id="setting-port-overrides"
+      className="scroll-mt-4 bg-background text-foreground"
+    >
       <CardHeader>
         <CardTitle>Environment Port Overrides</CardTitle>
         <CardDescription>

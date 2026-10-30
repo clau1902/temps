@@ -81,7 +81,7 @@ export function HostingCard({
   }
 
   return (
-    <Card>
+    <Card id="setting-where-it-runs" className="scroll-mt-4">
       <CardHeader>
         <CardTitle>Where it runs</CardTitle>
         <CardDescription>

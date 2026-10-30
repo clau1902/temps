@@ -5,7 +5,10 @@ import {
   getEnvironmentOptions,
   listContainersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { Plus } from 'lucide-react'
+import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { ContainerList } from '@/components/containers/ContainerList'
 import { ContainerActionDialog } from '@/components/containers/ContainerActionDialog'
@@ -31,6 +34,11 @@ interface EnvironmentDashboardProps {
   onEnvironmentChange?: (id: number) => void
   onCreateEnvironment?: () => void
   onDelete?: () => void
+  /**
+   * Inside the v2 project layout: the project bar already picks the
+   * environment, so drop the side column and show the views as tabs.
+   */
+  embedded?: boolean
 }
 
 export function EnvironmentDashboard({
@@ -40,6 +48,7 @@ export function EnvironmentDashboard({
   onEnvironmentChange,
   onCreateEnvironment,
   onDelete,
+  embedded = false,
 }: EnvironmentDashboardProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const activeView = resolveEnvironmentView(searchParams.get('view'))
@@ -69,7 +78,7 @@ export function EnvironmentDashboard({
 
   if (environmentError) {
     return (
-      <div className="p-4 sm:p-6">
+      <div>
         <ErrorAlert
           title="Failed to load environment"
           description={
@@ -89,7 +98,7 @@ export function EnvironmentDashboard({
 
   if (!environment) {
     return (
-      <div className="p-4 sm:p-6">
+      <div>
         <ErrorAlert
           title="Environment not found"
           description="The environment you're looking for does not exist"
@@ -100,6 +109,55 @@ export function EnvironmentDashboard({
   }
 
   const isStatic = project?.source_type === 'static_files'
+
+  if (embedded) {
+    return (
+      <div className="min-w-0 space-y-6">
+        {/* The project bar already shows the environment's name. */}
+        <h1 className="sr-only">{environment.name}</h1>
+        <div className="flex items-center gap-3 border-b">
+          <Tabs
+            className="min-w-0 flex-1"
+            value={activeView}
+            onValueChange={(value) =>
+              handleViewChange(resolveEnvironmentView(value))
+            }
+          >
+            <TabsList
+              className="border-b-0"
+              aria-label={`${environment.name} pages`}
+            >
+              {EMBEDDED_VIEWS.map((view) => (
+                <TabsTrigger key={view.value} value={view.value}>
+                  {view.label}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+          </Tabs>
+          {onCreateEnvironment && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={onCreateEnvironment}
+            >
+              <Plus className="size-4" aria-hidden="true" />
+              <span className="max-sm:sr-only">New environment</span>
+            </Button>
+          )}
+        </div>
+        <EnvironmentViewContent
+          project={project}
+          environment={environment}
+          environmentId={environmentId}
+          activeView={activeView}
+          isStatic={isStatic}
+          onViewChange={handleViewChange}
+          onDelete={onDelete}
+        />
+      </div>
+    )
+  }
 
   return (
     <div className="grid min-w-0 flex-1 content-start bg-background lg:content-stretch lg:grid-cols-[200px_minmax(0,1fr)]">
@@ -114,42 +172,77 @@ export function EnvironmentDashboard({
       <div className="min-w-0">
         <EnvironmentHeaderBar environment={environment} project={project} />
         <div className="w-full px-4 py-6 sm:px-6 sm:py-8 lg:px-8">
-          {activeView === 'settings' ? (
-            <EnvironmentSettingsContent
-              environment={environment}
-              project={project}
-              environmentId={environmentId.toString()}
-              onDelete={onDelete}
-            />
-          ) : activeView === 'shield' ? (
-            <EnvironmentShieldView
-              project={project}
-              environment={environment}
-              onOpenSettings={() => handleViewChange('settings')}
-            />
-          ) : isStatic ? (
-            <div className="flex flex-col items-center justify-center h-72 rounded-lg border border-neutral-950/10 bg-neutral-50 p-6 text-center dark:border-white/10 dark:bg-white/5">
-              <p className="text-sm font-semibold text-neutral-900 dark:text-white">
-                Static site
-              </p>
-              <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
-                This service does not have running containers to manage.
-              </p>
-            </div>
-          ) : activeView === 'metrics' ? (
-            <EnvironmentMetricsCharts
-              projectId={project.id}
-              environmentId={environmentId}
-            />
-          ) : (
-            <ContainerPanel
-              project={project}
-              environmentId={environmentId.toString()}
-            />
-          )}
+          <EnvironmentViewContent
+            project={project}
+            environment={environment}
+            environmentId={environmentId}
+            activeView={activeView}
+            isStatic={isStatic}
+            onViewChange={handleViewChange}
+            onDelete={onDelete}
+          />
         </div>
       </div>
     </div>
+  )
+}
+
+const EMBEDDED_VIEWS: { value: EnvironmentView; label: string }[] = [
+  { value: 'containers', label: 'Containers' },
+  { value: 'metrics', label: 'Metrics' },
+  { value: 'shield', label: 'Shield' },
+  { value: 'settings', label: 'Settings' },
+]
+
+function EnvironmentViewContent({
+  project,
+  environment,
+  environmentId,
+  activeView,
+  isStatic,
+  onViewChange,
+  onDelete,
+}: {
+  project: ProjectResponse
+  environment: EnvironmentResponse
+  environmentId: number
+  activeView: EnvironmentView
+  isStatic: boolean
+  onViewChange: (view: EnvironmentView) => void
+  onDelete?: () => void
+}) {
+  return activeView === 'settings' ? (
+    <EnvironmentSettingsContent
+      environment={environment}
+      project={project}
+      environmentId={environmentId.toString()}
+      onDelete={onDelete}
+    />
+  ) : activeView === 'shield' ? (
+    <EnvironmentShieldView
+      project={project}
+      environment={environment}
+      onOpenSettings={() => onViewChange('settings')}
+    />
+  ) : isStatic ? (
+    <div className="flex flex-col items-center justify-center h-72 rounded-lg border border-neutral-950/10 bg-neutral-50 p-6 text-center dark:border-white/10 dark:bg-white/5">
+      <p className="text-sm font-semibold text-neutral-900 dark:text-white">
+        Static site
+      </p>
+      <p className="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
+        This service does not have running containers to manage.
+      </p>
+    </div>
+  ) : activeView === 'metrics' ? (
+    <EnvironmentMetricsCharts
+      projectId={project.id}
+      environmentId={environmentId}
+    />
+  ) : (
+    <ContainerPanel
+      project={project}
+      environmentId={environmentId.toString()}
+    />
   )
 }
 

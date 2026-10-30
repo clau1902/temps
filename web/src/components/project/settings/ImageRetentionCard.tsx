@@ -97,7 +97,10 @@ export function ImageRetentionCard({
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSave)}>
-        <Card className="bg-background text-foreground">
+        <Card
+          id="setting-image-retention"
+          className="scroll-mt-4 bg-background text-foreground"
+        >
           <CardHeader>
             <CardTitle>Built Image Retention</CardTitle>
             <CardDescription>

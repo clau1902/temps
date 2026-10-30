@@ -28,7 +28,9 @@ export const PROJECT_SECTION_LINKS: Partial<
   Record<ProjectSection, ProjectSectionLink[]>
 > = {
   // ADR 064 D2: who reaches the app is part of the project, not a setting.
-  domains: [{ title: 'Domains', url: 'domains', aliases: ['settings/domains'] }],
+  domains: [
+    { title: 'Domains', url: 'domains', aliases: ['settings/domains'] },
+  ],
   'environment-variables': [
     {
       title: 'Environment Variables',
@@ -64,7 +66,6 @@ export const PROJECT_SECTION_LINKS: Partial<
       url: 'cron-jobs',
       keywords: ['schedule', 'check-ins', 'missed', 'timeout'],
     },
-    { title: 'Status pages', url: 'status-pages' },
     { title: 'Alert rules', url: 'errors/alert-rules' },
   ],
   analytics: [
@@ -109,7 +110,7 @@ export const PROJECT_SECTION_LINKS: Partial<
     {
       title: 'General',
       url: 'settings/general',
-      aliases: ['settings', 'setup'],
+      aliases: ['settings'],
     },
     {
       title: 'Build & deploy',
@@ -126,8 +127,9 @@ export const PROJECT_SECTION_LINKS: Partial<
     {
       title: 'Variables',
       url: 'settings/variables',
-      aliases: ['settings/secrets', 'settings/deployment-tokens'],
+      aliases: ['settings/secrets'],
     },
+    { title: 'Deployment tokens', url: 'settings/deployment-tokens' },
     {
       title: 'Automation',
       url: 'settings/automation',
@@ -220,7 +222,7 @@ const EXTERNAL_PROJECT_PAGES = [
 
 /** Whether a project-relative URL is a page an external project has. */
 export function isExternalProjectPage(url: string): boolean {
-  const route = url.split('?')[0]
+  const route = url.split(/[?#]/)[0]
   return EXTERNAL_PROJECT_PAGES.some((page) => matches(route, page))
 }
 

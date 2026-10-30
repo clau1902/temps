@@ -84,7 +84,10 @@ See sandbox `/iconography` for examples.
 ## Page structure
 
 `PageContainer` owns horizontal padding — nothing else in a page tree sets
-`px-*` on its outer wrapper. `PageHeader` owns the `h1` + actions row.
+`px-*` on its outer wrapper. Only the outermost one pads: a template's own
+`PageContainer` inside a route shell's renders as a plain column. `PageHeader`
+owns the `h1` + actions row; under `PageNamedByChromeContext` (a tab strip
+that already names the page) the `h1` is screen-reader only.
 
 ## Record page checklist
 
@@ -227,17 +230,31 @@ sample label in demos, and move walkthrough instructions into "About this exampl
 outside the main workflow. Use existing semantic spacing and colors; help is not
 a new bordered card around every field.
 
-Use `SettingsSection` for collapsible form groups, not the informational
-`Disclosure`: it retains field values and reveals validation errors. Use open sections for everyday settings, with section headings on the left and
-controls on the right on desktop; stack headings above controls on mobile. Separate groups with
-spacing instead of a card or divider around each one. Reserve collapsible form
-groups for advanced or infrequent controls. Keep short forms at a readable width
-(the settings reference uses a `max-w-5xl` grid with one-third headings and
-two-thirds controls) rather than stretching inputs across the viewport. `Field.help` places optional context beside the label;
-required instructions and errors remain visible below the control.
+Settings are never collapsible. No expand/collapse on settings, and never a
+collapsible inside a collapsible: a setting is read and edited in place.
+`SettingsSection` is always open. At the top level it is an open group laid
+out like `SettingsGroup` (title and description left, settings right, a rule
+between groups); inside another section (or a `SettingsSurface`) it renders
+flat, as a sub-heading with a divider. A console `Card` placed directly on a
+settings surface drops its frame, and dialogs, sheets and popovers reset the
+surface so their cards keep it. A settings page is never a box inside a box,
+and links reach a section through `?section=` deep links, not disclosures.
 
-Use `SettingsGroup` for the aligned open layout. Use `SettingsSection` only when
-the form group should collapse; each caller retains its own save scope.
+List pages in settings (secrets, tokens, variables, access) use one
+`PageHeader` with the primary action on the right, then the list itself on the
+page; they never repeat the page title as a section heading.
+
+Use open sections with section headings on the left and controls on the right
+on desktop; stack headings above controls on mobile. Separate groups with
+spacing instead of a card or divider around each one. Keep short forms at a
+readable width (the settings reference uses a `max-w-5xl` grid with one-third
+headings and two-thirds controls) rather than stretching inputs across the
+viewport. `Field.help` places optional context beside the label; required
+instructions and errors remain visible below the control.
+
+Use `SettingsGroup` for the aligned open layout and `SettingsSection` for a
+titled group of settings; each caller retains its own save scope. `Disclosure`
+stays for informational detail only, never for settings.
 
 SettingsGroup descriptions are optional: one short sentence beneath the heading
 that clarifies scope or outcome. Omit repeated labels and detailed instructions.

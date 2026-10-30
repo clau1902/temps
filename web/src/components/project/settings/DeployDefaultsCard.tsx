@@ -187,7 +187,7 @@ export function DeployDefaultsCard({
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-6">
-            <div className="space-y-4">
+            <div id="setting-resource-limits" className="scroll-mt-4 space-y-4">
               <h3 className="text-sm font-medium">Resource Limits</h3>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <FormField
@@ -281,7 +281,10 @@ export function DeployDefaultsCard({
                   control={form.control}
                   name="replicas"
                   render={({ field }) => (
-                    <FormItem>
+                    <FormItem
+                      id="setting-replicas-and-port"
+                      className="scroll-mt-4"
+                    >
                       <FormLabel>Default Replicas</FormLabel>
                       <FormControl>
                         <Input
@@ -325,7 +328,7 @@ export function DeployDefaultsCard({
                   control={form.control}
                   name="probeType"
                   render={({ field }) => (
-                    <FormItem id="health-probe">
+                    <FormItem id="health-probe" className="scroll-mt-4">
                       <FormLabel>Health probe</FormLabel>
                       <Select
                         value={field.value}
@@ -494,7 +497,7 @@ export function DeployDefaultsCard({
               </div>
             </div>
 
-            <div className="space-y-4">
+            <div id="setting-build-location" className="scroll-mt-4 space-y-4">
               <h3 className="text-sm font-medium">Builds</h3>
               <FormField
                 control={form.control}
@@ -545,7 +548,10 @@ export function DeployDefaultsCard({
               />
             </div>
 
-            <div className="space-y-4">
+            <div
+              id="setting-automatic-deployments"
+              className="scroll-mt-4 space-y-4"
+            >
               <h3 className="text-sm font-medium">Automation</h3>
               <FormField
                 control={form.control}

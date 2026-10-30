@@ -16,7 +16,6 @@ import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
 import { ShieldPlatformSettings } from '@/components/settings/ShieldPlatformSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
-import { useOpenSectionFromHash } from '@/hooks/useOpenSectionFromHash'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
 import {
@@ -52,13 +51,10 @@ function parseNetworkLines(text: string): string[] {
     .filter((entry) => entry.length > 0)
 }
 
-const LINKED_SECTIONS = ['shield'] as const
-
 export function SecurityPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
-  useOpenSectionFromHash(LINKED_SECTIONS, !isLoading && !error)
 
   const {
     register,
@@ -258,6 +254,7 @@ export function SecurityPage() {
           </div>
         </SettingsSection>
         <SettingsSection
+          id="trusted-private-network-settings"
           title="Trusted private networks"
           description="Let webhooks, notifications, uptime checks, AI providers, self-hosted git, OIDC and importers reach services on your private network"
           icon={Network}

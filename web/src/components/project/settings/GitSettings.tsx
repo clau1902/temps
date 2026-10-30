@@ -886,7 +886,14 @@ function GitSettingsInline({
 
       {/* ----------------- Build configuration card ----------------- */}
       {(sections.showBuildConfiguration || sections.showGitAutomation) && (
-        <Card>
+        <Card
+          id={
+            sections.showGitAutomation
+              ? 'setting-production-branch'
+              : 'setting-build-configuration'
+          }
+          className="scroll-mt-4"
+        >
           <CardHeader>
             <CardTitle className="text-base">
               {sections.showGitAutomation
@@ -1051,6 +1058,7 @@ function GitSettingsInline({
                 <>
                   {/* Framework row */}
                   <InlineRow
+                    id="setting-framework"
                     label="Framework"
                     editing={editing === 'framework'}
                     onStartEdit={() => setEditing('framework')}
@@ -1097,6 +1105,7 @@ function GitSettingsInline({
 
                   {/* Directory row */}
                   <InlineRow
+                    id="setting-root-directory"
                     label="Root directory"
                     editing={editing === 'directory'}
                     onStartEdit={() => {
@@ -1224,6 +1233,7 @@ function GitSettingsInline({
                   {/* Dockerfile path — only when dockerfile preset */}
                   {isDockerfilePreset && (
                     <InlineRow
+                      id="setting-dockerfile-path"
                       label="Dockerfile path"
                       editing={editing === 'dockerfile'}
                       onStartEdit={() => {
@@ -1279,6 +1289,7 @@ function GitSettingsInline({
                 outside its own directory. */}
                   {isDockerfilePreset && (
                     <InlineRow
+                      id="setting-build-context"
                       label="Build context"
                       editing={editing === 'buildContext'}
                       onStartEdit={() => {
@@ -1333,6 +1344,7 @@ function GitSettingsInline({
                   {/* Compose path — only when compose preset */}
                   {isComposePreset && (
                     <InlineRow
+                      id="setting-compose-file"
                       label="Compose file"
                       editing={editing === 'composePath'}
                       onStartEdit={() => {
@@ -1402,7 +1414,7 @@ function GitSettingsInline({
 
       {/* ----------------- Compose routing and service controls ----------------- */}
       {sections.showBuildConfiguration && isComposePreset && (
-        <Card>
+        <Card id="setting-docker-compose" className="scroll-mt-4">
           <CardHeader>
             <CardTitle className="text-base">Docker Compose</CardTitle>
             <CardDescription>
@@ -1896,6 +1908,7 @@ function RepositoryWebhookRow({
 // One row in the build configuration list. Click anywhere on the row to edit;
 // while editing, the editor occupies the row, and Save/Cancel sit on the right.
 function InlineRow({
+  id,
   label,
   display,
   editor,
@@ -1906,6 +1919,8 @@ function InlineRow({
   isPending,
   hideSaveButtons,
 }: {
+  /** Anchor for links and the command palette (`setting-…`). */
+  id?: string
   label: string
   display: React.ReactNode
   editor: React.ReactNode
@@ -1917,7 +1932,7 @@ function InlineRow({
   hideSaveButtons?: boolean
 }) {
   return (
-    <li className="px-6 py-4">
+    <li id={id} className="scroll-mt-4 px-6 py-4">
       <div className="flex items-center gap-4">
         <div className="w-32 shrink-0 text-sm text-muted-foreground">
           {label}
@@ -2049,7 +2064,7 @@ function PublicPortsInline({
   const hasDuplicateRoutes = draft.some((row, i) => duplicateRoute(row, i))
 
   return (
-    <div className="space-y-3">
+    <div id="setting-compose-public-routes" className="scroll-mt-4 space-y-3">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -2550,7 +2565,7 @@ function ExcludedServicesInline({
   }
 
   return (
-    <div className="space-y-3">
+    <div id="setting-compose-services" className="scroll-mt-4 space-y-3">
       <div className="flex items-start justify-between gap-2">
         <div>
           <Label className="text-sm font-medium">Compose services</Label>

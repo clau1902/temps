@@ -27,6 +27,12 @@ import { normalizeFrecency } from '@/lib/frecency'
 import { projectHasPage } from '@/lib/project-navigation'
 import { settingsSectionPath } from '@/lib/project-settings-sections'
 import {
+  PROJECT_SETTINGS_INDEX,
+  projectHasSetting,
+  projectSettingUrl,
+  type SettingPreset,
+} from '@/lib/project-settings-index'
+import {
   buildCommandSampleQueries,
   dedupeCommandDestinations,
   hoistResultFirst,
@@ -119,6 +125,8 @@ interface NavigationItem {
   url: string
   icon: SettingsNavigationIcon
   keywords?: string[]
+  /** Offered only for services built with this preset. */
+  preset?: SettingPreset
 }
 
 export function CommandPaletteSuggestions({
@@ -970,12 +978,6 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['monitoring', 'uptime', 'health', 'monitors'],
   },
   {
-    title: 'Status Pages',
-    url: 'status-pages',
-    icon: Globe,
-    keywords: ['status page', 'public status', 'uptime', 'outage', 'publish'],
-  },
-  {
     title: 'Traces',
     url: 'traces',
     icon: Workflow,
@@ -1040,7 +1042,7 @@ export const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Deployment Tokens',
-    url: settingsSectionPath('variables', 'deployment-tokens'),
+    url: settingsSectionPath('deployment-tokens', 'deployment-tokens'),
     icon: Key,
     keywords: ['tokens', 'deployment tokens', 'TEMPS_API_TOKEN', 'api'],
   },
@@ -1063,6 +1065,30 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['security', 'headers', 'rate limiting', 'protection'],
   },
   {
+    title: 'Vulnerability scanning',
+    url: 'settings/security#vulnerability-scanning',
+    icon: ShieldCheck,
+    keywords: ['scan', 'scans', 'cve', 'trivy', 'vulnerabilities', 'image'],
+  },
+  {
+    title: 'Security headers',
+    url: 'settings/security#security-headers',
+    icon: Shield,
+    keywords: ['headers', 'csp', 'hsts', 'content security policy'],
+  },
+  {
+    title: 'Rate limiting',
+    url: 'settings/security#rate-limiting',
+    icon: Gauge,
+    keywords: ['rate limit', 'throttle', 'requests per minute'],
+  },
+  {
+    title: 'Shield',
+    url: 'settings/security#shield',
+    icon: Shield,
+    keywords: ['shield', 'waf', 'bots', 'firewall', 'block'],
+  },
+  {
     title: 'Access',
     url: 'settings/access',
     icon: Users,
@@ -1070,9 +1096,18 @@ export const projectNavItems: NavigationItem[] = [
   },
   {
     title: 'Cron Jobs',
-    url: settingsSectionPath('automation', 'cron-jobs'),
+    url: 'cron-jobs',
     icon: Activity,
-    keywords: ['cron', 'jobs', 'scheduled', 'tasks'],
+    keywords: [
+      'cron',
+      'jobs',
+      'scheduled',
+      'tasks',
+      '.temps.yaml',
+      'temps.yaml',
+      'check-in',
+      'monitor',
+    ],
   },
   {
     title: 'Webhooks',
@@ -1178,22 +1213,34 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Agents',
-    url: settingsSectionPath('automation', 'agents'),
+    title: 'Automations',
+    url: settingsSectionPath('automation', 'automations'),
     icon: Bot,
-    keywords: ['agents', 'autopilot', 'ai', 'automation', 'workflows'],
+    keywords: [
+      'automation',
+      'agents',
+      'autopilot',
+      'ai',
+      'chat',
+      'workflows',
+      'prompt',
+      'schedule',
+    ],
   },
   {
     title: 'Crash autofix',
     url: settingsSectionPath('automation', 'crash-autofix'),
     icon: Wand2,
-    keywords: ['autofix', 'crash', 'errors', 'fix', 'incident', 'confidence'],
-  },
-  {
-    title: 'Autofixer',
-    url: settingsSectionPath('automation', 'autofixer'),
-    icon: Wand2,
-    keywords: ['autofix', 'autofixer', 'ai', 'errors', 'repair'],
+    keywords: [
+      'autofix',
+      'autofixer',
+      'crash',
+      'errors',
+      'fix',
+      'repair',
+      'incident',
+      'confidence',
+    ],
   },
   {
     title: 'Error Alert Rules',
@@ -1213,17 +1260,32 @@ export const projectNavItems: NavigationItem[] = [
     icon: Network,
     keywords: ['logs', 'requests', 'http', 'traffic'],
   },
+  // Single settings inside the settings pages ("Docker Compose", "Health
+  // checks"), each opening its page scrolled to that setting.
+  ...PROJECT_SETTINGS_INDEX.map((entry) => ({
+    title: entry.title,
+    url: projectSettingUrl(entry),
+    icon: Settings2,
+    keywords: ['setting', 'settings', ...entry.keywords],
+    preset: entry.preset,
+  })),
 ]
 
 /**
- * The project pages `project` actually has: a monitoring-only (external)
- * project registers no hosting pages, so offering them would land on
- * "Add hosting" or, for settings, on the wrong page.
+ * The project pages and settings `project` actually has: a monitoring-only
+ * (external) project registers no hosting pages, so offering them would land
+ * on "Add hosting" or, for settings, on the wrong page; and a setting specific
+ * to one build preset (the Compose file) is not offered to services built
+ * another way.
  */
 export function projectNavItemsFor(project: {
   source_type?: string | null
+  preset?: string | null
 }): NavigationItem[] {
-  return projectNavItems.filter((item) => projectHasPage(project, item.url))
+  return projectNavItems.filter(
+    (item) =>
+      projectHasPage(project, item.url) && projectHasSetting(project, item)
+  )
 }
 
 export function CommandPalette() {

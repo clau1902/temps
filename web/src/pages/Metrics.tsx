@@ -14,6 +14,7 @@ import { ruleStatus, useAlertStatus } from '@/components/metrics/alert-status'
 import { alertSummary, StatusDot } from '@/components/metrics/alert-format'
 import { firingRuleLinks } from '@/components/metrics/firing-rule-links'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useInProjectV2Layout } from '@/components/project-v2/project-v2-layout-context'
 
 interface MetricsProps {
   project: ProjectResponse
@@ -35,9 +36,16 @@ interface MetricsProps {
  * actually wrong, so a healthy project keeps the charts high on the page.
  */
 export default function Metrics({ project }: MetricsProps) {
+  // In the v2 layout Explore, Dashboards and Alerts are the section's own
+  // tabs; a second strip here would be a second row of the same tabs.
+  const inV2 = useInProjectV2Layout()
   return (
     <div className="flex w-full flex-col gap-4">
-      <MetricsTopBar project={project} />
+      {inV2 ? (
+        <MetricsFiringRows project={project} />
+      ) : (
+        <MetricsTopBar project={project} />
+      )}
       <Routes>
         <Route index element={<MetricsIndexRedirect project={project} />} />
         <Route path="explore" element={<MetricsExplorer project={project} />} />
@@ -174,6 +182,15 @@ function MetricsTopBar({ project }: { project: ProjectResponse }) {
         <FiringRows firing={status.firing} base={base} projectId={project.id} />
       )}
     </div>
+  )
+}
+
+/** Only the firing-alert rows, for layouts that provide the tabs. */
+function MetricsFiringRows({ project }: { project: ProjectResponse }) {
+  const { base, status } = useMetricsNav(project)
+  if (status.firing.length === 0) return null
+  return (
+    <FiringRows firing={status.firing} base={base} projectId={project.id} />
   )
 }
 

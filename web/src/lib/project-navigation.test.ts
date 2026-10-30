@@ -116,23 +116,17 @@ describe('flat project navigation', () => {
       expect(resolveProjectPrimaryRoute(route)).toBe('settings')
     }
   })
-  test('monitoring lists metrics, uptime, cron jobs, status pages and alert rules', () => {
+  test('monitoring lists metrics, uptime, cron jobs and alert rules', () => {
+    // Status pages are platform-wide (`/status-pages`), not a project tab.
     expect(PROJECT_SECTION_LINKS.monitoring?.map((link) => link.url)).toEqual([
       'metrics',
       'monitors',
       'cron-jobs',
-      'status-pages',
       'errors/alert-rules',
     ])
-    for (const route of ['status-pages', 'status-pages/7']) {
-      expect(resolveProjectPrimaryRoute(route)).toBe('monitoring')
-      expect(resolveProjectSectionLink('monitoring', route, '')).toBe(
-        'status-pages'
-      )
-    }
   })
-  test('settings has only six destinations', () => {
-    expect(PROJECT_SECTION_LINKS.settings).toHaveLength(6)
+  test('settings has only seven destinations', () => {
+    expect(PROJECT_SECTION_LINKS.settings).toHaveLength(7)
   })
   test('every existing tool has a direct contextual destination', () => {
     for (const tool of flattenProjectTools(projectToolGroups)) {

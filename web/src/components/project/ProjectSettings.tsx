@@ -15,6 +15,7 @@ import { TelemetrySettings } from './settings/TelemetrySettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
 import { WebhookDetail } from './settings/webhooks/WebhookDetail'
+import { PageHeader } from '@temps-sdk/ds'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -25,21 +26,27 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
   return (
     <div>
       <Routes>
-        {(['delivery', 'variables', 'automation', 'integrations'] as const).map(
-          (page) => (
-            <Route
-              key={page}
-              path={page}
-              element={
-                <CombinedProjectSettings
-                  page={page}
-                  project={project}
-                  refetch={refetch}
-                />
-              }
-            />
-          )
-        )}
+        {(
+          [
+            'delivery',
+            'variables',
+            'deployment-tokens',
+            'automation',
+            'integrations',
+          ] as const
+        ).map((page) => (
+          <Route
+            key={page}
+            path={page}
+            element={
+              <CombinedProjectSettings
+                page={page}
+                project={project}
+                refetch={refetch}
+              />
+            }
+          />
+        ))}
         <Route index element={<RedirectWithQuery to="general" />} />
         <Route
           path="general"
@@ -108,6 +115,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
           path="security"
           element={
             <div className="space-y-6">
+              <PageHeader
+                title="Protection"
+                description="Shield, security headers, rate limits and IP access for this service. Empty fields inherit the instance-wide settings."
+              />
               <ProjectSecuritySettings project={project} refetch={refetch} />
               <ProjectIpAccessCard
                 projectId={project.id}
@@ -170,15 +181,6 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
             <LegacyProjectRouteRedirect
               projectSlug={project.slug}
               route="settings/mcp-servers"
-            />
-          }
-        />
-        <Route
-          path="deployment-tokens"
-          element={
-            <LegacyProjectRouteRedirect
-              projectSlug={project.slug}
-              route="settings/deployment-tokens"
             />
           }
         />

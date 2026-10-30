@@ -25,8 +25,13 @@ import {
 
 export function EnvironmentsTabsView({
   project,
+  selectedEnvironmentId,
+  embedded = false,
 }: {
   project: ProjectResponse
+  /** Inside the v2 layout the project bar picks the environment. */
+  selectedEnvironmentId?: number
+  embedded?: boolean
 }) {
   const [searchParams, setSearchParams] = useSearchParams()
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
@@ -56,10 +61,12 @@ export function EnvironmentsTabsView({
     },
   })
 
-  const activeEnvId = resolveEnvironmentSelection(
-    searchParams.get('environment'),
-    environments ?? []
-  )
+  const activeEnvId =
+    selectedEnvironmentId ??
+    resolveEnvironmentSelection(
+      searchParams.get('environment'),
+      environments ?? []
+    )
 
   if (isEnvironmentsLoading) {
     return <EnvironmentDashboardSkeleton />
@@ -129,6 +136,7 @@ export function EnvironmentsTabsView({
           path="*"
           element={
             <EnvironmentDashboard
+              embedded={embedded}
               key={activeEnvId}
               project={project}
               environmentId={activeEnvId}

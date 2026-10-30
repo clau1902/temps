@@ -15,6 +15,10 @@ import { installBrowserWindow } from '@/test/dom'
 import { client as apiClient } from '@/api/client/client.gen'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse } from '@/api/client'
+import {
+  ProjectEnvironmentContext,
+  type ProjectEnvironmentContextValue,
+} from '@/components/project-v2/project-environment-context'
 import CronMonitors from './CronMonitors'
 
 installBrowserWindow()
@@ -116,4 +120,98 @@ test('cron limits validate before transport; a native API error preserves inputs
   })
   await waitFor(() => expect(requests.length).toBe(2))
   query.clear()
+})
+
+/** Serves the cron list page's reads; records every path requested. */
+function serveCronList(paths: string[]) {
+  apiClient.setConfig({
+    baseUrl: 'https://console.example.test/api',
+    fetch: Object.assign(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request =
+          input instanceof Request ? input : new Request(input, init)
+        const path = new URL(request.url).pathname.replace(/^\/api/, '')
+        paths.push(path)
+        const crons = path.match(/^\/projects\/17\/environments\/(\d+)\/crons$/)
+        if (crons)
+          return Response.json([
+            {
+              id: 9,
+              path: `/api/tick-${crons[1]}`,
+              schedule: '*/10 * * * *',
+              environment_id: Number(crons[1]),
+              project_id: 17,
+              created_at: '2026-01-01T00:00:00Z',
+              next_run: null,
+              mode: 'http',
+              concurrency_policy: 'allow',
+              retry_limit: 0,
+            },
+          ])
+        if (path === '/projects/17/environments')
+          return Response.json([
+            { id: 3, name: 'production', slug: 'production' },
+          ])
+        if (path === '/projects/17/cron-monitors')
+          return Response.json({ items: [], total: 0, page: 1, page_size: 20 })
+        return Response.json({ configured: true })
+      },
+      { preconnect: fetch.preconnect }
+    ),
+  })
+}
+
+function renderCronList(wrap: (page: React.ReactNode) => React.ReactNode) {
+  const query = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const project = { id: 17, slug: 'synthetic', name: 'Synthetic' }
+  return render(
+    <QueryClientProvider client={query}>
+      <MemoryRouter initialEntries={['/']}>
+        {wrap(<CronMonitors project={project as ProjectResponse} />)}
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+}
+
+test('the cron page lists the .temps.yaml jobs Temps runs, next to check-in monitors', async () => {
+  const paths: string[] = []
+  serveCronList(paths)
+  const view = renderCronList((page) => page)
+
+  expect(view.getByRole('heading', { name: 'Scheduled by Temps' })).toBeTruthy()
+  expect(view.getByRole('heading', { name: 'Check-in monitors' })).toBeTruthy()
+  const job = await view.findByRole('link', { name: /\/api\/tick-3/ })
+  expect(job.getAttribute('href')).toBe(
+    '/projects/synthetic/settings/cron-jobs/3/9'
+  )
+  expect(paths).toContain('/projects/17/environments/3/crons')
+  expect(
+    view
+      .getAllByRole('link', { name: 'Create monitor' })
+      .map((link) => link.getAttribute('href'))
+  ).toContain('/projects/synthetic/cron-jobs/new')
+})
+
+test('in the v2 layout the jobs follow the environment bar', async () => {
+  const paths: string[] = []
+  serveCronList(paths)
+  const staging = { id: 5, name: 'staging', slug: 'staging' }
+  const bar = {
+    environments: [staging],
+    isPending: false,
+    selection: { environment: staging, all: false, source: 'url' },
+  } as unknown as ProjectEnvironmentContextValue
+  const view = renderCronList((page) => (
+    <ProjectEnvironmentContext.Provider value={bar}>
+      {page}
+    </ProjectEnvironmentContext.Provider>
+  ))
+
+  await view.findByRole('link', { name: /\/api\/tick-5/ })
+  expect(paths).toContain('/projects/17/environments/5/crons')
+  expect(paths).not.toContain('/projects/17/environments/3/crons')
+  // The bar picks the environment; the section has no picker of its own.
+  expect(view.queryByLabelText('Environment')).toBeNull()
 })

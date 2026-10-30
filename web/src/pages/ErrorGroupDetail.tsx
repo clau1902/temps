@@ -203,7 +203,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
   if (isLoadingGroup || isLoadingEvents) {
     return (
-      <div className="space-y-6 p-4 sm:p-6">
+      <div className="space-y-6">
         <div className="flex items-center justify-between">
           <Skeleton className="h-8 w-64" />
           <div className="flex gap-2">
@@ -276,7 +276,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const sentryEvent = latestEvent ? extractSentryEvent(latestEvent.data) : null
 
   return (
-    <div className="p-4 sm:p-6">
+    <div>
       {/* Error Title Bar with Back Button */}
       <div className="mb-6 space-y-3">
         <div className="flex flex-wrap items-center gap-2">

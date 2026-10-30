@@ -33,6 +33,20 @@ import { ProjectDrop } from '@/pages/ProjectDrop'
 import { ProjectDetailHeader } from '@/components/project/ProjectDetailHeader'
 import { ProjectOverview } from '@/components/project/ProjectOverview'
 import { ProjectSectionLayout } from '@/components/project/ProjectSectionLayout'
+import { BuildAndDeployPage } from '@/components/project-v2/BuildAndDeployPage'
+import { ProjectEnvironmentBar } from '@/components/project-v2/ProjectEnvironmentBar'
+import {
+  ProjectV2Frame,
+  ProjectV2Section,
+} from '@/components/project-v2/ProjectV2Frame'
+import { useProjectV2PageWidth } from '@/components/project-v2/use-project-v2-location'
+import { PageContainer } from '@/components/layout/PageContainer'
+import {
+  ProjectDeploymentsV2,
+  ProjectEnvironmentsV2,
+  ProjectOverviewV2,
+} from '@/components/project-v2/ProjectV2Pages'
+import { cn } from '@/lib/utils'
 import { ProjectRevenue } from '@/components/project/ProjectRevenue'
 import { ProjectRuntime } from '@/components/project/ProjectRuntime'
 import { ProjectServices } from '@/components/project/ProjectServices'
@@ -57,7 +71,7 @@ import { SourceMapArtifacts, SourceMapCredentials } from './SourceMapArtifacts'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import {
   LegacyStatusPageRedirect,
-  ProjectStatusPages,
+  LegacyStatusPagesRedirect,
 } from '@/components/project/status-pages/ProjectStatusPages'
 import { MonitorDetail } from '@/components/project/MonitorDetail'
 import { ErrorTracking } from '@/components/projects/ErrorTracking'
@@ -107,7 +121,7 @@ import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
 import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useState } from 'react'
 import {
   Route,
   Routes,
@@ -122,11 +136,21 @@ import { ShieldAlert } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { toast } from 'sonner'
 
-export function ProjectDetail() {
+export function ProjectDetail({
+  layout = 'classic',
+}: {
+  /** `v2` is the prototype layout served at `/projects/:slug/v2/*`. */
+  layout?: 'classic' | 'v2'
+} = {}) {
+  const isV2 = layout === 'v2'
   const { slug } = useParams()
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const variableRoute = useMatch('/projects/:slug/environment-variables/*')
+  const classicVariableRoute = useMatch(
+    '/projects/:slug/environment-variables/*'
+  )
+  const v2VariableRoute = useMatch('/projects/:slug/v2/environment-variables/*')
+  const variableRoute = classicVariableRoute ?? v2VariableRoute
   const variableSubpath = variableRoute?.params['*'] ?? ''
   const [breadcrumbVariableId, breadcrumbSection] = variableSubpath.split('/')
   const [searchParams, setSearchParams] = useSearchParams()
@@ -176,9 +200,13 @@ export function ProjectDetail() {
   const isVariableRoute = !!variableRoute
   // ADR 069: Projects → project → Environments → <environment> → Make it
   // reachable.
-  const reachabilityRoute = useMatch(
+  const classicReachabilityRoute = useMatch(
     '/projects/:slug/environments/:environment/reachability'
   )
+  const v2ReachabilityRoute = useMatch(
+    '/projects/:slug/v2/environments/:environment/reachability'
+  )
+  const reachabilityRoute = classicReachabilityRoute ?? v2ReachabilityRoute
   const reachabilityEnvironmentParam =
     reachabilityRoute?.params.environment ?? null
   const breadcrumbEnvironments = useQuery({
@@ -669,7 +697,7 @@ export function ProjectDetail() {
               />
               <Route
                 path="status-pages"
-                element={<ProjectStatusPages project={project} />}
+                element={<LegacyStatusPagesRedirect />}
               />
               <Route
                 path="status-pages/:statusPageId"
@@ -702,31 +730,41 @@ export function ProjectDetail() {
     )
   }
 
-  return (
+  const handleDeployClick = () => {
+    if (projectDeployLaunchMode(project.source_type) === 'upload') {
+      navigate(`/projects/${project.slug}/drop`)
+      return
+    }
+    setIsDeployDialogOpen(true)
+  }
+  const SectionChrome = isV2 ? ProjectV2Section : ProjectSectionLayout
+
+  const page = (
     <div className="flex h-full w-full overflow-hidden">
       <Confetti active={showConfetti} duration={4000} particleCount={100} />
       <div className="flex flex-1 flex-col overflow-hidden min-w-0">
-        <ProjectDetailHeader
-          project={project}
-          activeVisitorsCount={activeVisitorsCount}
-          repositoryCloneUrl={
-            repository?.clone_url || project.git_url || undefined
-          }
-          repositoryProviderType={repositoryProviderType}
-          lastDeploymentUrl={stableLink?.url ?? null}
-          lastDeploymentUnavailableReason={
-            stableLink?.unavailableReason ?? null
-          }
-          lastDeploymentEnvironmentId={lastDeployment?.environment_id}
-          isLoadingLastDeployment={isLoadingLastDeployment}
-          onDeploy={() => {
-            if (projectDeployLaunchMode(project.source_type) === 'upload') {
-              navigate(`/projects/${project.slug}/drop`)
-              return
+        {isV2 ? (
+          <ProjectEnvironmentBar
+            project={project}
+            onDeploy={handleDeployClick}
+          />
+        ) : (
+          <ProjectDetailHeader
+            project={project}
+            activeVisitorsCount={activeVisitorsCount}
+            repositoryCloneUrl={
+              repository?.clone_url || project.git_url || undefined
             }
-            setIsDeployDialogOpen(true)
-          }}
-        />
+            repositoryProviderType={repositoryProviderType}
+            lastDeploymentUrl={stableLink?.url ?? null}
+            lastDeploymentUnavailableReason={
+              stableLink?.unavailableReason ?? null
+            }
+            lastDeploymentEnvironmentId={lastDeployment?.environment_id}
+            isLoadingLastDeployment={isLoadingLastDeployment}
+            onDeploy={handleDeployClick}
+          />
+        )}
         <RedeploymentModal
           project={project}
           isOpen={isDeployDialogOpen}
@@ -740,363 +778,427 @@ export function ProjectDetail() {
           }
           isLoading={createDeployment.isPending || deployImage.isPending}
         />
-        <div className="flex-1 overflow-y-auto overflow-x-hidden p-4">
-          {/* Attack Mode Banner */}
-          {(project as typeof project & { attack_mode?: boolean })
-            .attack_mode && (
-            <Alert className="mb-4 border-primary bg-primary/10">
-              <ShieldAlert className="h-4 w-4 text-primary" />
-              <AlertDescription className="flex items-center justify-between gap-3">
-                <span className="text-foreground">
-                  Attack Mode is enabled for this service
-                </span>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 px-2 text-primary hover:bg-primary/20"
-                  onClick={handleDisableAttackMode}
-                  disabled={disableAttackMode.isPending}
-                >
-                  {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
-                </Button>
-              </AlertDescription>
-            </Alert>
+        <div
+          className={cn(
+            'flex-1 overflow-y-auto overflow-x-hidden',
+            !isV2 && 'p-4'
           )}
-          <ReachabilityWarningBanner
-            warning={project.reachability_warning}
-            projectSlug={project.slug}
-            className="mb-4"
-          />
-          <ProjectTour />
-          <ProjectSectionLayout project={project}>
-            <Routes>
-              <Route index element={<RedirectWithQuery to="project" />} />
-              <Route
-                path="hosting"
-                element={<RedirectWithQuery to="../settings/delivery" />}
-              />
-              <Route
-                path="integrations"
-                element={<MonitoringProjectOverview project={project} />}
-              />
-              <Route
-                path="project"
-                element={
-                  <ProjectOverview
-                    project={project}
-                    lastDeployment={lastDeployment}
-                  />
-                }
-              />
-              <Route
-                path="tools"
-                element={<RedirectWithQuery to="../settings/general" />}
-              />
-              <Route
-                path="setup"
-                element={
-                  <LegacyProjectRouteRedirect
-                    projectSlug={project.slug}
-                    route="setup"
-                  />
-                }
-              />
-              <Route
-                path="deployments"
-                element={<ProjectDeployments project={project} />}
-              />
-              <Route
-                path="deployments/:deploymentId"
-                element={<DeploymentDetails project={project} />}
-              />
-              <Route path="drop" element={<ProjectDrop project={project} />} />
-              <Route
-                path="environment-variables"
-                element={<EnvironmentVariablesSettings project={project} />}
-              />
-              <Route
-                path="environment-variables/:variableId"
-                element={<EnvironmentVariablePage project={project} />}
-              />
-              <Route
-                path="environment-variables/:variableId/checks"
-                element={
-                  <EnvironmentVariablePage project={project} configure />
-                }
-              />
-              <Route
-                path="flags"
-                element={
-                  <LegacyProjectRouteRedirect
-                    projectSlug={project.slug}
-                    route="flags"
-                  />
-                }
-              />
-              <Route
-                path="domains"
-                element={<DomainsSettings project={project} />}
-              />
-              <Route
-                path="git"
-                element={
-                  <LegacyProjectRouteRedirect
-                    projectSlug={project.slug}
-                    route="git"
-                  />
-                }
-              />
-              <Route
-                path="build"
-                element={
-                  <LegacyProjectRouteRedirect
-                    projectSlug={project.slug}
-                    route="build"
-                  />
-                }
-              />
-              <Route
-                path="git/change-repository"
-                element={
-                  <RedirectWithQuery
-                    to={`/projects/${project.slug}/connect-repository`}
-                  />
-                }
-              />
-              <Route
-                path="connect-repository"
-                element={
-                  <ChangeRepositoryPage project={project} refetch={refetch} />
-                }
-              />
-              <Route
-                path="connect-repository/connections/:connectionId"
-                element={
-                  <ChangeRepositoryPage project={project} refetch={refetch} />
-                }
-              />
-              <Route
-                path="connect-repository/connections/:connectionId/repositories/:repositoryId"
-                element={
-                  <ChangeRepositoryPage project={project} refetch={refetch} />
-                }
-              />
-              <Route
-                path="analytics/*"
-                element={<ProjectAnalytics project={project} />}
-              />
-              <Route
-                path="storage"
-                element={<ProjectStorage project={project} />}
-              />
-              <Route
-                path="databases"
-                element={
-                  <RedirectWithQuery
-                    to={legacyDatabasesRedirectPath(project.slug)}
-                  />
-                }
-              />
-              <Route
-                path="services/*"
-                element={<ProjectServices project={project} />}
-              />
-              <Route
-                path="runtime"
-                element={<ProjectRuntime project={project} />}
-              />
-              <Route path="observe" element={<Observe project={project} />} />
-              <Route
-                path="settings/*"
-                element={
-                  <ProjectSettings project={project} refetch={refetch} />
-                }
-              />
-              <Route
-                path="speed"
-                element={<ProjectSpeedInsights project={project} />}
-              />
-              <Route
-                path="logs/*"
-                element={
-                  <RenamedProjectRouteRedirect
-                    projectSlug={project.slug}
-                    from="logs"
-                    to="request-logs"
-                  />
-                }
-              />
-              <Route
-                path="request-logs/*"
-                element={<RequestLogs project={project} />}
-              />
-              <Route
-                path="ai-crawlers"
-                element={<ProjectAiCrawlers project={project} />}
-              />
-              <Route
-                path="errors/feedback/*"
-                element={<ProjectFeedback project={project} />}
-              />
-              <Route
-                path="cron-jobs/*"
-                element={<CronMonitors project={project} />}
-              />
-              <Route
-                path="monitors"
-                element={<ProjectMonitors project={project} />}
-              />
-              <Route
-                path="monitors/:monitorId"
-                element={<MonitorDetail project={project} />}
-              />
-              <Route
-                path="status-pages"
-                element={<ProjectStatusPages project={project} />}
-              />
-              <Route
-                path="status-pages/:statusPageId"
-                element={<LegacyStatusPageRedirect />}
-              />
-              <Route path="traces/*" element={<Traces project={project} />} />
-              <Route
-                path="client-outcomes"
-                element={<ClientOutcomes project={project} />}
-              />
-              <Route
-                path="releases"
-                element={<TelemetryReleases project={project} />}
-              />
-              <Route
-                path="telemetry-logs"
-                element={<LogsList project={project} />}
-              />
-              <Route path="metrics/*" element={<Metrics project={project} />} />
-              {/* Dashboards moved under the unified Metrics surface; redirect
+        >
+          {/* v2: one centered column, as wide as the page needs, holding the
+              banners, the section tabs and the page so they line up. */}
+          <PageWidthShell enabled={isV2} projectSlug={project.slug}>
+            {/* Attack Mode Banner */}
+            {(project as typeof project & { attack_mode?: boolean })
+              .attack_mode && (
+              <Alert className="mb-4 border-primary bg-primary/10">
+                <ShieldAlert className="h-4 w-4 text-primary" />
+                <AlertDescription className="flex items-center justify-between gap-3">
+                  <span className="text-foreground">
+                    Attack Mode is enabled for this service
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 px-2 text-primary hover:bg-primary/20"
+                    onClick={handleDisableAttackMode}
+                    disabled={disableAttackMode.isPending}
+                  >
+                    {disableAttackMode.isPending ? 'Disabling...' : 'Disable'}
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            )}
+            <ReachabilityWarningBanner
+              warning={project.reachability_warning}
+              projectSlug={project.slug}
+              className="mb-4"
+            />
+            {!isV2 && <ProjectTour />}
+            <SectionChrome project={project}>
+              <Routes>
+                <Route index element={<RedirectWithQuery to="project" />} />
+                <Route
+                  path="hosting"
+                  element={<RedirectWithQuery to="../settings/delivery" />}
+                />
+                <Route
+                  path="integrations"
+                  element={<MonitoringProjectOverview project={project} />}
+                />
+                <Route
+                  path="project"
+                  element={
+                    isV2 ? (
+                      <ProjectOverviewV2
+                        project={project}
+                        lastDeployment={lastDeployment}
+                      />
+                    ) : (
+                      <ProjectOverview
+                        project={project}
+                        lastDeployment={lastDeployment}
+                      />
+                    )
+                  }
+                />
+                <Route
+                  path="tools"
+                  element={<RedirectWithQuery to="../settings/general" />}
+                />
+                <Route
+                  path="setup"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="setup"
+                    />
+                  }
+                />
+                <Route
+                  path="deployments"
+                  element={
+                    isV2 ? (
+                      <ProjectDeploymentsV2 project={project} />
+                    ) : (
+                      <ProjectDeployments project={project} />
+                    )
+                  }
+                />
+                <Route
+                  path="build-deploy"
+                  element={
+                    <BuildAndDeployPage project={project} refetch={refetch} />
+                  }
+                />
+                <Route
+                  path="deployments/:deploymentId"
+                  element={<DeploymentDetails project={project} />}
+                />
+                <Route
+                  path="drop"
+                  element={<ProjectDrop project={project} />}
+                />
+                <Route
+                  path="environment-variables"
+                  element={<EnvironmentVariablesSettings project={project} />}
+                />
+                <Route
+                  path="environment-variables/:variableId"
+                  element={<EnvironmentVariablePage project={project} />}
+                />
+                <Route
+                  path="environment-variables/:variableId/checks"
+                  element={
+                    <EnvironmentVariablePage project={project} configure />
+                  }
+                />
+                <Route
+                  path="flags"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="flags"
+                    />
+                  }
+                />
+                <Route
+                  path="domains"
+                  element={<DomainsSettings project={project} />}
+                />
+                <Route
+                  path="git"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="git"
+                    />
+                  }
+                />
+                <Route
+                  path="build"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="build"
+                    />
+                  }
+                />
+                <Route
+                  path="git/change-repository"
+                  element={
+                    <RedirectWithQuery
+                      to={`/projects/${project.slug}/connect-repository`}
+                    />
+                  }
+                />
+                <Route
+                  path="connect-repository"
+                  element={
+                    <ChangeRepositoryPage project={project} refetch={refetch} />
+                  }
+                />
+                <Route
+                  path="connect-repository/connections/:connectionId"
+                  element={
+                    <ChangeRepositoryPage project={project} refetch={refetch} />
+                  }
+                />
+                <Route
+                  path="connect-repository/connections/:connectionId/repositories/:repositoryId"
+                  element={
+                    <ChangeRepositoryPage project={project} refetch={refetch} />
+                  }
+                />
+                <Route
+                  path="analytics/*"
+                  element={<ProjectAnalytics project={project} />}
+                />
+                <Route
+                  path="storage"
+                  element={<ProjectStorage project={project} />}
+                />
+                <Route
+                  path="databases"
+                  element={
+                    <RedirectWithQuery
+                      to={legacyDatabasesRedirectPath(project.slug)}
+                    />
+                  }
+                />
+                <Route
+                  path="services/*"
+                  element={<ProjectServices project={project} />}
+                />
+                <Route
+                  path="runtime"
+                  element={<ProjectRuntime project={project} />}
+                />
+                <Route path="observe" element={<Observe project={project} />} />
+                <Route
+                  path="settings/*"
+                  element={
+                    <ProjectSettings project={project} refetch={refetch} />
+                  }
+                />
+                <Route
+                  path="speed"
+                  element={<ProjectSpeedInsights project={project} />}
+                />
+                <Route
+                  path="logs/*"
+                  element={
+                    <RenamedProjectRouteRedirect
+                      projectSlug={project.slug}
+                      from="logs"
+                      to="request-logs"
+                    />
+                  }
+                />
+                <Route
+                  path="request-logs/*"
+                  element={<RequestLogs project={project} />}
+                />
+                <Route
+                  path="ai-crawlers"
+                  element={<ProjectAiCrawlers project={project} />}
+                />
+                <Route
+                  path="errors/feedback/*"
+                  element={<ProjectFeedback project={project} />}
+                />
+                <Route
+                  path="cron-jobs/*"
+                  element={<CronMonitors project={project} />}
+                />
+                <Route
+                  path="monitors"
+                  element={<ProjectMonitors project={project} />}
+                />
+                <Route
+                  path="monitors/:monitorId"
+                  element={<MonitorDetail project={project} />}
+                />
+                <Route
+                  path="status-pages"
+                  element={<LegacyStatusPagesRedirect />}
+                />
+                <Route
+                  path="status-pages/:statusPageId"
+                  element={<LegacyStatusPageRedirect />}
+                />
+                <Route path="traces/*" element={<Traces project={project} />} />
+                <Route
+                  path="client-outcomes"
+                  element={<ClientOutcomes project={project} />}
+                />
+                <Route
+                  path="releases"
+                  element={<TelemetryReleases project={project} />}
+                />
+                <Route
+                  path="telemetry-logs"
+                  element={<LogsList project={project} />}
+                />
+                <Route
+                  path="metrics/*"
+                  element={<Metrics project={project} />}
+                />
+                {/* Dashboards moved under the unified Metrics surface; redirect
                   any lingering /dashboards links. */}
-              <Route
-                path="dashboards/*"
-                element={<RedirectWithQuery to="../metrics/dashboards" />}
-              />
-              <Route
-                path="ai-gateway"
-                element={
-                  <ProjectAgentActivity
-                    projectId={project.id}
-                    projectSlug={project.slug}
-                  />
-                }
-              />
-              <Route
-                path="revenue"
-                element={<ProjectRevenue project={project} />}
-              />
-              <Route
-                path="agents"
-                element={
-                  <LegacyProjectRouteRedirect
-                    projectSlug={project.slug}
-                    route="agents"
-                  />
-                }
-              />
-              <Route
-                path="agents/detail/:agentSlug"
-                element={<AgentDetailPage project={project} />}
-              />
-              <Route
-                path="agents/detail/:agentSlug/edit"
-                element={<AgentEditPage project={project} />}
-              />
-              <Route
-                path="agents/:runId"
-                element={<AutopilotRunDetail project={project} />}
-              />
-              <Route
-                path="autofixer"
-                element={
-                  <LegacyProjectRouteRedirect
-                    projectSlug={project.slug}
-                    route="autofixer"
-                  />
-                }
-              />
-              <Route
-                path="errors"
-                element={<ErrorTracking project={project} />}
-              />
-              <Route
-                path="errors/setup"
-                element={<ErrorTrackingSetup project={project} />}
-              />
-              <Route
-                path="errors/alert-rules"
-                element={<AlertRulesManagement projectId={project.id} />}
-              />
-              <Route
-                path="errors/alert-rules/new"
-                element={
-                  <AlertRuleForm
-                    projectId={project.id}
-                    projectName={project.name}
-                  />
-                }
-              />
-              <Route
-                path="errors/alert-rules/:ruleId/edit"
-                element={
-                  <AlertRuleForm
-                    projectId={project.id}
-                    projectName={project.name}
-                  />
-                }
-              />
-              <Route
-                path="errors/source-maps"
-                element={<SourceMapArtifacts project={project} />}
-              />
-              <Route
-                path="errors/source-maps/credentials"
-                element={<SourceMapCredentials project={project} />}
-              />
-              <Route
-                path="errors/:errorGroupId"
-                element={<ErrorGroupDetail project={project} />}
-              />
-              <Route
-                path="errors/:errorGroupId/autofix"
-                element={<AutofixRedirect project={project} />}
-              />
-              <Route
-                path="errors/:errorGroupId/event/:eventId"
-                element={<ErrorEventDetail project={project} />}
-              />
-              <Route
-                path="security"
-                element={<SecurityOverview project={project} />}
-              />
-              <Route path="security/scans/:scanId" element={<ScanDetail />} />
-              <Route
-                path="security/scans/:scanId/vulnerabilities/:vulnId"
-                element={<VulnerabilityDetailPage />}
-              />
-              {/* ADR 069: Make it reachable, one URL per environment. */}
-              <Route
-                path="environments/:environment/reachability"
-                element={<ReachabilityPage project={project} />}
-              />
-              <Route
-                path="environments/*"
-                element={<EnvironmentsTabsView project={project} />}
-              />
-              <Route
-                path="*"
-                element={<ProjectPageNotFound project={project} />}
-              />
-            </Routes>
-          </ProjectSectionLayout>
+                <Route
+                  path="dashboards/*"
+                  element={<RedirectWithQuery to="../metrics/dashboards" />}
+                />
+                <Route
+                  path="ai-gateway"
+                  element={
+                    <ProjectAgentActivity
+                      projectId={project.id}
+                      projectSlug={project.slug}
+                    />
+                  }
+                />
+                <Route
+                  path="revenue"
+                  element={<ProjectRevenue project={project} />}
+                />
+                <Route
+                  path="agents"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="agents"
+                    />
+                  }
+                />
+                <Route
+                  path="agents/detail/:agentSlug"
+                  element={<AgentDetailPage project={project} />}
+                />
+                <Route
+                  path="agents/detail/:agentSlug/edit"
+                  element={<AgentEditPage project={project} />}
+                />
+                <Route
+                  path="agents/:runId"
+                  element={<AutopilotRunDetail project={project} />}
+                />
+                <Route
+                  path="autofixer"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="autofixer"
+                    />
+                  }
+                />
+                <Route
+                  path="errors"
+                  element={<ErrorTracking project={project} />}
+                />
+                <Route
+                  path="errors/setup"
+                  element={<ErrorTrackingSetup project={project} />}
+                />
+                <Route
+                  path="errors/alert-rules"
+                  element={<AlertRulesManagement projectId={project.id} />}
+                />
+                <Route
+                  path="errors/alert-rules/new"
+                  element={
+                    <AlertRuleForm
+                      projectId={project.id}
+                      projectName={project.name}
+                    />
+                  }
+                />
+                <Route
+                  path="errors/alert-rules/:ruleId/edit"
+                  element={
+                    <AlertRuleForm
+                      projectId={project.id}
+                      projectName={project.name}
+                    />
+                  }
+                />
+                <Route
+                  path="errors/source-maps"
+                  element={<SourceMapArtifacts project={project} />}
+                />
+                <Route
+                  path="errors/source-maps/credentials"
+                  element={<SourceMapCredentials project={project} />}
+                />
+                <Route
+                  path="errors/:errorGroupId"
+                  element={<ErrorGroupDetail project={project} />}
+                />
+                <Route
+                  path="errors/:errorGroupId/autofix"
+                  element={<AutofixRedirect project={project} />}
+                />
+                <Route
+                  path="errors/:errorGroupId/event/:eventId"
+                  element={<ErrorEventDetail project={project} />}
+                />
+                <Route
+                  path="security"
+                  element={<SecurityOverview project={project} />}
+                />
+                <Route path="security/scans/:scanId" element={<ScanDetail />} />
+                <Route
+                  path="security/scans/:scanId/vulnerabilities/:vulnId"
+                  element={<VulnerabilityDetailPage />}
+                />
+                {/* ADR 069: Make it reachable, one URL per environment. */}
+                <Route
+                  path="environments/:environment/reachability"
+                  element={<ReachabilityPage project={project} />}
+                />
+                <Route
+                  path="environments/*"
+                  element={
+                    isV2 ? (
+                      <ProjectEnvironmentsV2 project={project} />
+                    ) : (
+                      <EnvironmentsTabsView project={project} />
+                    )
+                  }
+                />
+                <Route
+                  path="*"
+                  element={<ProjectPageNotFound project={project} />}
+                />
+              </Routes>
+            </SectionChrome>
+          </PageWidthShell>
         </div>
       </div>
     </div>
+  )
+
+  return isV2 ? <ProjectV2Frame project={project}>{page}</ProjectV2Frame> : page
+}
+
+/**
+ * The v2 page column: centered and capped at the width the current section
+ * asks for. The classic layout keeps its full-width padding.
+ */
+function PageWidthShell({
+  enabled,
+  projectSlug,
+  children,
+}: {
+  enabled: boolean
+  projectSlug: string
+  children: ReactNode
+}) {
+  const width = useProjectV2PageWidth(projectSlug)
+  if (!enabled) return <>{children}</>
+  return (
+    <PageContainer width={width} innerClassName="space-y-0">
+      {children}
+    </PageContainer>
   )
 }

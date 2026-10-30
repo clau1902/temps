@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import { InheritedVariablesPanel } from '@/components/project-groups/InheritedVariablesPanel'
 import {
   EnvironmentVariableResponse,
@@ -2067,14 +2068,10 @@ export function EnvironmentVariablesSettings({
     <div className="space-y-6">
       <div>
         <div className="flex flex-col gap-4 mb-5 sm:flex-row sm:items-start sm:justify-between">
-          <div className="space-y-1.5">
-            <h2 className="text-2xl font-semibold tracking-tight">
-              Environment Variables
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              Manage values and automatic credential checks across environments.
-            </p>
-          </div>
+          <PageHeader
+            title="Environment variables"
+            description="Values and automatic credential checks across environments."
+          />
           {(hasVariables ||
             orderedEnvironments.length > 0 ||
             Boolean(search)) && (

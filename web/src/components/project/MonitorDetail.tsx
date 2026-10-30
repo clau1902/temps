@@ -311,7 +311,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   if (monitorError || currentMonitorStatusError) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Failed to load monitor"
           description={
@@ -356,7 +356,7 @@ export function MonitorDetail({ project }: MonitorDetailProps) {
 
   if (!monitor) {
     return (
-      <div className="p-6">
+      <div>
         <ErrorAlert
           title="Monitor not found"
           description="The monitor you're looking for doesn't exist."

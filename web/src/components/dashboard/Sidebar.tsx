@@ -49,6 +49,10 @@ import {
   Terminal,
   Wand2,
   Variable,
+  Hammer,
+  Lock,
+  Workflow,
+  AlertOctagon,
 } from 'lucide-react'
 
 import {
@@ -60,6 +64,13 @@ import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { resolveProjectPrimaryRoute } from '@/lib/project-navigation'
+import {
+  PROJECT_V2_GROUPS,
+  projectV2Root,
+  resolveProjectV2Location,
+  type ProjectV2SectionId,
+} from '@/lib/project-navigation-v2'
+import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
 import {
   nodeRouteOf,
   nodeSections,
@@ -381,6 +392,11 @@ export default function AppSidebar() {
           <SettingsNav onBack={() => setForceDefaultKey(location.key)} />
         ) : aiMode ? (
           <AiNav onBack={() => setForceDefaultKey(location.key)} />
+        ) : projectSlug && isProjectV2Path(location.pathname, projectSlug) ? (
+          <ProjectNavV2
+            slug={projectSlug}
+            onBack={() => setForceDefaultKey(location.key)}
+          />
         ) : projectSlug ? (
           <ProjectNav
             slug={projectSlug}
@@ -1040,6 +1056,95 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
           ))}
         </SidebarMenu>
       </SidebarGroup>
+    </>
+  )
+}
+
+function isProjectV2Path(pathname: string, slug: string) {
+  const root = projectV2Root(slug)
+  return pathname === root || pathname.startsWith(`${root}/`)
+}
+
+const projectV2Icons: Record<ProjectV2SectionId, LucideIcon> = {
+  overview: Home,
+  deployments: GitBranch,
+  environments: Layers,
+  domains: Globe,
+  databases: Database,
+  logs: ScrollText,
+  errors: AlertOctagon,
+  traces: GitFork,
+  analytics: BarChart3,
+  monitoring: Activity,
+  build: Hammer,
+  variables: Variable,
+  access: Lock,
+  automation: Workflow,
+  general: Settings,
+}
+
+// v2 project menu (prototype): the same pages grouped by job. Each section's
+// own pages are tabs on the page, so this stays one level deep.
+function ProjectNavV2({ slug, onBack }: { slug: string; onBack: () => void }) {
+  const { data: project } = useQuery(
+    getProjectBySlugOptions({ path: { slug } })
+  )
+  const location = useLocation()
+  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+  const root = projectV2Root(slug)
+  const active = resolveProjectV2Location(location.pathname.slice(root.length))
+    .section.id
+  // Keep the environment chosen in the project bar when switching sections.
+  const env = new URLSearchParams(location.search).get(ENVIRONMENT_PARAM)
+  const query = env ? `?${ENVIRONMENT_PARAM}=${encodeURIComponent(env)}` : ''
+  return (
+    <>
+      <SwapHeader
+        title={project?.name ?? 'Loading…'}
+        onBack={onBack}
+        backLabel="Back to menu"
+      />
+      {PROJECT_V2_GROUPS.map((group, index) => (
+        <SidebarGroup
+          key={group.label ?? index}
+          className={index === 0 ? 'py-2' : 'py-0'}
+        >
+          {group.label && (
+            <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+              {group.label}
+            </SidebarGroupLabel>
+          )}
+          <SidebarMenu aria-label={group.label ?? 'Project'}>
+            {group.sections.map((section) => {
+              const Icon = projectV2Icons[section.id]
+              const isActive = active === section.id
+              return (
+                <SidebarMenuItem key={section.id}>
+                  <SidebarMenuButton
+                    asChild
+                    tooltip={compact ? section.title : undefined}
+                    className={cn(
+                      compact ? 'justify-center' : 'justify-start',
+                      isActive &&
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
+                    )}
+                  >
+                    <Link
+                      to={`${root}/${section.tabs[0].url}${query}`}
+                      aria-current={isActive ? 'page' : undefined}
+                      onClick={() => isMobile && setOpenMobile(false)}
+                    >
+                      <Icon />
+                      {!compact && <span>{section.title}</span>}
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )
+            })}
+          </SidebarMenu>
+        </SidebarGroup>
+      ))}
     </>
   )
 }
