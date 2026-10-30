@@ -101,6 +101,7 @@ import {
   Settings2,
   Shield,
   ShieldCheck,
+  ShieldOff,
   Sparkles,
   SquareTerminal,
   SunMoon,
@@ -863,6 +864,12 @@ export const projectNavItems: NavigationItem[] = [
     url: 'analytics',
     icon: BarChart3,
     keywords: ['stats', 'metrics', 'analytics', 'overview'],
+  },
+  {
+    title: 'Traffic filters',
+    url: 'analytics/settings',
+    icon: ShieldOff,
+    keywords: ['bots', 'datacenter', 'cloud', 'exclude', 'filter', 'spam'],
   },
   {
     title: 'Revenue',

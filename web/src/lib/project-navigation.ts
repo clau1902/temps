@@ -185,6 +185,7 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
           { title: 'AI crawlers', url: 'ai-crawlers' },
           { title: 'API traffic', url: 'analytics/api-traffic' },
           { title: 'Revenue', url: 'revenue' },
+          { title: 'Traffic filters', url: 'analytics/settings' },
         ],
       },
       {

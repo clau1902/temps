@@ -51,6 +51,7 @@ const SECTION_TABS = [
       'AI crawlers',
       'API traffic',
       'Revenue',
+      'Traffic filters',
     ],
   ],
   ['Monitoring', ['Metrics', 'Dashboards', 'Alerts', 'Uptime', 'Cron jobs']],
