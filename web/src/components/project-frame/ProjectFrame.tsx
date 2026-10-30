@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { PageNamedByChromeContext } from '@temps-sdk/ds'
+import { PageNamedByChromeContext, PageTitleLevelContext } from '@temps-sdk/ds'
 import type { ReactNode } from 'react'
 import type { ProjectResponse } from '@/api/client'
 import {
@@ -11,7 +11,10 @@ import {
 import { ProjectEnvironmentProvider } from './ProjectEnvironmentProvider'
 import { ProjectSectionTabs } from './ProjectSectionTabs'
 
-/** Shares the environment chosen in the bar with every project page. */
+/**
+ * Shares the environment chosen in the bar with every project page. The bar
+ * names the project as the page's `h1`, so page titles inside are `h2`.
+ */
 export function ProjectFrame({
   project,
   children,
@@ -28,7 +31,9 @@ export function ProjectFrame({
       project={project}
       scope={location.section.environmentScope}
     >
-      {children}
+      <PageTitleLevelContext.Provider value="h2">
+        {children}
+      </PageTitleLevelContext.Provider>
     </ProjectEnvironmentProvider>
   )
 }

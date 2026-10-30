@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import {
   getGenaiTraceOptions,
   queryGenaiTracesOptions,
@@ -4411,7 +4412,9 @@ console.log(response.choices[0].message.content);`,
       {/* Page Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl sm:text-3xl font-bold">AI Gateway</h1>
+          <PageTitle className="text-2xl sm:text-3xl font-bold">
+            AI Gateway
+          </PageTitle>
           <p className="text-muted-foreground mt-1 sm:mt-2 text-sm">
             Unified API for multiple AI providers with a single endpoint
           </p>

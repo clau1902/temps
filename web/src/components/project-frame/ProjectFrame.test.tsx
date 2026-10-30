@@ -5,6 +5,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { cleanup, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, useLocation } from 'react-router'
+import { PageHeader, PageTitle } from '@temps-sdk/ds'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { installBrowserWindow } from '@/test/dom'
@@ -113,4 +114,30 @@ test('a legacy environment link is rewritten as ?env=, so the next tab keeps it'
   expect(alerts.getAttribute('href')).toBe(
     '/projects/first/errors/alert-rules?env=staging'
   )
+})
+
+test('page titles inside a project are one level below the project name', () => {
+  const query = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+  })
+  query.setQueryData(
+    getEnvironmentsOptions({ path: { project_id: 1 } }).queryKey,
+    environments
+  )
+  const view = render(
+    <QueryClientProvider client={query}>
+      <MemoryRouter initialEntries={['/projects/first/storage']}>
+        <ProjectFrame project={{ id: 1, slug: 'first' } as ProjectResponse}>
+          <PageHeader title="Databases" description="Synthetic page." />
+          <PageTitle>KV Store</PageTitle>
+        </ProjectFrame>
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+
+  expect(
+    view.getByRole('heading', { level: 2, name: 'Databases' })
+  ).toBeTruthy()
+  expect(view.getByRole('heading', { level: 2, name: 'KV Store' })).toBeTruthy()
+  expect(view.queryByRole('heading', { level: 1 })).toBeNull()
 })

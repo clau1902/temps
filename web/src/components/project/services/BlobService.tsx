@@ -1,3 +1,4 @@
+import { PageTitle } from '@temps-sdk/ds'
 import { CodeBlock, HighlightedCode } from '@/components/ui/code-block'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
@@ -65,9 +66,9 @@ export function BlobService({ project: _project }: BlobServiceProps) {
               <HardDrive className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold sm:text-2xl">
+              <PageTitle className="text-xl font-semibold sm:text-2xl">
                 Blob Storage
-              </h1>
+              </PageTitle>
               <p className="text-muted-foreground text-sm">
                 S3-compatible file storage
               </p>
@@ -97,7 +98,9 @@ export function BlobService({ project: _project }: BlobServiceProps) {
             <HardDrive className="h-6 w-6 text-primary" />
           </div>
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold sm:text-2xl">Blob Storage</h1>
+            <PageTitle className="text-xl font-semibold sm:text-2xl">
+              Blob Storage
+            </PageTitle>
             <p className="text-muted-foreground text-sm">
               Upload, list, and serve files with a simple S3-backed API
             </p>

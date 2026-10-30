@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client'
 import { kvStatusOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
@@ -69,7 +70,9 @@ export function KvService({ project }: KvServiceProps) {
               <Database className="h-6 w-6 text-primary" />
             </div>
             <div>
-              <h1 className="text-xl font-semibold sm:text-2xl">KV Store</h1>
+              <PageTitle className="text-xl font-semibold sm:text-2xl">
+                KV Store
+              </PageTitle>
               <p className="text-muted-foreground text-sm">
                 Serverless key-value store backed by Redis
               </p>
@@ -99,7 +102,9 @@ export function KvService({ project }: KvServiceProps) {
             <Database className="h-6 w-6 text-primary" />
           </div>
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold sm:text-2xl">KV Store</h1>
+            <PageTitle className="text-xl font-semibold sm:text-2xl">
+              KV Store
+            </PageTitle>
             <p className="text-muted-foreground text-sm">
               Serverless key-value store backed by Redis — no infrastructure to
               manage

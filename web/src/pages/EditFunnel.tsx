@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { FunnelForm, FunnelFormData } from '@/components/funnel/FunnelForm'
 import {
@@ -147,7 +148,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <h1 className="text-3xl font-bold">Funnel Not Found</h1>
+          <PageTitle className="text-3xl font-bold">Funnel Not Found</PageTitle>
         </div>
         <Alert variant="destructive">
           <AlertDescription>

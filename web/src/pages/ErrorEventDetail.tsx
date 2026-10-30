@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import { ProjectResponse } from '@/api/client'
@@ -194,13 +195,13 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
               >
                 {sentryEvent?.sentry?.level || 'error'}
               </Badge>
-              <h1 className="min-w-0 break-words text-lg font-semibold sm:text-2xl">
+              <PageTitle className="min-w-0 break-words text-lg font-semibold sm:text-2xl">
                 {primaryException?.value ||
                   sentryEvent?.sentry?.logentry?.formatted ||
                   (isCsp
                     ? 'Content Security Policy violation'
                     : 'Event Details')}
-              </h1>
+              </PageTitle>
             </div>
             <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-muted-foreground">
               <Clock className="h-3 w-3" />

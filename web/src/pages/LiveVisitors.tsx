@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse } from '@/api/client/types.gen'
 import { LiveVisitorsList } from '@/components/visitors/LiveVisitorsList'
@@ -77,7 +78,7 @@ export function LiveVisitors({ project: projectProp }: LiveVisitorsProps = {}) {
         </Button>
 
         <div>
-          <h1 className="text-3xl font-bold">Live Visitors</h1>
+          <PageTitle className="text-3xl font-bold">Live Visitors</PageTitle>
           <p className="text-muted-foreground mt-1">
             See who&apos;s currently browsing {project.name}
           </p>

@@ -6,6 +6,7 @@ export { cn } from './lib/cn'
 export {
   PageContainer,
   PageHeader,
+  PageTitle,
   type PageContainerProps,
   type PageWidth,
   type PageHeaderProps,
@@ -93,7 +94,9 @@ export { useOnSettingsSurface } from './settings-surface-context'
 export {
   InsidePageContainerContext,
   PageNamedByChromeContext,
+  PageTitleLevelContext,
   usePageNamedByChrome,
+  usePageTitleLevel,
 } from './page-context'
 
 export { SettingsGroup } from './settings-group'

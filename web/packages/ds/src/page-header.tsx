@@ -6,6 +6,7 @@ import { cn } from './lib/cn'
 import {
   InsidePageContainerContext,
   PageNamedByChromeContext,
+  PageTitleLevelContext,
 } from './page-context'
 
 // Promoted from web/src/components/layout/PageContainer.tsx (it was already
@@ -88,7 +89,10 @@ export function PageContainer({
 }
 
 export interface PageHeaderProps {
-  /** Use h2 for a nested example or section; page titles remain h1. */
+  /**
+   * Use h2 for a nested example or section. A page title takes the level
+   * its frame sets (`PageTitleLevelContext`): h1, or h2 inside a project.
+   */
   headingLevel?: 'h1' | 'h2'
   title: ReactNode
   description?: ReactNode
@@ -103,18 +107,25 @@ export interface PageHeaderProps {
 }
 
 export function PageHeader({
-  headingLevel: Heading = 'h1',
+  headingLevel,
   title,
   description,
   verdict,
   actions,
   className,
 }: PageHeaderProps) {
-  // A tab strip above already names the page: keep the h1 for screen readers
+  // A tab strip above already names the page: keep the title for screen readers
   // and outlines, but do not print the same words twice.
-  const namedByChrome = useContext(PageNamedByChromeContext) && Heading === 'h1'
+  const pageTitleLevel = useContext(PageTitleLevelContext)
+  const isPageTitle = headingLevel !== 'h2'
+  const level = isPageTitle ? pageTitleLevel : 'h2'
+  const namedByChrome = useContext(PageNamedByChromeContext) && isPageTitle
   if (namedByChrome && !description && !verdict && !actions) {
-    return <Heading className="sr-only">{title}</Heading>
+    return (
+      <HeadingElement level={level} className="sr-only">
+        {title}
+      </HeadingElement>
+    )
   }
   return (
     <div
@@ -131,7 +142,8 @@ export function PageHeader({
             namedByChrome && !verdict && 'contents'
           )}
         >
-          <Heading
+          <HeadingElement
+            level={level}
             className={
               namedByChrome
                 ? 'sr-only'
@@ -139,7 +151,7 @@ export function PageHeader({
             }
           >
             {title}
-          </Heading>
+          </HeadingElement>
           {verdict}
         </div>
         {description ? (
@@ -159,5 +171,40 @@ export function PageHeader({
         </div>
       ) : null}
     </div>
+  )
+}
+
+/**
+ * A page's title for pages that lay out their own header: an `h1`, or an
+ * `h2` inside a frame whose bar already has the top heading.
+ */
+export function PageTitle({
+  className,
+  children,
+}: {
+  className?: string
+  children: ReactNode
+}) {
+  const level = useContext(PageTitleLevelContext)
+  return (
+    <HeadingElement level={level} className={className}>
+      {children}
+    </HeadingElement>
+  )
+}
+
+function HeadingElement({
+  level,
+  className,
+  children,
+}: {
+  level: 'h1' | 'h2'
+  className?: string
+  children: ReactNode
+}) {
+  return level === 'h1' ? (
+    <h1 className={className}>{children}</h1>
+  ) : (
+    <h2 className={className}>{children}</h2>
   )
 }

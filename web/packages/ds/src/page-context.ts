@@ -21,3 +21,15 @@ export const PageNamedByChromeContext = createContext(false)
 export function usePageNamedByChrome(): boolean {
   return useContext(PageNamedByChromeContext)
 }
+
+/**
+ * The heading level of a page's title. `h1` unless the frame around the page
+ * already has the top heading: a project's bar names the project, so the
+ * pages inside it title themselves one level down.
+ */
+export const PageTitleLevelContext = createContext<'h1' | 'h2'>('h1')
+
+/** The element a page title renders as: `h1`, or `h2` inside a frame. */
+export function usePageTitleLevel(): 'h1' | 'h2' {
+  return useContext(PageTitleLevelContext)
+}

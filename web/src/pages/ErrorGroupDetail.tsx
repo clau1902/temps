@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { PageTitle } from '@temps-sdk/ds'
 import { HighlightedCode } from '@/components/ui/code-block'
 
 import {
@@ -315,9 +316,9 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           )}
         </div>
 
-        <h1 className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
+        <PageTitle className="text-lg sm:text-xl md:text-2xl font-semibold break-words">
           {errorGroup.title}
-        </h1>
+        </PageTitle>
 
         <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex flex-col gap-1 text-sm text-muted-foreground sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-2 sm:gap-y-1">

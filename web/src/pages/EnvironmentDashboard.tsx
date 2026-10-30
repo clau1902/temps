@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import {
   getEnvironmentOptions,
   listContainersOptions,
@@ -106,7 +107,7 @@ export function EnvironmentDashboard({
   return (
     <div className="min-w-0 space-y-6">
       {/* The project bar already shows the environment's name. */}
-      <h1 className="sr-only">{environment.name}</h1>
+      <PageTitle className="sr-only">{environment.name}</PageTitle>
       <div className="flex items-center gap-3 border-b">
         <Tabs
           className="min-w-0 flex-1"
