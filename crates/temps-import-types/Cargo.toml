@@ -25,10 +25,3 @@ sea-orm = { workspace = true }
 
 # OpenAPI
 utoipa = { version = "6.0", features = ["chrono"] }
-
-# Optional for validation
-validator = { version = "0.21", optional = true, features = ["derive"] }
-
-[features]
-default = []
-validation = ["validator"]

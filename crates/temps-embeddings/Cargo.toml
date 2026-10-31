@@ -14,18 +14,5 @@ homepage.workspace = true
 thiserror = { workspace = true }
 serde = { workspace = true }
 
-# Tokenization libraries (optional features)
-tokenizers = { version = "0.23", optional = true }
-tiktoken-rs = { version = "0.12", optional = true }
-
-[features]
-default = []
-# Enable Hugging Face tokenizers support
-huggingface = ["tokenizers"]
-# Enable OpenAI tiktoken support
-openai = ["tiktoken-rs"]
-# Enable all tokenization backends
-all = ["huggingface", "openai"]
-
 [dev-dependencies]
 tokio = { workspace = true }

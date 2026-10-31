@@ -111,7 +111,3 @@ rcgen = { version = "0.14.8", features = ["x509-parser"] }
 # only exposes their encoding APIs to the test binary, without new network downloads.
 p256 = { version = "0.14", features = ["pkcs8", "pem"] }
 rsa = { version = "0.9", features = ["pem"] }
-
-[features]
-default = []
-integration-tests = []
