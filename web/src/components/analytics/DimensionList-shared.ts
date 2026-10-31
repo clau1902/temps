@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ProjectResponse, PropertyColumn } from '@/api/client/types.gen'
+import { segmentSupportsVisitors } from './SegmentVisitors-shared'
 
 export type DimensionKey =
   | 'events'
@@ -152,3 +153,32 @@ export interface Row {
 }
 
 export type DimensionSortKey = 'value' | 'count'
+
+/**
+ * The page a breakdown row opens: an event's detail page, else the visitors
+ * in that segment (`/analytics/segments/:dimension/:value`), when the
+ * dimension can filter visitors. The date range carries over, so the page
+ * opens on the same window. `undefined` leaves the row plain.
+ */
+export function dimensionRowHref(
+  projectSlug: string,
+  dimension: DimensionKey,
+  value: string,
+  searchParams: URLSearchParams
+): string | undefined {
+  const base = `/projects/${projectSlug}/analytics`
+  const path =
+    dimension === 'events'
+      ? `${base}/events/${encodeURIComponent(value)}`
+      : segmentSupportsVisitors(dimension)
+        ? `${base}/segments/${dimension}/${encodeURIComponent(value)}`
+        : undefined
+  if (!path) return undefined
+  const params = new URLSearchParams()
+  for (const key of ['filter', 'from', 'to']) {
+    const current = searchParams.get(key)
+    if (current) params.set(key, current)
+  }
+  const qs = params.toString()
+  return qs ? `${path}?${qs}` : path
+}
