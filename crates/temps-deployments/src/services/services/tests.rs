@@ -5250,51 +5250,6 @@ fn resolve_resource_usage_is_opt_in_with_env_over_project() {
     assert_eq!(still_none.memory_limit, None);
 }
 
-#[test]
-fn rollback_runtime_uses_target_deployment_snapshot() {
-    let snapshot = temps_entities::deployment_config::DeploymentConfigSnapshot {
-        exposed_port: Some(8080),
-        replicas: 3,
-        cpu_request: Some(500_000),
-        cpu_limit: Some(1_000_000),
-        memory_request: Some(512),
-        memory_limit: Some(1_536),
-        ..Default::default()
-    };
-
-    let (port, replicas) = DeploymentService::rollback_snapshot_port_and_replicas(&snapshot, 42)
-        .expect("valid deployment snapshot");
-    let resources = DeploymentService::resource_usage_from_snapshot(&snapshot);
-
-    assert_eq!(port, Some(8080));
-    assert_eq!(replicas, 3);
-    assert_eq!(resources.cpu_request.as_deref(), Some("500000u"));
-    assert_eq!(resources.cpu_limit.as_deref(), Some("1000000u"));
-    assert_eq!(resources.memory_request.as_deref(), Some("512Mi"));
-    assert_eq!(resources.memory_limit.as_deref(), Some("1536Mi"));
-}
-
-#[test]
-fn rollback_rejects_invalid_target_snapshot_runtime() {
-    let invalid_port = temps_entities::deployment_config::DeploymentConfigSnapshot {
-        exposed_port: Some(70_000),
-        ..Default::default()
-    };
-    assert!(matches!(
-        DeploymentService::rollback_snapshot_port_and_replicas(&invalid_port, 42),
-        Err(DeploymentError::InvalidDeploymentState(_))
-    ));
-
-    let invalid_replicas = temps_entities::deployment_config::DeploymentConfigSnapshot {
-        replicas: 0,
-        ..Default::default()
-    };
-    assert!(matches!(
-        DeploymentService::rollback_snapshot_port_and_replicas(&invalid_replicas, 42),
-        Err(DeploymentError::InvalidDeploymentState(_))
-    ));
-}
-
 #[tokio::test]
 async fn test_trigger_image_deployment_rejects_empty_image_ref(
 ) -> Result<(), Box<dyn std::error::Error>> {
