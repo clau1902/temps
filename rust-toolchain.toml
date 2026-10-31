@@ -11,6 +11,6 @@
 # wasm32, Apple) add them explicitly, and listing them here would make
 # every local build try to install them.
 [toolchain]
-channel = "1.97.1"
+channel = "1.99.1"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

@@ -48,7 +48,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
           # Keep in sync with rust-toolchain.toml.
-          toolchain: 1.97.1
+          toolchain: 1.99.1
       - name: Verify daemon lifecycle without provider credentials
         env:
           DOCKER_DEFAULT_PLATFORM: linux/${{ matrix.arch }}
