@@ -162,7 +162,7 @@ export function ExternalUrlStep({
               Saving...
             </>
           ) : (
-            'Save & Continue'
+            'Save & continue'
           )}
         </Button>
       </div>

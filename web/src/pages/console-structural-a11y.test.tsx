@@ -449,8 +449,8 @@ const SECTION_READY: Record<
   string
 > = {
   alerts: 'Route monitoring',
-  rules: 'Monitoring & Alerts',
-  alarms: 'Monitoring & Alerts',
+  rules: 'Monitoring & alerts',
+  alarms: 'Monitoring & alerts',
   notifications: 'Weekly digest',
 }
 

@@ -411,20 +411,17 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
             >
               <TabsList className="grid w-full grid-cols-2 sm:grid-cols-3 mb-4 h-auto">
                 {hasHtml && (
-                  <TabsTrigger value="preview" className="gap-2">
-                    <Eye className="h-4 w-4" />
+                  <TabsTrigger value="preview" icon={Eye}>
                     Preview
                   </TabsTrigger>
                 )}
                 {hasHtml && (
-                  <TabsTrigger value="html-source" className="gap-2">
-                    <Code className="h-4 w-4" />
+                  <TabsTrigger value="html-source" icon={Code}>
                     HTML source
                   </TabsTrigger>
                 )}
                 {hasText && (
-                  <TabsTrigger value="text" className="gap-2">
-                    <FileText className="h-4 w-4" />
+                  <TabsTrigger value="text" icon={FileText}>
                     Plain text
                   </TabsTrigger>
                 )}

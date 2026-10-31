@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Outlet, useLocation, useNavigate } from 'react-router'
+import { Box, Eye, Home, KeyRound, Terminal } from 'lucide-react'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -18,11 +19,31 @@ import {
 // tab order on desktop and the select-options order on mobile. Keep section
 // labels short — they share a row.
 const sections = [
-  { id: 'overview', label: 'Overview', path: '/agent-sandbox' },
-  { id: 'providers', label: 'Harnesses', path: '/agent-sandbox/providers' },
-  { id: 'sandbox', label: 'Sandbox', path: '/agent-sandbox/sandbox' },
-  { id: 'preview', label: 'Preview gateway', path: '/agent-sandbox/preview' },
-  { id: 'secrets', label: 'Secrets', path: '/agent-sandbox/secrets' },
+  { id: 'overview', label: 'Overview', path: '/agent-sandbox', icon: Home },
+  {
+    id: 'providers',
+    label: 'Harnesses',
+    path: '/agent-sandbox/providers',
+    icon: Terminal,
+  },
+  {
+    id: 'sandbox',
+    label: 'Sandbox',
+    path: '/agent-sandbox/sandbox',
+    icon: Box,
+  },
+  {
+    id: 'preview',
+    label: 'Preview gateway',
+    path: '/agent-sandbox/preview',
+    icon: Eye,
+  },
+  {
+    id: 'secrets',
+    label: 'Secrets',
+    path: '/agent-sandbox/secrets',
+    icon: KeyRound,
+  },
 ] as const
 
 type SectionId = (typeof sections)[number]['id']
@@ -80,7 +101,7 @@ export function AgentSandboxLayout() {
         <Tabs value={current} onValueChange={handleChange}>
           <TabsList>
             {sections.map((s) => (
-              <TabsTrigger key={s.id} value={s.id}>
+              <TabsTrigger key={s.id} value={s.id} icon={s.icon}>
                 {s.label}
               </TabsTrigger>
             ))}

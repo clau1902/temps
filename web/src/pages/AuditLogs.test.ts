@@ -27,7 +27,7 @@ describe('audit operation filters', () => {
     ).toEqual({
       value: 'VISITOR_ENRICHED',
       label: 'Visitor enriched',
-      group: 'Analytics & Visitors',
+      group: 'Analytics & visitors',
       keywords: 'VISITOR_ENRICHED',
     })
   })

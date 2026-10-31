@@ -485,7 +485,7 @@ export function DomainDetail() {
       const response = data as any
       if (response?.txt_records && response.txt_records.length > 0) {
         toast.success(
-          'Renewal order created. Update DNS TXT records and click "Verify & Complete" to finalize.',
+          'Renewal order created. Update DNS TXT records and click "Verify & complete" to finalize.',
           { duration: 6000 }
         )
       } else if (response?.Complete) {

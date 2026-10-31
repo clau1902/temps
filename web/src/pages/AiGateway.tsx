@@ -3261,8 +3261,7 @@ function TraceDetailView({
           {/* Invocations (default) + raw span tree */}
           <Tabs defaultValue="conversation" className="w-full">
             <TabsList>
-              <TabsTrigger value="conversation" className="gap-1.5">
-                <MessageSquare className="h-3.5 w-3.5" />
+              <TabsTrigger value="conversation" icon={MessageSquare}>
                 Conversation
                 {invocationCount > 0 && (
                   <span className="text-xs text-muted-foreground">
@@ -3270,8 +3269,7 @@ function TraceDetailView({
                   </span>
                 )}
               </TabsTrigger>
-              <TabsTrigger value="tree" className="gap-1.5">
-                <ListTree className="h-3.5 w-3.5" />
+              <TabsTrigger value="tree" icon={ListTree}>
                 Span tree
                 <span className="text-xs text-muted-foreground">
                   {traceDetail.span_count}

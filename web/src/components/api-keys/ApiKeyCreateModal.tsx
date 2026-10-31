@@ -247,13 +247,11 @@ export function ApiKeyCreateModal({
                     }
                   >
                     <TabsList className="grid w-full grid-cols-2">
-                      <TabsTrigger value="role">
-                        <Shield className="h-4 w-4 mr-2" />
-                        Predefined Role
+                      <TabsTrigger value="role" icon={Shield}>
+                        Predefined role
                       </TabsTrigger>
-                      <TabsTrigger value="custom">
-                        <Key className="h-4 w-4 mr-2" />
-                        Custom Permissions
+                      <TabsTrigger value="custom" icon={Key}>
+                        Custom permissions
                       </TabsTrigger>
                     </TabsList>
 

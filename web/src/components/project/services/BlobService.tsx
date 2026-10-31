@@ -126,16 +126,13 @@ export function BlobService({ project: _project }: BlobServiceProps) {
 
       <Tabs defaultValue="overview" className="space-y-6">
         <TabsList>
-          <TabsTrigger value="overview" className="gap-2">
-            <Settings2 className="h-4 w-4" />
+          <TabsTrigger value="overview" icon={Settings2}>
             Overview
           </TabsTrigger>
-          <TabsTrigger value="docs" className="gap-2">
-            <BookOpen className="h-4 w-4" />
+          <TabsTrigger value="docs" icon={BookOpen}>
             Documentation
           </TabsTrigger>
-          <TabsTrigger value="examples" className="gap-2">
-            <Terminal className="h-4 w-4" />
+          <TabsTrigger value="examples" icon={Terminal}>
             Examples
           </TabsTrigger>
         </TabsList>

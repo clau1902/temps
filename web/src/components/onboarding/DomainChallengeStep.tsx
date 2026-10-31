@@ -212,7 +212,7 @@ export function DomainChallengeStep({
               Creating Domain...
             </>
           ) : (
-            'Create Domain & Verify'
+            'Create domain & verify'
           )}
         </Button>
       </div>

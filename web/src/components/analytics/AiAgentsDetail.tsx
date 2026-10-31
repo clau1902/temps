@@ -38,6 +38,7 @@ import {
   Bot,
   ChevronRight,
   ExternalLink,
+  FileText,
   Search,
 } from 'lucide-react'
 import * as React from 'react'
@@ -510,8 +511,12 @@ export function AiAgentsDetail({
       {view === 'tables' && (
         <Tabs defaultValue="agents">
           <TabsList>
-            <TabsTrigger value="agents">Agents</TabsTrigger>
-            <TabsTrigger value="pages">Pages crawled</TabsTrigger>
+            <TabsTrigger value="agents" icon={Bot}>
+              Agents
+            </TabsTrigger>
+            <TabsTrigger value="pages" icon={FileText}>
+              Pages crawled
+            </TabsTrigger>
           </TabsList>
 
           {/* ─── Agents ─────────────────────────────────────────────── */}

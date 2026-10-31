@@ -13,6 +13,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
 import { useSearchParams } from 'react-router'
+import { BarChart3, Code, Globe, Send, Server } from 'lucide-react'
 
 export function Email() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -42,11 +43,21 @@ export function Email() {
 
           <Tabs value={activeTab} onValueChange={handleTabChange}>
             <TabsList className="w-full lg:w-auto">
-              <TabsTrigger value="providers">Providers</TabsTrigger>
-              <TabsTrigger value="domains">Domains</TabsTrigger>
-              <TabsTrigger value="emails">Sent emails</TabsTrigger>
-              <TabsTrigger value="analytics">Analytics</TabsTrigger>
-              <TabsTrigger value="sdk">SDK</TabsTrigger>
+              <TabsTrigger value="providers" icon={Server}>
+                Providers
+              </TabsTrigger>
+              <TabsTrigger value="domains" icon={Globe}>
+                Domains
+              </TabsTrigger>
+              <TabsTrigger value="emails" icon={Send}>
+                Sent emails
+              </TabsTrigger>
+              <TabsTrigger value="analytics" icon={BarChart3}>
+                Analytics
+              </TabsTrigger>
+              <TabsTrigger value="sdk" icon={Code}>
+                SDK
+              </TabsTrigger>
             </TabsList>
 
             <TabsContent value="providers" className="mt-6">

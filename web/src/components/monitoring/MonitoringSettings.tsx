@@ -1164,7 +1164,7 @@ export function MonitoringSettings() {
 
   return (
     <div className="space-y-6">
-      <PageHeader title="Monitoring & Alerts" />
+      <PageHeader title="Monitoring & alerts" />
 
       {/* Mobile Select */}
       <div className="sm:hidden">
@@ -1193,7 +1193,11 @@ export function MonitoringSettings() {
         >
           <TabsList>
             {MONITORING_SECTIONS.map((section) => (
-              <TabsTrigger key={section.id} value={section.id}>
+              <TabsTrigger
+                key={section.id}
+                value={section.id}
+                icon={section.icon}
+              >
                 {section.label}
               </TabsTrigger>
             ))}

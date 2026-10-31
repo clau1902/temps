@@ -1509,13 +1509,16 @@ function NodeDetail({
             <TabsList>
               <TabsTrigger
                 value="containers"
+                icon={Box}
                 count={containersLoading ? undefined : containers.length}
               >
-                <Box className="h-4 w-4" />
                 Containers
               </TabsTrigger>
-              <TabsTrigger value="sandboxes" count={sandboxesQuery.data?.total}>
-                <Terminal className="h-4 w-4" />
+              <TabsTrigger
+                value="sandboxes"
+                icon={Terminal}
+                count={sandboxesQuery.data?.total}
+              >
                 Sandboxes
               </TabsTrigger>
             </TabsList>

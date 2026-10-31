@@ -39,17 +39,19 @@ import { httpStatusClass } from '@/lib/http-status-class'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
-  ArrowLeft,
-  Clock,
-  Globe,
-  CheckCircle,
-  XCircle,
   AlertCircle,
-  Globe as MapPinIcon,
-  Users as UserIcon,
+  ArrowLeft,
+  ArrowLeftRight,
   Bug,
+  CheckCircle,
   ChevronLeft,
   ChevronRight,
+  Clock,
+  Globe,
+  Globe as MapPinIcon,
+  MousePointerClick,
+  Users as UserIcon,
+  XCircle,
 } from 'lucide-react'
 import * as React from 'react'
 import { useNavigate } from 'react-router'
@@ -473,11 +475,19 @@ export function SessionDetail({
           {/* Tabs for Events and Request Logs */}
           <Tabs defaultValue="requests" className="w-full">
             <TabsList className="grid w-full grid-cols-2">
-              <TabsTrigger value="requests">
-                Request Logs ({sessionLogs?.total_count || 0})
+              <TabsTrigger
+                value="requests"
+                icon={ArrowLeftRight}
+                count={sessionLogs?.total_count || 0}
+              >
+                Request logs
               </TabsTrigger>
-              <TabsTrigger value="events">
-                Events ({sessionEvents?.total_count || 0})
+              <TabsTrigger
+                value="events"
+                icon={MousePointerClick}
+                count={sessionEvents?.total_count || 0}
+              >
+                Events
               </TabsTrigger>
             </TabsList>
 

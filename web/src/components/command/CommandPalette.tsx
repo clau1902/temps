@@ -1060,7 +1060,7 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['git', 'repository', 'repo', 'source'],
   },
   {
-    title: 'Build & Deploy',
+    title: 'Build & deploy',
     url: 'settings/delivery',
     icon: Settings,
     keywords: ['build', 'framework', 'compose', 'docker', 'root directory'],

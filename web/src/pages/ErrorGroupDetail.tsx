@@ -56,6 +56,8 @@ import {
   ArrowLeft,
   Check,
   EyeOff,
+  Home,
+  List,
   MoreVertical,
   RotateCcw,
   UserRound,
@@ -435,9 +437,15 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       {/* Tabs for different views */}
       <Tabs value={selectedTab} onValueChange={setSelectedTab}>
         <TabsList className="grid w-full max-w-[400px] grid-cols-2">
-          <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="events">
-            Events ({errorEvents?.data?.length || 0})
+          <TabsTrigger value="overview" icon={Home}>
+            Overview
+          </TabsTrigger>
+          <TabsTrigger
+            value="events"
+            icon={List}
+            count={errorEvents?.data?.length || 0}
+          >
+            Events
           </TabsTrigger>
         </TabsList>
 

@@ -751,12 +751,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
         className="space-y-4"
       >
         <TabsList className="grid w-full max-w-2xl grid-cols-3">
-          <TabsTrigger value="journey" className="flex items-center gap-2">
-            <Activity className="h-4 w-4" />
+          <TabsTrigger value="journey" icon={Activity}>
             Journey
           </TabsTrigger>
-          <TabsTrigger value="sessions" className="flex items-center gap-2">
-            <Clock className="h-4 w-4" />
+          <TabsTrigger value="sessions" icon={Clock}>
             Sessions
             {sessions && (
               <Badge variant="secondary" className="ml-1">
@@ -764,8 +762,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="replays" className="flex items-center gap-2">
-            <PlayCircle className="h-4 w-4" />
+          <TabsTrigger value="replays" icon={PlayCircle}>
             Session replays
             {sessionReplays && (
               <Badge variant="secondary" className="ml-1">

@@ -161,7 +161,7 @@ function ExtensionNotAvailable({
                     Restarting…
                   </>
                 ) : (
-                  'Enable & Restart'
+                  'Enable & restart'
                 )}
               </Button>
               <p className="text-xs text-muted-foreground">
@@ -587,7 +587,7 @@ function SlowQueriesContent({
                   Restarting…
                 </>
               ) : (
-                'Enable & Restart'
+                'Enable & restart'
               )}
             </AlertDialogAction>
           </AlertDialogFooter>

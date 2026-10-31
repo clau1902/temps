@@ -57,7 +57,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
     ],
   },
   {
-    label: 'Users & Roles',
+    label: 'Users & roles',
     operations: [
       { value: 'USER_CREATED', label: 'User created' },
       { value: 'USER_UPDATED', label: 'User updated' },
@@ -137,7 +137,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
     ],
   },
   {
-    label: 'Services & Environments',
+    label: 'Services & environments',
     operations: [
       { value: 'PROJECT_CREATED', label: 'Service created' },
       { value: 'PROJECT_UPDATED', label: 'Service updated' },
@@ -350,7 +350,7 @@ export const OPERATION_GROUPS: OperationGroup[] = [
     ],
   },
   {
-    label: 'Analytics & Visitors',
+    label: 'Analytics & visitors',
     operations: [{ value: 'VISITOR_ENRICHED', label: 'Visitor enriched' }],
   },
   {

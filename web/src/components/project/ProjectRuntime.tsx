@@ -73,12 +73,10 @@ export function ProjectRuntime({ project }: ProjectRuntimeProps) {
       />
       <div className="mb-2">
         <TabsList>
-          <TabsTrigger value="live" className="gap-1.5">
-            <Radio className="h-3.5 w-3.5" />
+          <TabsTrigger value="live" icon={Radio}>
             Live
           </TabsTrigger>
-          <TabsTrigger value="history" className="gap-1.5">
-            <ScrollText className="h-3.5 w-3.5" />
+          <TabsTrigger value="history" icon={ScrollText}>
             History
           </TabsTrigger>
         </TabsList>

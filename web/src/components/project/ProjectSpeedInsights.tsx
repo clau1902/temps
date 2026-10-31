@@ -835,16 +835,16 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               <TabsList className="h-8">
                 <TabsTrigger
                   value="desktop"
-                  className="h-6 gap-1.5 px-2 text-xs"
+                  icon={Monitor}
+                  className="h-6 px-2 text-xs"
                 >
-                  <Monitor className="h-3.5 w-3.5" />
                   Desktop
                 </TabsTrigger>
                 <TabsTrigger
                   value="mobile"
-                  className="h-6 gap-1.5 px-2 text-xs"
+                  icon={Smartphone}
+                  className="h-6 px-2 text-xs"
                 >
-                  <Smartphone className="h-3.5 w-3.5" />
                   Mobile
                 </TabsTrigger>
               </TabsList>

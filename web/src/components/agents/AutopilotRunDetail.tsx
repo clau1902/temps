@@ -30,9 +30,12 @@ import {
   ArrowLeft,
   ExternalLink,
   FileCode,
+  FileText,
   Hash,
+  Info,
   Loader2,
   RefreshCw,
+  ScrollText,
   Terminal,
   Webhook,
 } from 'lucide-react'
@@ -1831,24 +1834,28 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
           <TabsList className="h-auto bg-transparent p-0 gap-4 justify-start border-b border-border w-full rounded-none">
             <TabsTrigger
               value="conversation"
+              icon={MessageSquare}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Conversation
             </TabsTrigger>
             <TabsTrigger
               value="report"
+              icon={FileText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Report
             </TabsTrigger>
             <TabsTrigger
               value="details"
+              icon={Info}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Details
             </TabsTrigger>
             <TabsTrigger
               value="logs"
+              icon={ScrollText}
               className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-foreground rounded-none px-0 pb-2 text-sm font-medium text-muted-foreground data-[state=active]:text-foreground"
             >
               Logs

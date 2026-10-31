@@ -284,7 +284,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   usePageTitle('Alarms')
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Monitoring & Alerts' }, { label: 'Alarms' }])
+    setBreadcrumbs([{ label: 'Monitoring & alerts' }, { label: 'Alarms' }])
   }, [setBreadcrumbs])
 
   // Deep-link support (e.g. from an alert rule's per-series "View" link):

@@ -409,7 +409,7 @@ describe('command palette project pages', () => {
 
   test('Build & Deploy opens the combined delivery settings', () => {
     expect(
-      projectNavItems.find((item) => item.title === 'Build & Deploy')?.url
+      projectNavItems.find((item) => item.title === 'Build & deploy')?.url
     ).toBe('settings/delivery')
   })
 })
