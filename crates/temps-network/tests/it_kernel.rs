@@ -25,6 +25,11 @@
     clippy::disallowed_methods,
     reason = "integration test: reads fixture configuration from the environment"
 )]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test: a failed setup step should abort the test with its message"
+)]
 
 use ipnet::Ipv4Net;
 use std::net::{IpAddr, Ipv4Addr};
