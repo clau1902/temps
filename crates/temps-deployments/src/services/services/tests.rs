@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::cleanup::{recorded_container_ownership, RecordedContainerOwnership};
+use super::redeploy::check_redeploy_plan_batch;
 use super::*;
 
 use chrono::Utc;
