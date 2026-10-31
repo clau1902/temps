@@ -6,6 +6,7 @@ use super::presets::{
     validate_compose_public_ports, validate_relaxed_capability_services,
     validate_unsandboxed_services,
 };
+use super::queries::has_ready_deployment;
 use super::source_directory::public_directory_provider;
 use super::*;
 
