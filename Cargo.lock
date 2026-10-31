@@ -13296,7 +13296,6 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
- "temps-dns",
  "temps-dns-resolver",
  "temps-docker-capture",
  "temps-entities",
