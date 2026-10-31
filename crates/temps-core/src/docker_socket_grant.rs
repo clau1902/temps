@@ -65,7 +65,7 @@ impl DockerSocketGrant {
     /// `set_var` (tests, embedders) change container privileges at runtime.
     #[allow(
         clippy::disallowed_methods,
-        reason = "documented host-level operator policy: TEMPS_DOCKER_SOCKET_PROJECTS (CLAUDE.md env table, ADR 045)"
+        reason = "documented host-level operator policy: TEMPS_DOCKER_SOCKET_PROJECTS (docs/reference/environment-variables.md, ADR 079)"
     )]
     pub fn from_env() -> Self {
         Self::parse(std::env::var(DOCKER_SOCKET_PROJECTS_ENV).ok().as_deref())
