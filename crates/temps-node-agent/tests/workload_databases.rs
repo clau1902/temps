@@ -28,12 +28,14 @@ use axum::Json;
 use bollard::models::ContainerCreateBody;
 use bollard::Docker;
 use serde_json::{json, Value};
-use temps_agent::handlers::AgentState;
-use temps_agent::service_handlers::{create_service, create_service_workload, service_snapshot};
-use temps_agent::{ServiceCreateRequest, ServicePortMapping};
 use temps_docker_capture::{golden_value, FakeDocker, Method};
 use temps_entities::external_service_workload_mode::ServiceWorkloadMode;
 use temps_entities::external_services;
+use temps_node_agent::handlers::AgentState;
+use temps_node_agent::service_handlers::{
+    create_service, create_service_workload, service_snapshot,
+};
+use temps_node_agent::{ServiceCreateRequest, ServicePortMapping};
 use temps_providers::externalsvc::redis::RedisService;
 use temps_providers::externalsvc::{ExternalService, ServiceConfig, ServiceType};
 use temps_providers::remote_service_client::{

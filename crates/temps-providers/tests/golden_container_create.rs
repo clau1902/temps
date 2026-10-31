@@ -8,7 +8,7 @@
 //! (`temps-docker-capture`) that records every `POST /containers/create`
 //! and fails it. Phase 4 moves databases onto the Docker driver; these
 //! fixtures say what that driver must send, and where the worker path
-//! (`temps-agent`'s `create_service`) differs today (defect 1).
+//! (`temps-node-agent`'s `create_service`) differs today (defect 1).
 //! `TEMPS_UPDATE_GOLDEN=1` rewrites them.
 
 // Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`

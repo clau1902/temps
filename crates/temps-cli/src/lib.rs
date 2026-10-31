@@ -220,7 +220,7 @@ pub fn install_tracing_with_otel(
              temps_screenshots={level},\
              temps_static_files={level},\
              temps_vulnerability_scanner={level},\
-             temps_agent={level},\
+             temps_node_agent={level},\
              temps_edge={level},\
              temps_wireguard={level},\
              temps_ai={level},\

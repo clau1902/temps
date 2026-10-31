@@ -19,10 +19,10 @@ use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde_json::{json, Value};
-use temps_agent::handlers::AgentState;
-use temps_agent::service_handlers::create_service;
-use temps_agent::{ServiceCreateRequest, ServicePortMapping};
 use temps_docker_capture::{assert_golden, golden_value, FakeDocker, Method};
+use temps_node_agent::handlers::AgentState;
+use temps_node_agent::service_handlers::create_service;
+use temps_node_agent::{ServiceCreateRequest, ServicePortMapping};
 
 #[tokio::test]
 async fn golden_worker_postgres_service() {

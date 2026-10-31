@@ -3,7 +3,7 @@
 
 //! Resolver runtime configuration.
 //!
-//! Built by `temps-agent` at startup from: the node's [`NodeAlloc`]
+//! Built by `temps-node-agent` at startup from: the node's [`NodeAlloc`]
 //! (provides bridge gateway IP for the listen socket), an env var for the
 //! disk snapshot directory, and the control-plane URL + node bearer token
 //! (for the sync long-poll).

@@ -25,11 +25,11 @@ path = "src/lib.rs"
 default = []
 # Embed the network policy eBPF programs (needs nightly Rust with rust-src
 # and bpf-linker at build time). Without it nodes enforce with nftables.
-ebpf = ["temps-network-policy/ebpf", "temps-agent/ebpf"]
+ebpf = ["temps-network-policy/ebpf", "temps-node-agent/ebpf"]
 
 [dependencies]
 # All library crates
-temps-agent = { path = "../temps-agent" }
+temps-node-agent = { path = "../temps-node-agent" }
 temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-edge = { path = "../temps-edge" }
 temps-ai-gateway = { path = "../temps-ai-gateway" }

@@ -107,7 +107,7 @@ members = [
     "crates/temps-sandbox",
     "crates/temps-pty-agent",
     "crates/temps-git-credential",
-    "crates/temps-agent",
+    "crates/temps-node-agent",
     "crates/temps-edge",
     "crates/temps-preview-gateway",
     "crates/temps-external-plugins",

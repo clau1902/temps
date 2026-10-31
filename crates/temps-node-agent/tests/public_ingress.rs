@@ -12,16 +12,16 @@ use std::time::Duration;
 
 use axum::response::IntoResponse;
 use tempfile::TempDir;
-use temps_agent::internal_proxy::{
+use temps_node_agent::internal_proxy::{
     spawn_public_http, spawn_serve_socket, spawn_tunnel_origin, ServeSocket,
 };
-use temps_agent::public_ingress::{self, PublicIngressConfig};
-use temps_agent::route_store::{
+use temps_node_agent::public_ingress::{self, PublicIngressConfig};
+use temps_node_agent::route_store::{
     PrivateRouteEntry, PublicIngressCertBundle, PublicIngressCertificates, PublicIngressSnapshot,
     RouteBackend, RouteEntry, RouteStore, ServeEntry, SharedRouteStore,
 };
-use temps_agent::route_sync_client::RouteSyncClient;
-use temps_agent::tailnet_identity::TailnetIdentity;
+use temps_node_agent::route_sync_client::RouteSyncClient;
+use temps_node_agent::tailnet_identity::TailnetIdentity;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
@@ -413,11 +413,11 @@ async fn test_public_ingress_forged_forwarding_headers_are_replaced() {
 async fn test_tunnel_origin_removes_the_connector_ja4_header() {
     let (backend_address, mut requests, backend_shutdown) = start_recording_backend().await;
     let ingress = IngressHarness::start(backend_address, true).await;
-    use temps_agent::internal_proxy::TunnelOriginHeaders;
+    use temps_node_agent::internal_proxy::TunnelOriginHeaders;
     let headers = Arc::new(arc_swap::ArcSwap::from_pointee(
         TunnelOriginHeaders::new(Some("x-connector-client-ip"), None).expect("valid header names"),
     ));
-    let origin = temps_agent::internal_proxy::spawn_tunnel_origin(
+    let origin = temps_node_agent::internal_proxy::spawn_tunnel_origin(
         "127.0.0.1:0".parse().expect("parse loopback address"),
         Arc::clone(&ingress.store),
         Arc::clone(&ingress.shutdown),
@@ -1817,7 +1817,7 @@ async fn test_serve_socket_admits_only_listed_tailnet_users() {
     // No LocalAPI: whois is unavailable, as without the owner's consent.
     // The worker knows its own node, as after the Serve manager's first pass.
     let identity = Arc::new(TailnetIdentity::new());
-    identity.set_self(Some(temps_agent::tailnet_identity::SelfNode {
+    identity.set_self(Some(temps_node_agent::tailnet_identity::SelfNode {
         stable_id: "n123CNTRL".to_string(),
         ips: vec!["100.101.102.103".parse().expect("an IP")],
     }));

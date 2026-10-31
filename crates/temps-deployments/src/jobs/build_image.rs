@@ -3377,7 +3377,7 @@ pub(crate) mod fake_worker {
         }
     }
 
-    /// Applies the checks the real agent (`temps_agent::build_handler`)
+    /// Applies the checks the real agent (`temps_node_agent::build_handler`)
     /// applies before handing the context to Docker: the spec must come first
     /// and pass `BuildSpec::validate`, the context must be a readable tar, and
     /// the spec's Dockerfile must be in it. Answers with the same NDJSON
