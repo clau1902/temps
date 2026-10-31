@@ -28,7 +28,7 @@
     },
     "temps-ai-agent-cli": {
       "files_over_3000_lines": 1,
-      "functions_over_300_lines": 3
+      "functions_over_300_lines": 2
     },
     "temps-ai-chat": {
       "handler_db_access": 1,
@@ -111,7 +111,7 @@
       "files_over_3000_lines": 1
     },
     "temps-database": {
-      "anyhow_in_library": 57
+      "anyhow_in_library": 56
     },
     "temps-deployer": {
       "lazy_error_variants": 20,
@@ -308,7 +308,7 @@
     "temps-providers": {
       "handler_db_access": 9,
       "lazy_error_variants": 3,
-      "anyhow_in_library": 587,
+      "anyhow_in_library": 585,
       "files_over_3000_lines": 8,
       "functions_over_300_lines": 9
     },
