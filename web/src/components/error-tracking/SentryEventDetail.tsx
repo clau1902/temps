@@ -23,6 +23,7 @@ import { CheckCircle, Copy } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 import { StackTrace } from './StackTrace'
+import { IpLink } from '@/components/data-display/IpLink'
 
 interface SentryEventDetailProps {
   event: SentryEvent
@@ -1022,10 +1023,10 @@ export function SentryEventDetail({
                 {sentryData.user.ip_address && (
                   <div className="text-sm">
                     <div className="text-muted-foreground text-xs">
-                      IP Address
+                      IP address
                     </div>
                     <div className="font-mono">
-                      {sentryData.user.ip_address}
+                      <IpLink ip={sentryData.user.ip_address} />
                     </div>
                   </div>
                 )}

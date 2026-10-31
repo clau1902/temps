@@ -43,6 +43,7 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { EventBadge } from './shared'
 import { parseUserAgent } from './sharedUtils'
+import { IpLink } from '@/components/data-display/IpLink'
 
 // Types
 interface EmailEventStats {
@@ -359,7 +360,7 @@ export function EmailAnalytics() {
                             {event.ip_address && (
                               <span className="flex items-center gap-1">
                                 <Globe className="h-3 w-3" />
-                                {event.ip_address}
+                                <IpLink ip={event.ip_address} />
                               </span>
                             )}
                             {event.user_agent && (

@@ -17,6 +17,7 @@ import { Link, useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useState } from 'react'
 import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
+import { IpLink } from '@/components/data-display/IpLink'
 
 interface LiveVisitorsListProps {
   project: ProjectResponse
@@ -185,10 +186,14 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground font-medium mb-1">
-                          IP Address
+                          IP address
                         </p>
                         <p className="text-sm font-medium font-mono">
-                          {visitor.ip_address}
+                          {visitor.ip_address ? (
+                            <IpLink ip={visitor.ip_address} />
+                          ) : (
+                            'Unknown'
+                          )}
                         </p>
                       </div>
                     </div>

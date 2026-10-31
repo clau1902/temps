@@ -57,6 +57,7 @@ import {
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
+import { IpLink } from '@/components/data-display/IpLink'
 
 interface ProxyLogsDataTableProps {
   projectId?: number
@@ -1632,11 +1633,14 @@ function DetailField({
   value,
   mono,
   copyable,
+  ip,
 }: {
   label: string
   value: string | number | null | undefined
   mono?: boolean
   copyable?: boolean
+  /** The value is a client address: link it to its IP page. */
+  ip?: boolean
 }) {
   if (value === null || value === undefined || value === '') return null
   const display = String(value)
@@ -1648,7 +1652,7 @@ function DetailField({
           className={`text-sm truncate ${mono ? 'font-mono' : ''}`}
           title={display}
         >
-          {display}
+          {ip ? <IpLink ip={display} /> : display}
         </p>
         {copyable && (
           <CopyButton
@@ -1710,7 +1714,7 @@ function ProxyLogInlineDetail({ log }: { log: ProxyLogResponse }) {
         <DetailField label="Source" value={log.request_source} />
         <DetailField label="Routing" value={log.routing_status} />
 
-        <DetailField label="Client IP" value={log.client_ip} mono copyable />
+        <DetailField label="Client IP" value={log.client_ip} mono copyable ip />
         <DetailField label="Device" value={log.device_type} />
         <DetailField
           label="Browser"
