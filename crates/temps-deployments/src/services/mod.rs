@@ -61,10 +61,6 @@ pub use external_deployment::*;
 pub mod screenshot_operation;
 pub use screenshot_operation::*;
 
-#[allow(
-    clippy::expect_used,
-    reason = "TEMPORARY: lane p0-stability owns this module and removes its panicking lock/plugin calls; drop this allow when that lands"
-)]
 pub mod docker_cleanup_service;
 pub use docker_cleanup_service::*;
 

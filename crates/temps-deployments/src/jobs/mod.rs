@@ -66,10 +66,6 @@ pub mod deploy_static_bundle;
 pub mod deploy_static_from_source;
 pub mod download_repo;
 pub mod image_source;
-#[allow(
-    clippy::expect_used,
-    reason = "TEMPORARY: lane p0-stability owns this module and removes its panicking lock/plugin calls; drop this allow when that lands"
-)]
 pub mod mark_deployment_complete;
 pub mod node_health_check;
 pub(crate) mod node_image;

@@ -81,6 +81,10 @@ impl std::fmt::Debug for PreviewGatewayToken {
 }
 
 impl PreviewGatewayToken {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap fallback for the preview gateway secret: cached in an ArcSwap and re-read at most every ENV_FALLBACK_REFRESH, never per request"
+    )]
     pub fn new() -> Self {
         Self::with_env_reader(
             Box::new(|| std::env::var(PREVIEW_GATEWAY_SECRET_ENV).ok()),

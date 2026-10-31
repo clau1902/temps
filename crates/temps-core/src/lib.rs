@@ -40,10 +40,6 @@ pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
 pub mod openapi;
-#[allow(
-    clippy::unwrap_used,
-    reason = "TEMPORARY: lane p0-stability owns this module and removes its panicking lock/plugin calls; drop this allow when that lands"
-)]
 pub mod plugin;
 pub mod plugin_builder;
 pub mod problemdetails;

@@ -33,10 +33,6 @@ pub mod record;
 #[cfg(feature = "sync")]
 pub mod sync_client;
 pub mod upstream;
-#[allow(
-    clippy::expect_used,
-    reason = "TEMPORARY: lane p0-stability owns this module and removes its panicking lock/plugin calls; drop this allow when that lands"
-)]
 pub mod zone_store;
 
 pub use authority::{ZoneAuthority, RESOLVER_MARKER_NAME, RESOLVER_MARKER_VALUE};

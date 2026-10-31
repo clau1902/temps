@@ -50,3 +50,6 @@ http-body-util = { workspace = true }
 tempfile = { workspace = true }
 tokio-test = "0.4"
 tower = { workspace = true }
+
+[lints]
+workspace = true

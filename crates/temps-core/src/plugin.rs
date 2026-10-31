@@ -1503,10 +1503,11 @@ pub mod middleware_helpers {
                 // Add request ID if not present
                 let request_id = if !req.headers().contains_key("x-request-id") {
                     let request_id = uuid::Uuid::new_v4().to_string();
-                    req.headers_mut().insert(
-                        "x-request-id",
-                        axum::http::HeaderValue::from_str(&request_id).unwrap(),
-                    );
+                    // A hyphenated UUID is always a valid header value;
+                    // skip the header rather than panic if that ever changes.
+                    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+                        req.headers_mut().insert("x-request-id", value);
+                    }
                     Some(request_id)
                 } else {
                     req.headers()

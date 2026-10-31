@@ -7,11 +7,6 @@ pub mod error;
 pub mod node_capacity;
 pub mod node_sampler;
 pub mod proxy;
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "TEMPORARY: lane p0-stability owns this module and removes its panicking lock/plugin calls; drop this allow when that lands"
-)]
 pub mod scraper;
 pub mod store;
 pub mod worker_report;
