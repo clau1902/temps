@@ -35,7 +35,7 @@ use temps_cloud_client::FirstLinkEnrollment;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::{PluginManager, TempsPlugin};
-use temps_telemetry::TelemetryPlugin;
+use temps_product_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through
 // `dyn TempsPlugin` in `ConsoleApiParams`.
 use temps_core::templates::TemplateService;

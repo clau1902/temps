@@ -93,7 +93,7 @@ members = [
     "crates/temps-log-aggregator",
     "crates/temps-clickhouse",
     "crates/temps-otel",
-    "crates/temps-telemetry",
+    "crates/temps-product-telemetry",
     "crates/temps-environments",
     "crates/temps-screenshots",
     "crates/temps-embeddings",

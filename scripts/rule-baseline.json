@@ -292,6 +292,9 @@
       "anyhow_in_library": 29,
       "functions_over_300_lines": 2
     },
+    "temps-product-telemetry": {
+      "anyhow_in_library": 2
+    },
     "temps-project-groups": {
       "unguarded_require_auth": 2,
       "anyhow_in_library": 2,
@@ -359,9 +362,6 @@
     },
     "temps-teams": {
       "anyhow_in_library": 16
-    },
-    "temps-telemetry": {
-      "anyhow_in_library": 2
     },
     "temps-vulnerability-scanner": {
       "handler_db_access": 3,

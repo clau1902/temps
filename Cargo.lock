@@ -12761,6 +12761,7 @@ dependencies = [
  "temps-observability",
  "temps-otel",
  "temps-plugin-sdk",
+ "temps-product-telemetry",
  "temps-project-groups",
  "temps-projects",
  "temps-providers",
@@ -12773,7 +12774,6 @@ dependencies = [
  "temps-static-files",
  "temps-status-page",
  "temps-teams",
- "temps-telemetry",
  "temps-vulnerability-scanner",
  "temps-webhooks",
  "temps-wireguard",
@@ -14540,6 +14540,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-product-telemetry"
+version = "0.1.0-beta.57"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "axum",
+ "chrono",
+ "reqwest 0.12.28",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-auth",
+ "temps-config",
+ "temps-core",
+ "temps-entities",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "url",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
 name = "temps-project-groups"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -15097,30 +15121,6 @@ dependencies = [
  "tokio",
  "tracing",
  "utoipa",
-]
-
-[[package]]
-name = "temps-telemetry"
-version = "0.1.0-beta.57"
-dependencies = [
- "anyhow",
- "async-trait",
- "axum",
- "chrono",
- "reqwest 0.12.28",
- "sea-orm 1.1.20",
- "serde",
- "serde_json",
- "temps-auth",
- "temps-config",
- "temps-core",
- "temps-entities",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "url",
- "utoipa",
- "uuid",
 ]
 
 [[package]]

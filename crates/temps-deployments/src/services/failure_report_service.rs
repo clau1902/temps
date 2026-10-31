@@ -26,7 +26,7 @@ use super::sensitive_envelope;
 use super::services::{DeploymentError, DeploymentService};
 
 /// Central endpoint deploy-failure reports are POSTed to. Deliberately a
-/// different path from `temps-telemetry`'s `DEFAULT_TELEMETRY_ENDPOINT` --
+/// different path from `temps-product-telemetry`'s `DEFAULT_TELEMETRY_ENDPOINT` --
 /// that pipeline never carries free text; this one only ever carries a
 /// report the user reviewed and explicitly chose to send. Overridable via
 /// `TEMPS_FAILURE_REPORT_ENDPOINT`, mirroring how `TEMPS_TELEMETRY_ENDPOINT`
@@ -220,7 +220,7 @@ impl FailureReportService {
     }
 
     /// Whether the operator has opted out of all outbound reporting to
-    /// Temps. Mirrors `temps_telemetry::TelemetryService::enabled_from_env`
+    /// Temps. Mirrors `temps_product_telemetry::TelemetryService::enabled_from_env`
     /// exactly (same env var, same accepted opt-out values) rather than
     /// depending on that crate just for this one check.
     #[allow(
