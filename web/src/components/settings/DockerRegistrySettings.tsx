@@ -62,7 +62,7 @@ export function DockerRegistrySettings({
         <div className="flex items-center justify-between">
           <div className="space-y-0.5">
             <Label htmlFor="docker-registry-enabled">
-              Enable External Registry
+              Enable external registry
             </Label>
             <p className="text-sm text-muted-foreground">
               Use a custom Docker registry instead of Docker Hub

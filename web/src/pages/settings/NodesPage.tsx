@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader, SettingsSurface } from '@temps-sdk/ds'
 import { Badge } from '@/components/ui/badge'
 import {
   Card,
@@ -1004,9 +1005,9 @@ export function NodeDetailPage() {
     const name = nodeData?.name ?? `Node ${nodeId}`
     setBreadcrumbs(
       section === 'overview'
-        ? [{ label: 'Worker Nodes', href: WORKER_NODES_URL }, { label: name }]
+        ? [{ label: 'Worker nodes', href: WORKER_NODES_URL }, { label: name }]
         : [
-            { label: 'Worker Nodes', href: WORKER_NODES_URL },
+            { label: 'Worker nodes', href: WORKER_NODES_URL },
             { label: name, href: nodeSectionUrl(id, 'overview') },
             { label: sectionTitle ?? section },
           ]
@@ -1784,10 +1785,10 @@ export function NodesPage() {
   }, [nodeCount, invalidateCapability])
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Worker Nodes' }])
+    setBreadcrumbs([{ label: 'Worker nodes' }])
   }, [setBreadcrumbs])
 
-  usePageTitle('Worker Nodes')
+  usePageTitle('Worker nodes')
 
   // A link to one of the advanced cards (search, other pages) opens the
   // section and brings the card into view. A toggle by hand wins until the
@@ -1820,185 +1821,191 @@ export function NodesPage() {
 
   if (error) {
     return (
-      <div className="space-y-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>Worker Nodes</CardTitle>
-            <CardDescription>
-              Distribute container deployments across multiple servers.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ReadFailure
-              resource="Worker nodes"
-              error={error}
-              onRetry={
-                isForbiddenRead(error) ? undefined : () => void refetchNodes()
-              }
-              retrying={nodesFetching}
-            />
-          </CardContent>
-        </Card>
-      </div>
+      <SettingsSurface>
+        <div className="space-y-6">
+          <PageHeader
+            title="Worker nodes"
+            description={
+              <>Distribute container deployments across multiple servers.</>
+            }
+          />
+          <Card>
+            <CardContent>
+              <ReadFailure
+                resource="Worker nodes"
+                error={error}
+                onRetry={
+                  isForbiddenRead(error) ? undefined : () => void refetchNodes()
+                }
+                retrying={nodesFetching}
+              />
+            </CardContent>
+          </Card>
+        </div>
+      </SettingsSurface>
     )
   }
 
   return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>Worker Nodes</CardTitle>
-          <CardDescription>
-            Distribute container deployments across multiple servers. Worker
-            nodes run the Temps agent and receive containers from the control
-            plane.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          {adding ? (
-            <AddWorkerNode otherWays={<JoinTokenSection />} />
-          ) : (
-            <Button onClick={() => setAdding(true)}>
-              <Plus className="mr-1 h-4 w-4" />
-              Add a worker node
-            </Button>
-          )}
+    <SettingsSurface>
+      <div className="space-y-6">
+        <PageHeader
+          title="Worker nodes"
+          description={
+            <>
+              Distribute container deployments across multiple servers. Worker
+              nodes run the Temps agent and receive containers from the control
+              plane.
+            </>
+          }
+        />
+        <Card>
+          <CardContent className="space-y-6">
+            {adding ? (
+              <AddWorkerNode otherWays={<JoinTokenSection />} />
+            ) : (
+              <Button onClick={() => setAdding(true)}>
+                <Plus className="mr-1 h-4 w-4" />
+                Add a worker node
+              </Button>
+            )}
 
-          <NodeStateStreamStatus />
-          {noWayIn && (
-            <Alert className="border-amber-500/30 bg-amber-500/5">
-              <AlertTriangle className="h-4 w-4 text-amber-500" />
-              <AlertTitle className="text-amber-700 dark:text-amber-400">
-                Visitors can&apos;t reach your apps yet
-              </AlertTitle>
-              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
-                <p>
-                  No worker takes traffic from the internet. Deployments run,
-                  but their domains don&apos;t answer until a worker does,
-                  through a tunnel (no public IP needed) or open ports on a
-                  public IP.
+            <NodeStateStreamStatus />
+            {noWayIn && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <AlertTitle className="text-amber-700 dark:text-amber-400">
+                  Visitors can&apos;t reach your apps yet
+                </AlertTitle>
+                <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                  <p>
+                    No worker takes traffic from the internet. Deployments run,
+                    but their domains don&apos;t answer until a worker does,
+                    through a tunnel (no public IP needed) or open ports on a
+                    public IP.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button asChild size="sm">
+                      <Link to={ingressSetupUrl()}>Set up ingress</Link>
+                    </Button>
+                    <Button asChild size="sm" variant="outline">
+                      <Link
+                        to={`/settings/nodes/${activeWorkers[0].id}#public-ingress`}
+                      >
+                        Open {activeWorkers[0].name}
+                      </Link>
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {workerCount > 0 && (
+              <ClusterDnsOffNotice title="Apps can't reach a database on another node">
+                Cluster DNS is off, so containers can&apos;t resolve{' '}
+                <code>*.temps.local</code> names. Deployments linked to a
+                managed service on a different node are blocked, and a database
+                cluster spanning nodes can&apos;t be reached by its apps.
+              </ClusterDnsOffNotice>
+            )}
+
+            {stranded.length > 0 && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <AlertTitle className="text-amber-700 dark:text-amber-400">
+                  {stranded.map((node) => node.name).join(', ')} joined with a
+                  public address
+                </AlertTitle>
+                <AlertDescription className="text-amber-700 dark:text-amber-300">
+                  {mesh?.state === 'starting'
+                    ? 'They move onto the WireGuard mesh as soon as it is up.'
+                    : 'Without the private network they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Turn it on under “Add a worker node” above.'}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {overlayDown.length > 0 && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <AlertTitle className="text-amber-700 dark:text-amber-400">
+                  Cross-node network unavailable on{' '}
+                  {overlayDown.map((node) => node.name).join(', ')}
+                </AlertTitle>
+                <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                  <p>
+                    Their deployments keep working; containers on them cannot
+                    reach containers on other nodes, and managed-service members
+                    spanning hosts are not placed there.
+                  </p>
+                  <ul className="list-disc space-y-1 pl-4">
+                    {overlayDown.map((node) => (
+                      <li key={node.id} className="break-words">
+                        <span className="font-medium">{node.name}:</span>{' '}
+                        {nodeOverlayStatus(node).description}
+                      </li>
+                    ))}
+                  </ul>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {needsFirstNode ? (
+              <div className="border-t pt-6">
+                <WorkerNodeRequiredAlert
+                  reason={capability?.reason}
+                  showSetupAction={false}
+                  canManageNodes={canAddWorkerNode(capability)}
+                />
+              </div>
+            ) : nodes.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-12 text-center border-t pt-6">
+                <Server className="h-12 w-12 text-muted-foreground mb-4" />
+                <p className="text-sm font-medium">No worker nodes</p>
+                <p className="text-sm text-muted-foreground mt-1 max-w-md">
+                  All deployments run on this server. Add worker nodes to
+                  distribute containers across multiple machines.
                 </p>
-                <div className="flex flex-wrap gap-2">
-                  <Button asChild size="sm">
-                    <Link to={ingressSetupUrl()}>Set up ingress</Link>
-                  </Button>
-                  <Button asChild size="sm" variant="outline">
-                    <Link
-                      to={`/settings/nodes/${activeWorkers[0].id}#public-ingress`}
-                    >
-                      Open {activeWorkers[0].name}
-                    </Link>
-                  </Button>
-                </div>
-              </AlertDescription>
-            </Alert>
-          )}
+              </div>
+            ) : (
+              <NodeTable
+                nodes={nodes}
+                mesh={mesh}
+                overlay={clusterNetwork?.nodes}
+              />
+            )}
+          </CardContent>
+        </Card>
 
-          {workerCount > 0 && (
-            <ClusterDnsOffNotice title="Apps can't reach a database on another node">
-              Cluster DNS is off, so containers can&apos;t resolve{' '}
-              <code>*.temps.local</code> names. Deployments linked to a managed
-              service on a different node are blocked, and a database cluster
-              spanning nodes can&apos;t be reached by its apps.
-            </ClusterDnsOffNotice>
-          )}
-
-          {stranded.length > 0 && (
-            <Alert className="border-amber-500/30 bg-amber-500/5">
-              <AlertTriangle className="h-4 w-4 text-amber-500" />
-              <AlertTitle className="text-amber-700 dark:text-amber-400">
-                {stranded.map((node) => node.name).join(', ')} joined with a
-                public address
-              </AlertTitle>
-              <AlertDescription className="text-amber-700 dark:text-amber-300">
-                {mesh?.state === 'starting'
-                  ? 'They move onto the WireGuard mesh as soon as it is up.'
-                  : 'Without the private network they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Turn it on under “Add a worker node” above.'}
-              </AlertDescription>
-            </Alert>
-          )}
-
-          {overlayDown.length > 0 && (
-            <Alert className="border-amber-500/30 bg-amber-500/5">
-              <AlertTriangle className="h-4 w-4 text-amber-500" />
-              <AlertTitle className="text-amber-700 dark:text-amber-400">
-                Cross-node network unavailable on{' '}
-                {overlayDown.map((node) => node.name).join(', ')}
-              </AlertTitle>
-              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
-                <p>
-                  Their deployments keep working; containers on them cannot
-                  reach containers on other nodes, and managed-service members
-                  spanning hosts are not placed there.
-                </p>
-                <ul className="list-disc space-y-1 pl-4">
-                  {overlayDown.map((node) => (
-                    <li key={node.id} className="break-words">
-                      <span className="font-medium">{node.name}:</span>{' '}
-                      {nodeOverlayStatus(node).description}
-                    </li>
-                  ))}
-                </ul>
-              </AlertDescription>
-            </Alert>
-          )}
-
-          {needsFirstNode ? (
-            <div className="border-t pt-6">
-              <WorkerNodeRequiredAlert
-                reason={capability?.reason}
-                showSetupAction={false}
-                canManageNodes={canAddWorkerNode(capability)}
+        <Collapsible
+          open={advancedOpen}
+          onOpenChange={(open) => setAdvancedToggle({ hash, open })}
+        >
+          <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+            <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
+            Advanced: mesh hub, cluster network, DNS and trust
+          </CollapsibleTrigger>
+          <CollapsibleContent className="mt-6 space-y-6">
+            <div id="mesh-hub" className="scroll-mt-20">
+              <MeshHubCard
+                mesh={mesh}
+                isLoading={meshLoading}
+                error={meshError}
+                onRetry={() => void refetchMesh()}
+                retrying={meshFetching}
               />
             </div>
-          ) : nodes.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-center border-t pt-6">
-              <Server className="h-12 w-12 text-muted-foreground mb-4" />
-              <p className="text-sm font-medium">No worker nodes</p>
-              <p className="text-sm text-muted-foreground mt-1 max-w-md">
-                All deployments run on this server. Add worker nodes to
-                distribute containers across multiple machines.
-              </p>
+            <div id="cluster-network" className="scroll-mt-20">
+              <ClusterNetworkCard />
             </div>
-          ) : (
-            <NodeTable
-              nodes={nodes}
-              mesh={mesh}
-              overlay={clusterNetwork?.nodes}
-            />
-          )}
-        </CardContent>
-      </Card>
-
-      <Collapsible
-        open={advancedOpen}
-        onOpenChange={(open) => setAdvancedToggle({ hash, open })}
-      >
-        <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
-          <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
-          Advanced: mesh hub, cluster network, DNS and trust
-        </CollapsibleTrigger>
-        <CollapsibleContent className="mt-6 space-y-6">
-          <div id="mesh-hub" className="scroll-mt-20">
-            <MeshHubCard
-              mesh={mesh}
-              isLoading={meshLoading}
-              error={meshError}
-              onRetry={() => void refetchMesh()}
-              retrying={meshFetching}
-            />
-          </div>
-          <div id="cluster-network" className="scroll-mt-20">
-            <ClusterNetworkCard />
-          </div>
-          <div id="cluster-dns" className="scroll-mt-20">
-            <ClusterDnsCard />
-          </div>
-          <div id="cluster-trust" className="scroll-mt-20">
-            <ClusterTrustCard />
-          </div>
-        </CollapsibleContent>
-      </Collapsible>
-    </div>
+            <div id="cluster-dns" className="scroll-mt-20">
+              <ClusterDnsCard />
+            </div>
+            <div id="cluster-trust" className="scroll-mt-20">
+              <ClusterTrustCard />
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      </div>
+    </SettingsSurface>
   )
 }

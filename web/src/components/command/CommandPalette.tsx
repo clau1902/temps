@@ -468,7 +468,7 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['sso', 'oidc', 'create', 'connect', 'okta', 'auth0', 'keycloak'],
   },
   {
-    title: 'API Keys',
+    title: 'API keys',
     url: '/settings/keys',
     icon: Key,
     keywords: ['tokens', 'auth', 'authentication', 'api'],
@@ -705,19 +705,19 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Load Balancer',
+    title: 'Load balancer',
     url: '/settings/load-balancer',
     icon: Server,
     keywords: ['lb', 'balancing', 'proxy', 'routes'],
   },
   {
-    title: 'Docker Registry',
+    title: 'Docker registry',
     url: '/settings/docker-registry',
     icon: Boxes,
     keywords: ['docker', 'registry', 'container', 'image'],
   },
   {
-    title: 'Build Limits',
+    title: 'Build limits',
     url: '/settings/build-limits',
     icon: Gauge,
     keywords: ['build', 'limits', 'concurrency', 'resources', 'cpu', 'memory'],
@@ -757,13 +757,13 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['shield', 'learning', 'attackers', 'approve', 'block', 'review'],
   },
   {
-    title: 'Rate Limiting',
+    title: 'Rate limiting',
     url: '/settings/rate-limiting',
     icon: Monitor,
     keywords: ['rate', 'limit', 'throttle', 'ip', 'access'],
   },
   {
-    title: 'Disk Monitoring',
+    title: 'Disk monitoring',
     url: '/settings/disk-monitoring',
     icon: HardDrive,
     keywords: ['disk', 'space', 'storage', 'alerts', 'monitoring'],
@@ -789,7 +789,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Metrics Monitoring',
+    title: 'Metrics monitoring',
     url: '/settings/metrics-monitoring',
     icon: BarChart3,
     keywords: [

@@ -103,6 +103,11 @@ the field as well as the problem. Pass Field props through `Picker inputProps`
 so searchable controls retain label/help/error associations.
 `Settings`'s save bar is always mounted — it doesn't appear/disappear with
 `dirty`, so its position never jumps.
+On settings pages built from `SettingsSection`/`SettingsGroup`, save with
+`SaveRow`: the same rule, hint and Save, always mounted, disabled until
+something changed. One sticky `SaveRow` for a page saved as one form, or one
+at the end of each group that saves on its own; never a Save button floating
+under a field.
 
 ## Notifications
 

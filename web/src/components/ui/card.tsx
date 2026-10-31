@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import * as React from 'react'
-import { useOnSettingsSurface } from '@temps-sdk/ds'
+import { saveRowClassName, useOnSettingsSurface } from '@temps-sdk/ds'
 
 import { cn } from '@/lib/utils'
 
@@ -120,7 +120,9 @@ const CardFooter = React.forwardRef<
       className={cn(
         'flex items-center p-6 pt-0',
         className,
-        flat && 'border-t-0 px-0 pb-0 pt-4'
+        // On a settings surface the footer is the group's save row: a rule, a
+        // hint on the left and Save on the right, like a page's own save.
+        flat && cn(saveRowClassName, 'mt-4 px-0 pb-0')
       )}
       {...props}
     />

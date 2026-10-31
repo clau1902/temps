@@ -96,7 +96,7 @@ export function SkillsSettings({ project }: SkillsSettingsProps) {
         <CreateActionButton
           onClick={openCreate}
           disabled={isLoading}
-          label="Add Skill"
+          label="Add skill"
         />
       </div>
 

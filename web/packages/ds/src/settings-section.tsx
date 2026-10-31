@@ -99,7 +99,8 @@ export function SettingsSection({
       id={id}
       aria-labelledby={headingId}
       className={cn(
-        'grid min-w-0 scroll-mt-4 gap-5 border-t pt-8 first:border-t-0 first:pt-0 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10',
+        // No rule above the first group, nor right under the page title.
+        'grid min-w-0 scroll-mt-4 gap-5 border-t pt-8 first:border-t-0 first:pt-0 [[data-page-header]+&]:border-t-0 [[data-page-header]+&]:pt-2 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10',
         className
       )}
     >

@@ -1,4 +1,4 @@
-import { SettingsGroup } from '@temps-sdk/ds'
+import { SaveRow, SettingsGroup } from '@temps-sdk/ds'
 import { SettingToggleRow } from '@/components/settings/SettingToggleRow'
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
@@ -131,6 +131,11 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
       return
     }
     toast.success('Service updated successfully', { id: toastId })
+    // The saved identity is the new baseline, so Save disables again.
+    projectForm.reset({
+      name: updated?.name ?? values.name,
+      slug: updated?.slug ?? values.slug,
+    })
     refetch()
     // Navigate to the slug the server persisted, not the one submitted: the
     // server normalizes it, so routing on the raw input can land on a URL that
@@ -268,13 +273,10 @@ export function GeneralSettings({ project, refetch }: GeneralSettingsProps) {
                 </FormItem>
               )}
             />
-            <Button
-              size="sm"
-              type="submit"
-              disabled={updateProjectSettings.isPending}
-            >
-              Save
-            </Button>
+            <SaveRow
+              dirty={projectForm.formState.isDirty}
+              saving={updateProjectSettings.isPending}
+            />
           </form>
         </Form>
       </SettingsGroup>

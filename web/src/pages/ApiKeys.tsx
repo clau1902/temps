@@ -24,7 +24,7 @@ import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { usePageTitle } from '@/hooks/usePageTitle'
 
 export default function ApiKeys() {
-  usePageTitle('API Keys')
+  usePageTitle('API keys')
   const navigate = useNavigate()
   const [keyToDelete, setKeyToDelete] = useState<ApiKeyResponse | null>(null)
   const queryClient = useQueryClient()
@@ -96,7 +96,7 @@ export default function ApiKeys() {
   return (
     <div className="w-full min-w-0 space-y-6">
       <PageHeader
-        title="API Keys"
+        title="API keys"
         description="Manage your API keys for programmatic access"
         actions={
           <CreateActionButton

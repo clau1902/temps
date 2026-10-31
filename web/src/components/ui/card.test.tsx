@@ -3,8 +3,8 @@
 
 import { expect, test } from 'bun:test'
 import { renderToStaticMarkup } from 'react-dom/server'
-import { SettingsSurface } from '@temps-sdk/ds'
-import { Card, CardContent, CardHeader, CardTitle } from './card'
+import { SettingsSurface, saveRowClassName } from '@temps-sdk/ds'
+import { Card, CardContent, CardFooter, CardHeader, CardTitle } from './card'
 
 const framed = (html: string) => html.split('rounded-lg border').length - 1
 
@@ -50,4 +50,22 @@ test('a dialog-style reset gives cards their frame back', () => {
     </SettingsSurface>
   )
   expect(html).not.toContain('border-0')
+})
+
+test('on a settings surface a card footer is the save row pages use', () => {
+  const footer = (
+    <Card>
+      <CardContent>Fields</CardContent>
+      <CardFooter>
+        <button type="submit">Save</button>
+      </CardFooter>
+    </Card>
+  )
+  const flat = renderToStaticMarkup(<SettingsSurface>{footer}</SettingsSurface>)
+    .replace(/&amp;/g, '&')
+    .replace(/&gt;/g, '>')
+  for (const name of saveRowClassName.split(' ')) expect(flat).toContain(name)
+
+  const standalone = renderToStaticMarkup(footer)
+  expect(standalone).not.toContain('border-t')
 })

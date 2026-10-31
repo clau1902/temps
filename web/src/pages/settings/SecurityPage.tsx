@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader, SaveRow } from '@temps-sdk/ds'
 import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { validateLoopbackJa4Header } from '@/lib/loopback-ja4-header'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
@@ -18,14 +18,7 @@ import { ShieldPlatformSettings } from '@/components/settings/ShieldPlatformSett
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
-import {
-  AlertCircle,
-  LockKeyhole,
-  Loader2,
-  Network,
-  Save,
-  Shield,
-} from 'lucide-react'
+import { AlertCircle, LockKeyhole, Network, Shield } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -182,6 +175,7 @@ export function SecurityPage() {
 
   return (
     <div className="space-y-6">
+      <PageHeader title="Security" />
       <SettingsSection
         title="Admin access gate"
         description="Require additional verification for sensitive administrative actions"
@@ -198,7 +192,12 @@ export function SecurityPage() {
       >
         <ShieldPlatformSettings />
       </SettingsSection>
-      <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+      {/* The rule a group draws above itself is dropped for the first group in
+          a container, so the form draws the one between Shield and its groups. */}
+      <form
+        onSubmit={handleSubmit(onSubmit)}
+        className="space-y-6 border-t pt-8"
+      >
         <SettingsSection
           title="Proxy client IP"
           description="Choose when Temps trusts forwarding headers from a local reverse proxy"
@@ -312,28 +311,7 @@ export function SecurityPage() {
           securityHeaders={securityHeaders}
           rateLimiting={rateLimiting}
         />
-        {isDirty && (
-          <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-            <div className="flex justify-between items-center">
-              <p className="text-sm text-muted-foreground">
-                You have unsaved changes
-              </p>
-              <Button type="submit" disabled={isSubmitting}>
-                {isSubmitting ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Saving...
-                  </>
-                ) : (
-                  <>
-                    <Save className="mr-2 h-4 w-4" />
-                    Save Changes
-                  </>
-                )}
-              </Button>
-            </div>
-          </div>
-        )}
+        <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
       </form>
     </div>
   )

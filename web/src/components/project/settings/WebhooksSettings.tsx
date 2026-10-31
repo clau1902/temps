@@ -94,7 +94,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
         <CreateActionButton
           to={`/projects/${project.slug}/settings/webhooks/new`}
           disabled={isLoading}
-          label="Add Webhook"
+          label="Add webhook"
         />
       </div>
 

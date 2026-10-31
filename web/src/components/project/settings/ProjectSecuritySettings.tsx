@@ -464,7 +464,7 @@ export function ProjectSecuritySettings({
       {/* Vulnerability Scanning Card */}
       <SettingsSection
         id="vulnerability-scanning"
-        title="Vulnerability Scanning"
+        title="Vulnerability scanning"
         description="Automatically scan deployed images for known vulnerabilities after every deployment and daily"
         icon={ScanSearch}
       >
@@ -501,14 +501,14 @@ export function ProjectSecuritySettings({
       {/* Security Headers Card */}
       <SettingsSection
         id="security-headers"
-        title="Security Headers"
+        title="Security headers"
         description="Configure service HTTP security headers that override global settings"
         icon={ShieldCheck}
       >
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <Label htmlFor="security-enabled">Enable Security Headers</Label>
+              <Label htmlFor="security-enabled">Enable security headers</Label>
               <p className="text-sm text-muted-foreground">
                 Apply security headers to HTTP responses
               </p>
@@ -526,7 +526,7 @@ export function ProjectSecuritySettings({
             <>
               <Separator />
               <div className="space-y-2">
-                <Label htmlFor="security-preset">Security Preset</Label>
+                <Label htmlFor="security-preset">Security preset</Label>
                 <Controller
                   name="security.headers.preset"
                   control={control}
@@ -568,7 +568,7 @@ export function ProjectSecuritySettings({
               {securityConfig?.headers?.preset === 'custom' && (
                 <>
                   <div className="space-y-2">
-                    <Label htmlFor="csp">Content Security Policy</Label>
+                    <Label htmlFor="csp">Content security policy</Label>
                     <Input
                       id="csp"
                       placeholder="Inherit from global or enter custom CSP"
@@ -626,7 +626,7 @@ export function ProjectSecuritySettings({
       {/* Rate Limiting Card */}
       <SettingsSection
         id="rate-limiting"
-        title="Rate Limiting"
+        title="Rate limiting"
         description="Configure service rate limits that override global settings"
         icon={TrafficCone}
       >
@@ -634,7 +634,7 @@ export function ProjectSecuritySettings({
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">
-                Enable Rate Limiting
+                Enable rate limiting
               </Label>
               <p className="text-sm text-muted-foreground">
                 Limit requests per IP address
@@ -655,7 +655,7 @@ export function ProjectSecuritySettings({
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-minute">
-                    Max Requests Per Minute
+                    Max requests per minute
                   </Label>
                   <Input
                     id="max-requests-per-minute"
@@ -673,7 +673,7 @@ export function ProjectSecuritySettings({
 
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-hour">
-                    Max Requests Per Hour
+                    Max requests per hour
                   </Label>
                   <Input
                     id="max-requests-per-hour"

@@ -162,9 +162,11 @@ export function SecuritySettings({
   }
 
   return (
-    <div className="space-y-6">
+    // Follows other groups on the Security page: draw the rule its first
+    // group drops.
+    <div className="space-y-6 border-t pt-8">
       <SettingsSection
-        title="Security Headers"
+        title="Security headers"
         icon={ShieldCheck}
         description="Configure HTTP security headers for all deployments"
       >
@@ -172,7 +174,7 @@ export function SecuritySettings({
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="security-headers-enabled">
-                Enable Security Headers
+                Enable security headers
               </Label>
               <p className="text-sm text-muted-foreground">
                 Apply security headers to HTTP responses
@@ -193,7 +195,7 @@ export function SecuritySettings({
             <>
               <Separator />
               <div className="space-y-2">
-                <Label htmlFor="security-preset">Security Preset</Label>
+                <Label htmlFor="security-preset">Security preset</Label>
                 <Controller
                   name="security_headers.preset"
                   control={control}
@@ -268,7 +270,7 @@ export function SecuritySettings({
               {securityHeaders?.preset === 'custom' && (
                 <>
                   <div className="space-y-2">
-                    <Label htmlFor="csp">Content Security Policy</Label>
+                    <Label htmlFor="csp">Content security policy</Label>
                     <Input
                       id="csp"
                       placeholder="default-src 'self'; script-src 'self'"
@@ -348,7 +350,7 @@ export function SecuritySettings({
       </SettingsSection>
 
       <SettingsSection
-        title="Rate Limiting"
+        title="Rate limiting"
         icon={Gauge}
         description="Configure rate limiting to prevent abuse"
       >
@@ -356,7 +358,7 @@ export function SecuritySettings({
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">
-                Enable Rate Limiting
+                Enable rate limiting
               </Label>
               <p className="text-sm text-muted-foreground">
                 Limit requests per IP address
@@ -379,7 +381,7 @@ export function SecuritySettings({
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-minute">
-                    Max Requests Per Minute
+                    Max requests per minute
                   </Label>
                   <Input
                     id="max-requests-per-minute"
@@ -397,7 +399,7 @@ export function SecuritySettings({
 
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-hour">
-                    Max Requests Per Hour
+                    Max requests per hour
                   </Label>
                   <Input
                     id="max-requests-per-hour"

@@ -99,7 +99,7 @@ export function GlobalSkillsSettings() {
         <CreateActionButton
           onClick={openCreate}
           disabled={isLoading}
-          label="Add Skill"
+          label="Add skill"
         />
       </div>
 

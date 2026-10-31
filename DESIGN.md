@@ -74,6 +74,13 @@ in a narrower column.
   Metrics page), the title stays for screen readers only and the description
   and actions keep their place. One row of tabs per page: a page inside a
   tabbed section does not add its own tab strip for the same pages.
+- Every group of settings is saved the same way: `SaveRow` from
+  `@temps-sdk/ds`, a rule with a hint on the left and Save on the right,
+  always mounted and disabled until something changed. A page saved as one
+  form uses one sticky `SaveRow`; a group that saves on its own ends in one
+  (a console `Card` on a settings surface renders its `CardFooter` as the same
+  row). Headings, labels and navigation entries are sentence case, and a
+  group never repeats the page title or a group title inside it.
 - Every setting can be found from ⌘K and linked to directly. Give its group,
   card or row a DOM id (`setting-<name>`), add it to
   `web/src/lib/project-settings-index.ts` with the words people use for it,

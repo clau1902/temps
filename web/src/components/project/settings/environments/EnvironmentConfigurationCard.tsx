@@ -402,7 +402,7 @@ export function EnvironmentConfigurationCard({
             icon={GitBranch}
           >
             <div>
-              <Label>Branch Name</Label>
+              <Label>Branch name</Label>
               <div className="mt-2">
                 <BranchSelector
                   repoOwner={project.repo_owner || ''}
@@ -516,7 +516,7 @@ export function EnvironmentConfigurationCard({
 
             {/* Memory Resources */}
             <div className="space-y-4">
-              <h3 className="text-sm font-medium">Memory Resources</h3>
+              <h3 className="text-sm font-medium">Memory resources</h3>
               <div className="space-y-4">
                 <div>
                   <Label>Memory Request (MB)</Label>
@@ -859,7 +859,7 @@ export function EnvironmentConfigurationCard({
             <p className="text-xs text-muted-foreground">
               A node labelled <code>temps.sh/role=builder</code> is preferred. A{' '}
               <code>temps.sh/role=dedicated</code> node builds only for
-              environments that select it in Target Nodes. When no worker can
+              environments that select it in Target nodes. When no worker can
               take a build, it runs on the control plane when local builds are
               enabled, and the build log says why. CI uses the configured GitHub
               Actions runner and never falls back locally.{' '}
@@ -960,9 +960,9 @@ export function EnvironmentConfigurationCard({
                 />
               </div>
 
-              {/* Target Nodes */}
+              {/* Target nodes */}
               <div>
-                <Label className="text-sm font-medium">Target Nodes</Label>
+                <Label className="text-sm font-medium">Target nodes</Label>
                 <p className="text-xs text-muted-foreground mb-2">
                   {isComposeProject
                     ? 'Choose where this Compose stack first runs. After its first deployment it stays on that node, because its volumes live there.'
@@ -1040,11 +1040,11 @@ export function EnvironmentConfigurationCard({
 
               {/* Target Labels */}
               <div>
-                <Label className="text-sm font-medium">Label Selectors</Label>
+                <Label className="text-sm font-medium">Label selectors</Label>
                 <p className="text-xs text-muted-foreground mb-2">
                   Only deploy to nodes matching these labels. All keys must
                   match (AND logic). Labels never select a dedicated node; pick
-                  it in Target Nodes instead.
+                  it in Target nodes instead.
                 </p>
 
                 {/* Existing labels */}
@@ -1247,7 +1247,7 @@ export function EnvironmentConfigurationCard({
                   htmlFor="env-security-headers"
                   className="text-sm font-medium"
                 >
-                  Security Headers
+                  Security headers
                 </Label>
                 <p className="text-xs text-muted-foreground">
                   Enable security headers
@@ -1271,7 +1271,7 @@ export function EnvironmentConfigurationCard({
             {formData.security?.enabled && (
               <div className="space-y-4 p-4 border rounded-lg bg-muted/30">
                 <div>
-                  <Label>Header Preset</Label>
+                  <Label>Header preset</Label>
                   <Select
                     value={formData.security?.headers?.preset ?? ''}
                     onValueChange={(value) =>
@@ -1361,10 +1361,10 @@ export function EnvironmentConfigurationCard({
             )}
 
             <div className="space-y-4 p-4 border rounded-lg">
-              <h4 className="text-sm font-medium">Rate Limiting</h4>
+              <h4 className="text-sm font-medium">Rate limiting</h4>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
-                  <Label>Max Requests Per Minute</Label>
+                  <Label>Max requests per minute</Label>
                   <Input
                     type="number"
                     value={
@@ -1389,7 +1389,7 @@ export function EnvironmentConfigurationCard({
                   />
                 </div>
                 <div>
-                  <Label>Max Requests Per Hour</Label>
+                  <Label>Max requests per hour</Label>
                   <Input
                     type="number"
                     value={

@@ -1,16 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader, SaveRow, SettingsSection } from '@temps-sdk/ds'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Separator } from '@/components/ui/separator'
@@ -19,7 +14,7 @@ import { IpAccessControl } from '@/components/settings/IpAccessControl'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
-import { Loader2, Plus, Save, Shield, Trash2 } from 'lucide-react'
+import { ListFilter, Loader2, Plus, Shield, Trash2 } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -58,11 +53,11 @@ export function RateLimitingPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Rate Limiting' },
+      { label: 'Rate limiting' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Rate Limiting')
+  usePageTitle('Rate limiting')
 
   useEffect(() => {
     if (settings) {
@@ -130,21 +125,17 @@ export function RateLimitingPage() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <Card>
-        <CardHeader className="border-b px-5 py-4">
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Shield className="h-5 w-5" />
-            Rate Limiting
-          </CardTitle>
-          <CardDescription>
-            Configure rate limiting to prevent abuse
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4 p-5">
+      <PageHeader title="Rate limiting" />
+      <SettingsSection
+        title="Requests per IP"
+        description="Limit how many requests each IP address can make"
+        icon={Shield}
+      >
+        <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">
-                Enable Rate Limiting
+                Enable rate limiting
               </Label>
               <p className="text-sm text-muted-foreground">
                 Limit requests per IP address
@@ -167,7 +158,7 @@ export function RateLimitingPage() {
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-minute">
-                    Max Requests Per Minute
+                    Max requests per minute
                   </Label>
                   <Input
                     id="max-requests-per-minute"
@@ -185,7 +176,7 @@ export function RateLimitingPage() {
 
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-hour">
-                    Max Requests Per Hour
+                    Max requests per hour
                   </Label>
                   <Input
                     id="max-requests-per-hour"
@@ -245,34 +236,20 @@ export function RateLimitingPage() {
               </div>
             </>
           )}
-        </CardContent>
-      </Card>
-
-      {/* IP Access Control - Uses dedicated API */}
-      <IpAccessControl />
-
-      {isDirty && (
-        <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-          <div className="flex justify-between items-center">
-            <p className="text-sm text-muted-foreground">
-              You have unsaved changes
-            </p>
-            <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save Changes
-                </>
-              )}
-            </Button>
-          </div>
         </div>
-      )}
+      </SettingsSection>
+
+      <SaveRow dirty={isDirty} saving={isSubmitting} />
+
+      {/* IP access control saves through its own API. */}
+      <SettingsSection
+        id="ip-access"
+        title="IP access control"
+        description="Allow or block access by IP address and network range"
+        icon={ListFilter}
+      >
+        <IpAccessControl />
+      </SettingsSection>
     </form>
   )
 }

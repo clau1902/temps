@@ -100,6 +100,7 @@ export {
 } from './page-context'
 
 export { SettingsGroup } from './settings-group'
+export { SaveRow, saveRowClassName } from './save-row'
 
 export { RecordLink } from './record-link'
 
