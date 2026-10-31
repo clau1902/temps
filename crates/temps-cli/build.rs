@@ -350,4 +350,22 @@ fn ensure_placeholder_dist(dist_dir: &std::path::Path) {
 
         println!("cargo:warning=Created placeholder index.html for development");
     }
+
+    track_dist_index(&index_html);
+}
+
+/// Make cargo rerun this script when `dist/index.html` disappears.
+///
+/// `dist/` is untracked, so a fresh checkout that reuses a cached `target/`
+/// (CI restores the one `main` built) has no `dist/` while cargo still holds
+/// this script's output as fresh. Without this line the script is skipped
+/// and `include_dir!` fails with "dist is not a directory". Cargo reruns a
+/// build script whose `rerun-if-changed` path is missing, which recreates it.
+///
+/// Only the placeholder path tracks it: the placeholder is written once, so
+/// the script settles after one rerun. The real web build rewrites
+/// `index.html` on every run, so tracking it there would rebuild the web UI
+/// on every release build.
+fn track_dist_index(index_html: &std::path::Path) {
+    println!("cargo:rerun-if-changed={}", index_html.display());
 }

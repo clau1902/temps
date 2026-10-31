@@ -306,13 +306,13 @@ Each line is one PR, small, low-risk and independently reviewable.
 
 ## 9. Execution and progress
 
-**Model.** `refactor/crates-refactor-30-oct` is the integration branch, with one draft PR into `main` so the full CI runs on the combined state. Each lane runs as an agent in its own worktree and opens a PR into the integration branch. The orchestrator verifies each lane and merges it, and the next wave starts from the merged result. Lanes are assigned by **file ownership**, not by priority, so parallel lanes never edit the same files. At most 3 lanes run at once, because of disk use by per-worktree build targets.
+**Model.** `refactor/crates-refactor-30-oct` is the integration branch, with one draft PR into `main` so the full CI runs on the combined state. Each lane runs as an agent in its own worktree and opens a PR into the integration branch. The orchestrator verifies each lane and merges it, and the next wave starts from the merged result. Lanes are assigned by **file ownership**, not by priority, so parallel lanes never edit the same files. At most 3 lanes run at once.
 
 | Wave | Lane | Content | Status |
 |---|---|---|---|
-| 1 | `p0-stability` | P0.1–P0.6 (proxy, edge, dns-resolver, deployments locks, backup queue, plugin registry) | pending |
-| 1 | `p1-guardrails` | P1.1–P1.6, P0.7 (env config to settings), production unwrap/expect fixes outside the P0 files | pending |
-| 1 | `p4-cargo-hygiene` | P4 "safe now", P1.7 dependency centralisation, T1 edge cuts, unused deps (cargo machete) | pending |
+| 1 | `p0-stability` | P0.1–P0.6 (proxy, edge, dns-resolver, deployments locks, backup queue, plugin registry) | merged (#1683) |
+| 1 | `p1-guardrails` | P1.1–P1.6, P0.7 (env config to settings), production unwrap/expect fixes outside the P0 files | running |
+| 1 | `p4-cargo-hygiene` | P4 "safe now", P1.7 dependency centralisation, T1 edge cuts, unused deps (cargo machete) | running |
 | 1b | `p6-docs` | P6.1, P6.2, P6.4, P6.6, CLAUDE.md amendments for decisions 1 and 5 | pending |
 | 1.5 | `renames` | Crate renames (solo) | pending |
 | 2 | `split-*` (one per crate) | P2 mechanical splits + R5; one lane per crate, 3 at a time | pending |

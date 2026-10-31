@@ -14,11 +14,11 @@
 //! - **Reads** go through ArcSwap snapshots (refreshed by background loops) or
 //!   moka TTL caches (populated on first miss, then served in-memory).
 //!
-//! The single intentional exception is the ACME HTTP-01 challenge lookup
-//! (`handle_acme_http_challenge`), which is path-gated to
-//! `/.well-known/acme-challenge/*` — a path that is rare by construction and never
-//! appears on normal traffic. Every other request-path DB call present before this
-//! branch was removed as part of `perf/remove-db-from-request-path` (WS1–WS6).
+//! The ACME HTTP-01 challenge lookup (`handle_acme_http_challenge`) is no
+//! exception: it reads [`AcmeChallengeCache`], whose misses share one
+//! single-flight, rate-limited reload, so a flood of random tokens on the
+//! unauthenticated `/.well-known/acme-challenge/*` path cannot fan out into
+//! one query per request.
 
 use crate::handler::preview_wall::{
     build_logout_cookie_sandbox, build_logout_cookie_sandbox_unpartitioned,
@@ -32,6 +32,7 @@ use crate::preview_auth::{
     preview_cookie_needs_refresh, preview_gateway_peer, preview_request_group_key, verify_argon2,
     PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewRequest, SandboxLookupCache,
 };
+use crate::service::acme_challenge_cache::AcmeChallengeCache;
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::cookie_codec::{
     make_v2_session_payload, parse_session_cookie, parse_visitor_cookie,
@@ -63,14 +64,13 @@ use pingora_core::{
 };
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use temps_core::static_files::{normalize_static_request_path, MAX_PUBLIC_STATIC_ASSET_BYTES};
 use temps_database::DbConnection;
-use temps_entities::{deployments, domains, environments, projects};
+use temps_entities::{deployments, environments, projects};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -1167,7 +1167,11 @@ pub struct LoadBalancer {
     /// `TempsLogin` exchange grants already traded on this proxy, so each
     /// is used once (ADR-055 §11). Taken once per sign-in, never per request.
     consumed_exchanges: Arc<crate::ingress::ConsumedExchanges>,
-    db: Arc<DbConnection>,
+    /// Pending ACME HTTP-01 challenges, so the unauthenticated challenge
+    /// path never queries the database per request.
+    acme_challenges: Arc<AcmeChallengeCache>,
+    /// Token for the local preview gateway, from the cached settings.
+    preview_gateway_token: crate::service::preview_gateway_token::PreviewGatewayToken,
     config_service: Arc<temps_config::ConfigService>,
     ip_access_control_service: Arc<IpAccessControlService>,
     /// Per-project/environment IP restriction. Defaults to an always-allow
@@ -1461,7 +1465,8 @@ impl LoadBalancer {
                 crate::service::static_asset_lookup::StaticAssetLookup::new(Arc::clone(&db)),
             ),
             sandbox_lookup_cache: Arc::new(SandboxLookupCache::new(Arc::clone(&db))),
-            db,
+            acme_challenges: Arc::new(AcmeChallengeCache::new(db)),
+            preview_gateway_token: Default::default(),
             config_service,
             ip_access_control_service,
             project_ip_gate,
@@ -2809,43 +2814,27 @@ impl LoadBalancer {
             host, token
         );
 
-        // Direct DB query accepted here: this code path is reachable only for
-        // requests whose path starts with `/.well-known/acme-challenge/`, which
-        // is rare by construction (only Let's Encrypt validation requests hit
-        // it). See item H in IMPLEMENTATION_PLAN.md §2 — intentionally left
-        // as-is because caching transient challenge tokens would complicate the
-        // cert-provisioning flow with no meaningful throughput benefit.
-        let domain_record = domains::Entity::find()
-            .filter(domains::Column::Domain.eq(host))
-            .filter(domains::Column::HttpChallengeToken.eq(token))
-            .one(self.db.as_ref())
+        let key_authorization = self
+            .acme_challenges
+            .lookup(host, token)
             .await
             .map_err(|e| {
-                error!("Database error looking up ACME challenge: {:?}", e);
+                error!("ACME challenge lookup failed: {}", e);
                 Error::new_str("Database error during ACME challenge lookup")
             })?;
 
-        if let Some(domain) = domain_record {
-            if let Some(key_auth) = domain.http_challenge_key_authorization {
-                debug!(
-                    "Found ACME HTTP-01 challenge for domain: {}, returning key authorization",
-                    host
-                );
-                return Ok(Some(key_auth));
-            } else {
-                debug!(
-                    "Domain {} has matching token but no key authorization",
-                    host
-                );
-            }
-        } else {
-            debug!(
+        match &key_authorization {
+            Some(_) => debug!(
+                "Found ACME HTTP-01 challenge for domain: {}, returning key authorization",
+                host
+            ),
+            None => debug!(
                 "No matching ACME challenge found for domain: {}, token: {}",
                 host, token
-            );
+            ),
         }
 
-        Ok(None)
+        Ok(key_authorization)
     }
 
     /// On-demand HTTP-01 TLS UX on port 80 (ADR-018 §5, "what the end user
@@ -5035,20 +5024,23 @@ impl LoadBalancer {
 
                 // Inject the token of whichever peer serves the sandbox, so
                 // it accepts us: the worker preview relay's, or the
-                // gateway's shared secret, read at request time to allow
-                // live rotation.
+                // gateway's shared secret. The secret comes from the cached
+                // settings row (reloaded on NOTIFY, so a rotated secret is
+                // picked up without a restart), never from a per-request
+                // environment read.
                 if ctx.preview_on_worker {
                     if let Some(relay) = temps_core::sandbox_preview_relay::worker_preview_relay() {
                         session
                             .req_header_mut()
                             .insert_header("X-Temps-Preview-Token", &relay.token)?;
                     }
-                } else if let Ok(secret) = std::env::var("PREVIEW_GATEWAY_SHARED_SECRET") {
-                    if !secret.is_empty() {
-                        session
-                            .req_header_mut()
-                            .insert_header("X-Temps-Preview-Token", &secret)?;
-                    }
+                } else if let Some(token) = self
+                    .preview_gateway_token
+                    .resolve(&settings.preview_gateway.shared_secret)
+                {
+                    session
+                        .req_header_mut()
+                        .insert_header("X-Temps-Preview-Token", token.as_str())?;
                 }
                 // The gateway strips its bearer token once, at the TCP
                 // connection boundary. Non-upgrade HTTP traffic must

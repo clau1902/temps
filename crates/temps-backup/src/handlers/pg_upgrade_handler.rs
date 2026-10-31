@@ -900,6 +900,7 @@ mod tests {
                 db.clone(),
             )),
             encryption.clone(),
+            Arc::new(NoopJobQueue),
         ));
         let restore_service = Arc::new(RestoreService::new(
             db.clone(),
