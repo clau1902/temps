@@ -86,42 +86,53 @@ exceptions = [
     { crate = "relay-protocol-derive", allow = ["LicenseRef-FSL-1.1-Apache-2.0"] },
 ]
 
-# These crates ship a licence file but no `license` expression.
+# These crates ship a licence file but no `license` expression. cargo-deny
+# requires `license-files`; an empty list applies the expression without
+# pinning a licence-file hash.
 [[licenses.clarify]]
 crate = "auto_generate_cdp"
 expression = "GPL-3.0-only"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-base-schema"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-common"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-conventions"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-event-derive"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-event-schema"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-pattern"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-protocol"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [[licenses.clarify]]
 crate = "relay-protocol-derive"
 expression = "LicenseRef-FSL-1.1-Apache-2.0"
+license-files = []
 
 [licenses.private]
 # Workspace crates with `publish = false` (the example plugins) are ours.
