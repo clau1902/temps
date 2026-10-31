@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::presets::{
+    validate_compose_public_ports, validate_relaxed_capability_services,
+    validate_unsandboxed_services,
+};
 use super::*;
 
 // ------------------------------------------------------------------
