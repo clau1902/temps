@@ -45,7 +45,7 @@ squeezed. The page shell picks one of two widths per route.
 
 | Width | About | For |
 |---|---|---|
-| `form` | 1024px (`max-w-5xl`), centered | Settings and other forms: Configure pages that are forms, environment settings |
+| `form` | 1024px (`max-w-5xl`), aligned left with the header | Settings and other forms: Configure pages that are forms, environment settings |
 | `full` | the whole content area, inside the gutters | Everything else: overview, deployments, environments, errors, analytics, monitoring, logs, traces, session replay, environment variables, secrets, tokens, scans |
 
 A `full` page starts at the same left edge as the project/environment bar
@@ -323,7 +323,8 @@ selected text after its hover background becomes light.
 
 - Check at 390px, 768px, and a wide desktop width. Widths are measured in the
   content area after the sidebar, not the entire viewport; on a wide screen a
-  `form` page is a centered column and a `full` page fills it.
+  `form` page is a column that starts at the left edge with the header, and a
+  `full` page fills it.
 - Verify both light and dark mode, including hover, selected, pending, and
   disabled controls.
 - No document-level horizontal overflow, clipped actions, or inaccessible
@@ -393,7 +394,13 @@ Use the shared `Tabs`, `TabsList`, `TabsTrigger`, and `TabsContent` exported by
 `@temps-sdk/ds` (and `@temps-sdk/ui`) for peer page views. The default is a
 transparent, full-width strip with a bottom divider and an underline on the
 active tab. No pill container, selected-card background, shadow, or page-local
-styling overrides. Keep labels text-first, with constant font weight.
+styling overrides. Labels keep a constant font weight. Lead each label with a
+Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
+technology), so a strip can be scanned by shape as well as by word. The icon
+never replaces the label, on any screen size. Give every tab in a strip an
+icon or none, keep icons distinct within a strip, and let a section's landing
+tab share the icon its section has in the menu. Add icons to a strip when
+touching it.
 
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item

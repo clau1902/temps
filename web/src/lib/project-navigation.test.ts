@@ -170,3 +170,18 @@ describe('projectPageWidth', () => {
     expect(widthOf('environments')).toBe('full')
   })
 })
+
+describe('tab icons', () => {
+  test('a section and its landing tab share an icon, so the menu and the tabs read as one', () => {
+    for (const section of PROJECT_NAV_SECTIONS) {
+      expect(section.tabs[0].icon).toBe(section.icon)
+    }
+  })
+
+  test('no two tabs of a section share an icon', () => {
+    for (const section of PROJECT_NAV_SECTIONS) {
+      const icons = section.tabs.map((tab) => tab.icon)
+      expect(new Set(icons).size).toBe(icons.length)
+    }
+  })
+})

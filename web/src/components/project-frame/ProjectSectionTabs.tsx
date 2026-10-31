@@ -37,10 +37,11 @@ export function ProjectSectionTabs({
             to={`${projectRoot(projectSlug)}/${item.url}${query}`}
             aria-current={active ? 'page' : undefined}
             className={cn(
-              'inline-flex min-h-10 shrink-0 items-center whitespace-nowrap border-b-2 border-transparent py-3 text-sm font-medium hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+              'inline-flex min-h-10 shrink-0 items-center gap-2 whitespace-nowrap border-b-2 border-transparent py-3 text-sm font-medium hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
               active && 'border-foreground text-foreground'
             )}
           >
+            <item.icon className="size-4 shrink-0" aria-hidden="true" />
             {item.title}
           </Link>
         )

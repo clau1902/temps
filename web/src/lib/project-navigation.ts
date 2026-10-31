@@ -19,12 +19,66 @@ export type EnvironmentScope =
   | 'project'
 
 import type { PageWidth } from '@temps-sdk/ds'
+import {
+  Activity,
+  AlertOctagon,
+  HardDrive,
+  ArrowLeftRight,
+  BarChart3,
+  BellRing,
+  Bot,
+  CalendarRange,
+  CircleDollarSign,
+  CirclePlay,
+  Clock,
+  Database,
+  Earth,
+  FileCode,
+  FileText,
+  Filter,
+  Gauge,
+  GitBranch,
+  GitFork,
+  Globe,
+  Hammer,
+  HeartPulse,
+  History,
+  Home,
+  KeyRound,
+  Layers,
+  LayoutGrid,
+  Lock,
+  MessageSquare,
+  Network,
+  Plug,
+  Puzzle,
+  Radar,
+  Radio,
+  Route,
+  ScrollText,
+  Settings,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  Tag,
+  Ticket,
+  UserCog,
+  Users,
+  Variable,
+  Workflow,
+  type LucideIcon,
+} from 'lucide-react'
 
 /** How wide a page may grow; see `PageWidth` in the design system. */
 export type { PageWidth }
 
 export interface ProjectNavTab {
   title: string
+  /**
+   * Shown before the title, never instead of it. Distinct within its
+   * section; the landing tab shares the section's icon.
+   */
+  icon: LucideIcon
   /** Overrides the section's width for this tab. */
   width?: PageWidth
   /** Sub-path below the project root (`/projects/:slug/<url>`). */
@@ -53,6 +107,8 @@ export type ProjectSectionId =
 export interface ProjectNavSection {
   id: ProjectSectionId
   title: string
+  /** The section's icon in the project menu. */
+  icon: LucideIcon
   environmentScope: EnvironmentScope
   width: PageWidth
   /** The first tab is the section's landing page. */
@@ -74,12 +130,18 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'overview',
         title: 'Overview',
+        icon: Home,
         environmentScope: 'single',
         width: 'full',
         tabs: [
           // A monitoring-only project's overview also answers `integrations`.
-          { title: 'Overview', url: 'project', aliases: ['integrations'] },
-          { title: 'Activity', url: 'observe' },
+          {
+            title: 'Overview',
+            icon: Home,
+            url: 'project',
+            aliases: ['integrations'],
+          },
+          { title: 'Activity', icon: History, url: 'observe' },
         ],
       },
     ],
@@ -90,35 +152,56 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'deployments',
         title: 'Deployments',
+        icon: GitBranch,
         environmentScope: 'all',
         width: 'full',
-        tabs: [{ title: 'Deployments', url: 'deployments', aliases: ['drop'] }],
+        tabs: [
+          {
+            title: 'Deployments',
+            icon: GitBranch,
+            url: 'deployments',
+            aliases: ['drop'],
+          },
+        ],
       },
       {
         id: 'environments',
         title: 'Environments',
+        icon: Layers,
         environmentScope: 'single',
         width: 'full',
-        tabs: [{ title: 'Environments', url: 'environments' }],
+        tabs: [{ title: 'Environments', icon: Layers, url: 'environments' }],
       },
       {
         id: 'domains',
         title: 'Domains',
+        icon: Globe,
         environmentScope: 'project',
         width: 'full',
         tabs: [
-          { title: 'Domains', url: 'domains', aliases: ['settings/domains'] },
+          {
+            title: 'Domains',
+            icon: Globe,
+            url: 'domains',
+            aliases: ['settings/domains'],
+          },
         ],
       },
       {
         id: 'databases',
         title: 'Databases',
+        icon: Database,
         environmentScope: 'project',
         width: 'full',
         tabs: [
-          { title: 'Databases', url: 'storage', aliases: ['databases'] },
-          { title: 'Key-value store', url: 'services/kv' },
-          { title: 'Blob storage', url: 'services/blob' },
+          {
+            title: 'Databases',
+            icon: Database,
+            url: 'storage',
+            aliases: ['databases'],
+          },
+          { title: 'Key-value store', icon: KeyRound, url: 'services/kv' },
+          { title: 'Blob storage', icon: HardDrive, url: 'services/blob' },
         ],
       },
     ],
@@ -129,83 +212,113 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'logs',
         title: 'Logs',
+        icon: ScrollText,
         environmentScope: 'single',
         width: 'full',
         tabs: [
-          { title: 'Application', url: 'runtime' },
-          { title: 'Requests', url: 'request-logs', aliases: ['logs'] },
-          { title: 'Telemetry', url: 'telemetry-logs' },
+          { title: 'Application', icon: ScrollText, url: 'runtime' },
+          {
+            title: 'Requests',
+            icon: ArrowLeftRight,
+            url: 'request-logs',
+            aliases: ['logs'],
+          },
+          { title: 'Telemetry', icon: Radio, url: 'telemetry-logs' },
         ],
       },
       {
         id: 'errors',
         title: 'Errors',
+        icon: AlertOctagon,
         // Its pages filter by the bar, "All environments" included.
         environmentScope: 'all',
         width: 'full',
         tabs: [
-          { title: 'Issues', url: 'errors' },
-          { title: 'Alerts', url: 'errors/alert-rules' },
-          { title: 'Feedback', url: 'errors/feedback' },
-          { title: 'Releases', url: 'releases' },
-          { title: 'Source maps', url: 'errors/source-maps' },
-          { title: 'SDK health', url: 'client-outcomes' },
-          { title: 'Setup', url: 'errors/setup' },
+          { title: 'Issues', icon: AlertOctagon, url: 'errors' },
+          { title: 'Alerts', icon: BellRing, url: 'errors/alert-rules' },
+          { title: 'Feedback', icon: MessageSquare, url: 'errors/feedback' },
+          { title: 'Releases', icon: Tag, url: 'releases' },
+          { title: 'Source maps', icon: FileCode, url: 'errors/source-maps' },
+          { title: 'SDK health', icon: HeartPulse, url: 'client-outcomes' },
+          { title: 'Setup', icon: Plug, url: 'errors/setup' },
         ],
       },
       {
         id: 'traces',
         title: 'Traces',
+        icon: GitFork,
         // Its pages filter by the bar, "All environments" included.
         environmentScope: 'all',
         width: 'full',
         tabs: [
-          { title: 'Traces', url: 'traces' },
-          { title: 'AI traces', url: 'ai-gateway' },
+          { title: 'Traces', icon: GitFork, url: 'traces' },
+          { title: 'AI traces', icon: Sparkles, url: 'ai-gateway' },
         ],
       },
       {
         id: 'analytics',
         title: 'Analytics',
+        icon: BarChart3,
         // Its pages filter by the bar, "All environments" included.
         environmentScope: 'all',
         width: 'full',
         tabs: [
-          { title: 'Overview', url: 'analytics' },
-          { title: 'Visitors', url: 'analytics/visitors' },
-          { title: 'Live', url: 'analytics/live-visitors' },
-          { title: 'Globe', url: 'analytics/live' },
-          { title: 'Journey', url: 'analytics/journey' },
-          { title: 'Sessions', url: 'analytics/replays', width: 'full' },
-          { title: 'Pages', url: 'analytics/pages' },
-          { title: 'Funnels', url: 'analytics/funnels' },
-          { title: 'Activity report', url: 'analytics/activity' },
-          { title: 'Web performance', url: 'speed' },
-          { title: 'AI visitors', url: 'analytics/ai-agents' },
-          { title: 'AI crawlers', url: 'ai-crawlers' },
-          { title: 'API traffic', url: 'analytics/api-traffic' },
-          { title: 'Revenue', url: 'revenue' },
-          { title: 'Traffic filters', url: 'analytics/settings' },
+          { title: 'Overview', icon: BarChart3, url: 'analytics' },
+          { title: 'Visitors', icon: Users, url: 'analytics/visitors' },
+          { title: 'Live', icon: Radio, url: 'analytics/live-visitors' },
+          { title: 'Globe', icon: Earth, url: 'analytics/live' },
+          { title: 'Journey', icon: Route, url: 'analytics/journey' },
+          {
+            title: 'Sessions',
+            icon: CirclePlay,
+            url: 'analytics/replays',
+            width: 'full',
+          },
+          { title: 'Pages', icon: FileText, url: 'analytics/pages' },
+          { title: 'Funnels', icon: Filter, url: 'analytics/funnels' },
+          {
+            title: 'Activity report',
+            icon: CalendarRange,
+            url: 'analytics/activity',
+          },
+          { title: 'Web performance', icon: Gauge, url: 'speed' },
+          { title: 'AI visitors', icon: Bot, url: 'analytics/ai-agents' },
+          { title: 'AI crawlers', icon: Radar, url: 'ai-crawlers' },
+          { title: 'API traffic', icon: Network, url: 'analytics/api-traffic' },
+          { title: 'Revenue', icon: CircleDollarSign, url: 'revenue' },
+          {
+            title: 'Traffic filters',
+            icon: SlidersHorizontal,
+            url: 'analytics/settings',
+          },
         ],
       },
       {
         id: 'monitoring',
         title: 'Monitoring',
+        icon: Activity,
         environmentScope: 'single',
         width: 'full',
         tabs: [
           // The Metrics page's own Explore / Dashboards / Alerts strip is
           // folded into these tabs, so there is one row of tabs, not two.
-          { title: 'Metrics', url: 'metrics/explore', aliases: ['metrics'] },
+          {
+            title: 'Metrics',
+            icon: Activity,
+            url: 'metrics/explore',
+            aliases: ['metrics'],
+          },
           {
             title: 'Dashboards',
+            icon: LayoutGrid,
             url: 'metrics/dashboards',
             aliases: ['dashboards'],
           },
-          { title: 'Alerts', url: 'metrics/alerts' },
-          { title: 'Uptime', url: 'monitors' },
+          { title: 'Alerts', icon: BellRing, url: 'metrics/alerts' },
+          { title: 'Uptime', icon: HeartPulse, url: 'monitors' },
           {
             title: 'Cron jobs',
+            icon: Clock,
             url: 'cron-jobs',
             aliases: ['settings/cron-jobs'],
           },
@@ -219,11 +332,13 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'build',
         title: 'Build & deploy',
+        icon: Hammer,
         environmentScope: 'single',
         width: 'form',
         tabs: [
           {
             title: 'Build & deploy',
+            icon: Hammer,
             url: BUILD_AND_DEPLOY_PATH,
             aliases: [
               'settings/delivery',
@@ -240,47 +355,58 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
       {
         id: 'variables',
         title: 'Variables & secrets',
+        icon: Variable,
         environmentScope: 'project',
         // Tables of keys and values, not forms.
         width: 'full',
         tabs: [
           {
             title: 'Environment variables',
+            icon: Variable,
             url: 'environment-variables',
             aliases: ['settings/environment-variables'],
           },
           {
             title: 'Secrets',
+            icon: KeyRound,
             url: 'settings/variables',
             aliases: ['settings/secrets'],
           },
-          { title: 'Deployment tokens', url: 'settings/deployment-tokens' },
+          {
+            title: 'Deployment tokens',
+            icon: Ticket,
+            url: 'settings/deployment-tokens',
+          },
         ],
       },
       {
         id: 'access',
         title: 'Security & access',
+        icon: Lock,
         environmentScope: 'project',
         width: 'form',
         tabs: [
-          { title: 'Protection', url: 'settings/security' },
-          { title: 'Access', url: 'settings/access' },
-          { title: 'Scans', url: 'security', width: 'full' },
+          { title: 'Protection', icon: Lock, url: 'settings/security' },
+          { title: 'Access', icon: UserCog, url: 'settings/access' },
+          { title: 'Scans', icon: ShieldCheck, url: 'security', width: 'full' },
         ],
       },
       {
         id: 'automation',
         title: 'Automation & integrations',
+        icon: Workflow,
         environmentScope: 'project',
         width: 'form',
         tabs: [
           {
             title: 'Automation',
+            icon: Workflow,
             url: 'settings/automation',
             aliases: ['agents', 'autofixer'],
           },
           {
             title: 'Integrations',
+            icon: Puzzle,
             url: 'settings/integrations',
             aliases: [
               'settings/webhooks',
@@ -288,17 +414,19 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
               'settings/mcp-servers',
             ],
           },
-          { title: 'Telemetry', url: 'settings/telemetry' },
+          { title: 'Telemetry', icon: Radio, url: 'settings/telemetry' },
         ],
       },
       {
         id: 'general',
         title: 'General',
+        icon: Settings,
         environmentScope: 'project',
         width: 'form',
         tabs: [
           {
             title: 'General',
+            icon: Settings,
             url: 'settings/general',
             aliases: ['settings', 'tools'],
           },

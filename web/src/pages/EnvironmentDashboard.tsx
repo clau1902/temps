@@ -6,7 +6,14 @@ import {
   getEnvironmentOptions,
   listContainersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Plus } from 'lucide-react'
+import {
+  Boxes,
+  LineChart,
+  Plus,
+  Settings2,
+  Shield,
+  type LucideIcon,
+} from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
@@ -121,7 +128,7 @@ export function EnvironmentDashboard({
             aria-label={`${environment.name} pages`}
           >
             {ENVIRONMENT_VIEWS.map((view) => (
-              <TabsTrigger key={view.value} value={view.value}>
+              <TabsTrigger key={view.value} value={view.value} icon={view.icon}>
                 {view.label}
               </TabsTrigger>
             ))}
@@ -152,11 +159,15 @@ export function EnvironmentDashboard({
   )
 }
 
-const ENVIRONMENT_VIEWS: { value: EnvironmentView; label: string }[] = [
-  { value: 'containers', label: 'Containers' },
-  { value: 'metrics', label: 'Metrics' },
-  { value: 'shield', label: 'Shield' },
-  { value: 'settings', label: 'Settings' },
+const ENVIRONMENT_VIEWS: {
+  value: EnvironmentView
+  label: string
+  icon: LucideIcon
+}[] = [
+  { value: 'containers', label: 'Containers', icon: Boxes },
+  { value: 'metrics', label: 'Metrics', icon: LineChart },
+  { value: 'shield', label: 'Shield', icon: Shield },
+  { value: 'settings', label: 'Settings', icon: Settings2 },
 ]
 
 function EnvironmentViewContent({

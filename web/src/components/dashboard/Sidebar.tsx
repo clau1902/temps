@@ -26,19 +26,12 @@ import {
   Bot,
   ChevronsUpDown,
   Check,
-  Database,
   Folder,
   Gauge,
-  GitBranch,
-  GitFork,
-  Globe,
-  Home,
-  Layers,
   LogOut,
   Monitor,
   Moon,
   Search,
-  ScrollText,
   MessageSquare,
   Server,
   Settings,
@@ -46,11 +39,6 @@ import {
   Sparkles,
   Terminal,
   Wand2,
-  Variable,
-  Hammer,
-  Lock,
-  Workflow,
-  AlertOctagon,
 } from 'lucide-react'
 
 import {
@@ -65,7 +53,6 @@ import {
   projectNavGroupsFor,
   projectRoot,
   resolveProjectLocation,
-  type ProjectSectionId,
 } from '@/lib/project-navigation'
 import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
 import {
@@ -915,24 +902,6 @@ function AiNav({ onBack }: { onBack: () => void }) {
 // Project nav — replaces the whole sidebar when on /projects/:slug/*.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const projectSectionIcons: Record<ProjectSectionId, LucideIcon> = {
-  overview: Home,
-  deployments: GitBranch,
-  environments: Layers,
-  domains: Globe,
-  databases: Database,
-  logs: ScrollText,
-  errors: AlertOctagon,
-  traces: GitFork,
-  analytics: BarChart3,
-  monitoring: Activity,
-  build: Hammer,
-  variables: Variable,
-  access: Lock,
-  automation: Workflow,
-  general: Settings,
-}
-
 // The project menu: its pages grouped by job. Each section's own pages are
 // tabs on the page, so this stays one level deep. A monitoring-only project
 // gets the sections it has, plus a way to add hosting.
@@ -972,7 +941,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
           )}
           <SidebarMenu aria-label={group.label ?? 'Project'}>
             {group.sections.map((section) => {
-              const Icon = projectSectionIcons[section.id]
+              const Icon = section.icon
               const isActive = active === section.id
               return (
                 <SidebarMenuItem key={section.id} data-tour={section.id}>
