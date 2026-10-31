@@ -82,3 +82,6 @@ temps-migrations = { path = "../temps-migrations" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-docker = { path = "../temps-workload-docker" }
 tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

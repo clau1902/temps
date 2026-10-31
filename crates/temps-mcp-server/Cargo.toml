@@ -30,3 +30,6 @@ serde_json = { workspace = true }
 temps-entities = { path = "../temps-entities" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+
+[lints]
+workspace = true

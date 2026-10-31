@@ -78,3 +78,6 @@ temps-environments = { path = "../temps-environments" }
 bollard = { workspace = true }
 # Sends requests through the assembled router in the same tests.
 tower = { workspace = true }
+
+[lints]
+workspace = true

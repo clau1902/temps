@@ -49,3 +49,6 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

@@ -42,3 +42,6 @@ rcgen = { workspace = true }
 tower = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 maplit = { workspace = true }
+
+[lints]
+workspace = true

@@ -32,3 +32,6 @@ http = { workspace = true }
 slug = { workspace = true }
 url = { workspace = true }
 argon2 = { workspace = true }
+
+[lints]
+workspace = true

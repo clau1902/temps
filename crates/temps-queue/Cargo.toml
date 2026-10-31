@@ -20,3 +20,6 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 utoipa = { workspace = true }
+
+[lints]
+workspace = true

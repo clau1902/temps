@@ -132,6 +132,16 @@ authors = ["Temps Contributors"]
 repository = "https://github.com/gotempsh/temps"
 homepage = "https://github.com/gotempsh/temps"
 
+[workspace.lints.clippy]
+# CLAUDE.md rules enforced by the compiler. Production code may not panic on
+# a Result/Option; tests may (see allow-*-in-tests in clippy.toml). For a
+# truly infallible call, prefer restructuring; otherwise use
+# `#[allow(clippy::unwrap_used, reason = "...")]` on the narrowest item.
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+
 [workspace.dependencies]
 arc-swap = "1.7"
 # ============================================================================

@@ -30,3 +30,6 @@ serde_json = { workspace = true }
 [dev-dependencies]
 # `mock` powers MockDatabase for the handler authorization tests.
 sea-orm = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

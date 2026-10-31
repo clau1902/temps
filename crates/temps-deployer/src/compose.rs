@@ -295,6 +295,10 @@ fn isolated_docker_command_with_candidates(candidates: &[&str]) -> tokio::proces
         .unwrap_or("/usr/bin/docker");
     let mut command = tokio::process::Command::new(docker_binary);
     command.env_clear().env("PATH", SAFE_DOCKER_PATH);
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "subprocess passthrough: forwards the operator's Docker client settings (HOME, DOCKER_*) to the docker child process"
+    )]
     for key in [
         "HOME",
         "DOCKER_CONFIG",
@@ -6785,11 +6789,19 @@ impl ComposeExecutor {
             PathBuf::from("/var/run/docker.sock"),
             PathBuf::from("/run/docker.sock"),
         ];
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "host lookup: DOCKER_HOST names this host's daemon socket, which a bind mount must not expose"
+        )]
         if let Ok(host) = std::env::var("DOCKER_HOST") {
             if let Some(socket) = host.strip_prefix("unix://") {
                 sockets.push(PathBuf::from(socket));
             }
         }
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "host lookup: HOME locates per-user Docker/Colima daemon sockets on this host"
+        )]
         if let Some(home) = std::env::var_os("HOME") {
             sockets.push(PathBuf::from(&home).join(".docker/run/docker.sock"));
             sockets.push(PathBuf::from(home).join(".colima/default/docker.sock"));

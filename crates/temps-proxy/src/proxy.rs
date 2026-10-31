@@ -210,7 +210,10 @@ fn strip_script_and_style(html: &str) -> String {
 
     // Parse as a fragment so we don't add an implicit <html>/<body> wrapper.
     let fragment = Html::parse_fragment(html);
-    let script_sel = Selector::parse("script, style").unwrap();
+    // A literal selector; like `main`/`body` above, degrade rather than panic.
+    let Ok(script_sel) = Selector::parse("script, style") else {
+        return html.to_owned();
+    };
 
     // Collect the IDs of nodes to remove.
     let to_remove: Vec<_> = fragment.select(&script_sel).map(|el| el.id()).collect();

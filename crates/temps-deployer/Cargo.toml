@@ -78,3 +78,6 @@ serial_test = { workspace = true }
 testcontainers = { workspace = true }
 temps-database = { path = "../temps-database" }
 temps-routes = { path = "../temps-routes" }
+
+[lints]
+workspace = true

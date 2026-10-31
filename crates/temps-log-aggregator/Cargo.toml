@@ -60,3 +60,6 @@ temps-auth = { path = "../temps-auth" }
 temps-entities = { path = "../temps-entities" }
 regex = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
+
+[lints]
+workspace = true

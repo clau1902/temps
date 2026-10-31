@@ -14,6 +14,11 @@
 //!   expected differences. It needs Docker and skips with a printed reason
 //!   without it.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 

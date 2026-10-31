@@ -29,3 +29,6 @@ sea-orm = { workspace = true }
 
 [dev-dependencies]
 temps-database = { path = "../temps-database" }
+
+[lints]
+workspace = true

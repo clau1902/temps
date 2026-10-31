@@ -2923,7 +2923,10 @@ host app_db app_user 10.0.0.0/8 md5
 /// named network and clean up only what they create.
 ///
 /// Run: `cargo test --lib -p temps-providers --features docker-tests -- scram_docker`
-#[cfg(all(test, feature = "docker-tests"))]
+// Two attributes rather than `cfg(all(test, ..))`: clippy only applies
+// `allow-unwrap-in-tests` when it sees a top-level `cfg(test)`.
+#[cfg(test)]
+#[cfg(feature = "docker-tests")]
 mod scram_docker_tests {
     use super::*;
     use bollard::exec::{CreateExecOptions, StartExecResults};

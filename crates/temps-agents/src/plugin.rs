@@ -174,6 +174,10 @@ fn host_sandbox_choice(
     }
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_ALLOW_LOCAL_SANDBOX"
+)]
 fn local_sandbox_opt_in() -> bool {
     std::env::var("TEMPS_ALLOW_LOCAL_SANDBOX")
         .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))

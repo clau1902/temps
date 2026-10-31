@@ -345,6 +345,10 @@ pub fn command_with_data_dir(command: &str, data_dir: &Path) -> String {
 }
 
 /// `~/.temps`: where a shell with no `TEMPS_DATA_DIR` puts Temps state.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "host lookup: HOME resolves the operator's home directory, not Temps configuration"
+)]
 fn default_data_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into())).join(".temps")
 }
@@ -392,6 +396,10 @@ fn runtime_probe(_config: &MicrosandboxSandboxConfig) -> Result<(), Microsandbox
 /// Temps data directory: `TEMPS_DATA_DIR` (a bootstrap value, read before
 /// any database exists), else `~/.temps`. Same resolution the agents plugin
 /// uses when it registers sandbox backends.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+)]
 pub fn host_data_dir() -> PathBuf {
     std::env::var("TEMPS_DATA_DIR")
         .map(PathBuf::from)

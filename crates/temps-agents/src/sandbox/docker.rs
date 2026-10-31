@@ -1795,6 +1795,10 @@ enum SandboxChannel {
 impl SandboxChannel {
     /// Read the channel from `TEMPS_SANDBOX_CHANNEL`. Default is stable —
     /// only an explicit `=beta` opts the host into the beta stream.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_SANDBOX_CHANNEL"
+    )]
     fn from_env() -> Self {
         match std::env::var("TEMPS_SANDBOX_CHANNEL").as_deref() {
             Ok("beta") => Self::Beta,
@@ -6650,6 +6654,10 @@ impl SandboxProvider for DockerSandboxProvider {
         }
 
         // ── Export to content-addressed tarball ───────────────────────────────
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+        )]
         let data_dir = std::env::var("TEMPS_DATA_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|_| {

@@ -35,3 +35,6 @@ hex = { workspace = true }
 rand = { workspace = true }
 anyhow = { workspace = true }
 csv = { workspace = true }
+
+[lints]
+workspace = true

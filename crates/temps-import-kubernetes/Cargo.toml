@@ -31,3 +31,6 @@ sea-orm = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
+
+[lints]
+workspace = true

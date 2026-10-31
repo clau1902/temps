@@ -25,3 +25,6 @@ sea-orm = { workspace = true }
 
 # OpenAPI
 utoipa = { version = "6.0", features = ["chrono"] }
+
+[lints]
+workspace = true

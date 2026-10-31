@@ -37,3 +37,6 @@ temps-geo = { path = "../temps-geo" }
 clickhouse = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 uuid = { workspace = true }
+
+[lints]
+workspace = true

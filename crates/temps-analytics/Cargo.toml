@@ -53,3 +53,6 @@ tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }
 testcontainers = { workspace = true }
 bollard = { workspace = true }
+
+[lints]
+workspace = true

@@ -38,3 +38,6 @@ sea-orm = { workspace = true }
 tower = { workspace = true }
 chrono = { workspace = true }
 temps-entities = { path = "../temps-entities" }
+
+[lints]
+workspace = true

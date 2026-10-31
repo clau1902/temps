@@ -173,18 +173,52 @@ retag, or otherwise mutate existing containers, images, volumes, or
 networks. Docker-backed tests may create uniquely named temporary
 resources and must clean up only the resources created by that test run.
 
-## Pre-commit hooks run cargo fmt and cargo clippy
+## Pre-commit hooks run cargo fmt, clippy and the rule-drift check
 
 Hooks **will** reformat your files and **will** fail the commit if
-clippy finds issues. Plan for it:
+clippy or the drift check finds issues. Install them with
+`scripts/setup-hooks.sh`. Plan for it:
 
+- At commit: `cargo fmt`, clippy on the crates your commit touches, and
+  `scripts/rule_drift.py`. At pre-push: the full
+  `cargo clippy --workspace --all-targets -- -D warnings`.
 - Don't fight the formatter. If `cargo fmt` modifies a file during a
   commit, re-stage and commit again.
-- Multiple atomic commits run hooks once each. If you're committing
-  three related changes, prefer one commit so clippy/fmt run once.
-  (The wall-clock cost of clippy on this workspace is ~3–5 min.)
 - Never pass `--no-verify` unless the user explicitly asks. CLAUDE.md
   forbids it. If a hook is broken, fix the hook, don't bypass it.
+
+## Clippy enforces the CLAUDE.md code rules
+
+The toolchain is pinned in `rust-toolchain.toml`; bump it there and in
+every workflow's `toolchain:` input together
+(`.github/scripts/check-toolchain-pin.py` fails CI otherwise).
+
+`[workspace.lints]` in the root `Cargo.toml` denies `unwrap_used`,
+`expect_used`, `dbg_macro` and `todo`, and `clippy.toml` disallows
+`anyhow::Context::{context, with_context}`, `std::env::{var, var_os}` and
+`tokio::sync::mpsc::unbounded_channel`. Tests may unwrap/expect.
+
+- A new crate ends its `Cargo.toml` with `[lints]` / `workspace = true`.
+- Prefer fixing the code (`?`, `map_err`, `let-else`, a bounded channel).
+  When a call truly cannot fail, or an env read is a legitimate bootstrap
+  value, put `#[allow(<lint>, reason = "...")]` on the narrowest item.
+  Every `allow` needs a `reason`.
+- Never a bare `#[ignore]`. Docker/network tests skip at runtime;
+  `#[ignore = "reason"]` is only for tests a dedicated CI job runs with
+  `--ignored`, or known-broken/manual tests whose reason starts with
+  `known broken:` / `manual:` and says what is wrong.
+
+## Rule drift
+
+`scripts/rule_drift.py` counts, per crate, the CLAUDE.md violations
+clippy can't express (DB access in handlers, `_ =>` in
+`From<..> for Problem`, `serde_json::Value` responses, lazy error
+variants, unguarded `RequireAuth`, `anyhow` in libraries, files over
+3,000 lines, functions over 300 lines, `#[ignore]` without a reason)
+against `scripts/rule-baseline.json`. CI and pre-commit fail when a
+count rises. After fixing violations, lower it with
+`python3 scripts/rule_drift.py --update-baseline` and commit the
+baseline; `--list <metric>` shows where the rest are.
 
 ## Conventional Commits
 
@@ -360,6 +394,11 @@ of naming the real one, even though the user supplied it themselves and it
 feels like harmless context. Grep your diff and any PR body you write for
 the real name before it leaves this machine — a PR description can't be
 un-published once it reaches GitHub.
+
+The same applies to the local build or verification environment: never put
+machine paths, cache helpers or servers, Docker socket paths, or local
+toolchain workarounds into PR descriptions, commit messages or code
+comments. Report verification as the generic commands and their results.
 
 ## Don't sweep unrelated dirty files into your commits
 

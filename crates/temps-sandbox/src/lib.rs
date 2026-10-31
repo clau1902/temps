@@ -20,6 +20,13 @@
 //!   see internal numeric IDs; an internal `i32` keys into the provider's
 //!   `run_id`-addressed handle map for compatibility.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod error;
 pub mod handlers;
 pub mod plugin;

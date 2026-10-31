@@ -42,3 +42,6 @@ urlencoding = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 temps-entities = { path = "../temps-entities" }
 chrono = { workspace = true }
+
+[lints]
+workspace = true

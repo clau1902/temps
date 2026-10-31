@@ -33,3 +33,6 @@ tokio = { workspace = true, features = ["test-util"] }
 # `network_compression_method` is ZSTD). Same pinned version as the other
 # crates' ClickHouse integration tests; Docker is detected at runtime.
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
+
+[lints]
+workspace = true

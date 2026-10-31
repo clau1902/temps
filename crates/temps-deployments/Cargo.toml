@@ -109,3 +109,6 @@ rcgen = { workspace = true }
 # only exposes their encoding APIs to the test binary, without new network downloads.
 p256 = { workspace = true }
 rsa = { workspace = true, features = ["pem"] }
+
+[lints]
+workspace = true

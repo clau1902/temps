@@ -75,3 +75,6 @@ microsandbox = { workspace = true }
 temps-docker-capture = { path = "../temps-docker-capture" }
 # ADR-055 §9: the netpol translation must deserialize into the pinned SDK.
 temps-workload-netpol = { path = "../temps-workload-netpol" }
+
+[lints]
+workspace = true

@@ -6010,6 +6010,13 @@ impl AiService for AgentCliAiService {
                 reason: format!("failed to create isolated CLI chat directory: {error}"),
             })?;
 
+        // One chat turn's events. The producer is a single CLI process bounded
+        // by the turn timeout and output limits, and the callback that feeds
+        // it is synchronous, so a bounded `send().await` is not available.
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "per-turn stream fed from a sync callback; bounded by the turn's timeout and output limits"
+        )]
         let (events_tx, events_rx) = tokio::sync::mpsc::unbounded_channel();
         let (mut mcp_bridge, bridge_event_task, mcp_config) = if request.tools.is_empty() {
             (None, None, None)

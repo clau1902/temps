@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+# One compiler for every build: developer machines, CI and the Docker
+# toolchain image. A floating `stable` let a new clippy release turn
+# `-D warnings` red with no code change. Bump this deliberately, together
+# with the `toolchain:` inputs in .github/workflows and the `rust:` image
+# tag in Dockerfile, and fix the new lints in the same PR.
+#
+# Targets are deliberately not listed: jobs that cross-compile (musl,
+# wasm32, Apple) add them explicitly, and listing them here would make
+# every local build try to install them.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

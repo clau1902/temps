@@ -7,6 +7,13 @@
 //! the control plane (or `RemoteNodeDeployer`) calls to manage containers
 //! and external services.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod auth;
 mod build_admission;
 pub mod build_handler;

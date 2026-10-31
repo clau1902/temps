@@ -258,10 +258,20 @@ impl MetricsScraper {
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
             let in_flight = Arc::clone(&self.in_flight);
-            let permit = Arc::clone(&sem)
-                .acquire_owned()
-                .await
-                .expect("semaphore should never be closed");
+            // `sem` is local to this cycle and never closed; if that ever
+            // changes, end the cycle instead of panicking the scraper.
+            let permit = match Arc::clone(&sem).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    lock_unpoisoned(&self.in_flight).remove(&service.id);
+                    warn!(
+                        service_id = service.id,
+                        error = %e,
+                        "MetricsScraper: concurrency semaphore closed; ending this scrape cycle"
+                    );
+                    break;
+                }
+            };
 
             join_set.spawn(async move {
                 // Permit is held for the lifetime of this task.

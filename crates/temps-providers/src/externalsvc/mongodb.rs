@@ -1747,10 +1747,9 @@ impl MongodbService {
             return Err(anyhow::anyhow!("Backup data is empty"));
         }
 
-        let temp_path = temp_file.path().to_str().unwrap();
         info!("MongoDB legacy backup size: {} bytes", total_bytes);
 
-        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_path).await?;
+        let body = aws_sdk_s3::primitives::ByteStream::from_path(temp_file.path()).await?;
         s3_client
             .put_object()
             .bucket(&s3_source.bucket_name)

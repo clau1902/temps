@@ -2791,9 +2791,16 @@ pub async fn stream_container_metrics(
                             "timestamp": stats.timestamp.to_rfc3339(),
                         });
 
-                        let event = axum::response::sse::Event::default()
-                            .json_data(json)
-                            .unwrap();
+                        let event = match axum::response::sse::Event::default().json_data(json) {
+                            Ok(event) => event,
+                            Err(e) => {
+                                error!(
+                                    "Failed to encode metrics event for container {}: {}",
+                                    c_id, e
+                                );
+                                axum::response::sse::Event::default().comment("error")
+                            }
+                        };
                         Some((Ok(event), ticker))
                     }
                     Err(e) => {

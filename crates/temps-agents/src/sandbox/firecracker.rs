@@ -3020,6 +3020,10 @@ fn firecracker_terminal_capability_for(
 }
 
 fn host_tool_available(tool: &str) -> bool {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "host lookup: PATH is the host's executable search path, not Temps configuration"
+    )]
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .chain(

@@ -33,3 +33,6 @@ url = { workspace = true }  # For URL validation and SSRF prevention
 
 [dev-dependencies]
 temps-queue = { path = "../temps-queue" }
+
+[lints]
+workspace = true

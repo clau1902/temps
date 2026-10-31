@@ -277,6 +277,10 @@ async fn probe_codex_status(
     // than the provider catalog's entire timeout, making a healthy Codex
     // login disappear intermittently. Only use the richer diagnostic as a
     // compatibility fallback when login status cannot identify auth.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "subprocess passthrough: detects whether the operator's ambient OPENAI_API_KEY will be forwarded to the codex child process"
+    )]
     let has_env_key = ambient_api_key && std::env::var("OPENAI_API_KEY").is_ok();
     let login_output = tokio::time::timeout(
         STATUS_TIMEOUT,

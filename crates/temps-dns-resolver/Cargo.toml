@@ -56,3 +56,6 @@ hickory-resolver = { workspace = true }
 temps-workload = { path = "../temps-workload" }
 wiremock = { workspace = true }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

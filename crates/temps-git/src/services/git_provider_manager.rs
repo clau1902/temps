@@ -1358,7 +1358,13 @@ impl GitProviderManager {
         match auth_method {
             // GitHub App: Generate fresh installation token only if connection has installation_id
             AuthMethod::GitHubApp { .. } if is_github_app_installation => {
-                let installation_id = connection.installation_id.as_ref().unwrap(); // Safe: checked above
+                // `is_github_app_installation` already required `Some`.
+                let Some(installation_id) = connection.installation_id.as_ref() else {
+                    return Err(GitProviderManagerError::InvalidConfiguration(format!(
+                        "GitHub App connection {} has no installation_id",
+                        connection_id
+                    )));
+                };
 
                 debug!(
                     "Generating fresh installation token for GitHub App connection {}",

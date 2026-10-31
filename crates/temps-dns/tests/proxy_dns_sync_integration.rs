@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Exercise worker synchronization over HTTP with no console or plugin registry.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::sync::Arc;
 use std::time::Duration;
 

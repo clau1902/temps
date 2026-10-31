@@ -35,3 +35,6 @@ uuid.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 temps-database = { path = "../temps-database" }
+
+[lints]
+workspace = true

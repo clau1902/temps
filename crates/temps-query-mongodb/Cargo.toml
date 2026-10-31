@@ -5,6 +5,7 @@
 name = "temps-query-mongodb"
 version = "0.1.0"
 edition = "2021"
+license.workspace = true
 
 [dependencies]
 temps-query = { path = "../temps-query" }
@@ -32,3 +33,6 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }
+
+[lints]
+workspace = true

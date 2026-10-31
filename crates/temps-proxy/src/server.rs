@@ -599,12 +599,18 @@ pub fn setup_proxy_server(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 
@@ -778,11 +784,16 @@ pub fn setup_proxy_server(
         } else {
             temps_metrics::NodeMetricsScope::Process
         };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create tokio runtime for proxy metrics sampler: {}",
+                    e
+                )
+            })?;
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for proxy metrics sampler");
             rt.block_on(async move {
                 let store = crate::service::metrics_sampler::build_metrics_store(
                     &sampler_config_service,
@@ -1077,12 +1088,18 @@ pub fn create_proxy_service(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 

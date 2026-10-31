@@ -55,3 +55,6 @@ http-body-util = { workspace = true }
 http = { workspace = true }
 wiremock = { workspace = true }
 tempfile.workspace = true
+
+[lints]
+workspace = true

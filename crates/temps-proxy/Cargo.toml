@@ -79,3 +79,6 @@ http-body-util = { workspace = true }
 tower = { workspace = true }
 anyhow = { workspace = true }
 temps-presets = { path = "../temps-presets" }
+
+[lints]
+workspace = true

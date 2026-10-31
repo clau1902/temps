@@ -28,6 +28,12 @@
 //! Skips gracefully when Docker isn't available (per project rule:
 //! Docker tests must NOT use `#[ignore]`, they must runtime-skip).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::time::Duration;
 
 use bollard::Docker;

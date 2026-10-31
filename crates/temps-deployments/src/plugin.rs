@@ -342,6 +342,21 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_service.set_environment_addresses(slot);
             }
             context.register_service(deployment_service.clone());
+            // Deploy-failure reporting (redact + preview + send). See
+            // `crate::services::failure_report_service` -- deliberately
+            // separate from the anonymous telemetry pipeline, which never
+            // carries free text. Built here rather than in `configure_routes`
+            // so an HTTP client failure fails startup with a typed error.
+            let failure_report_service = crate::services::FailureReportService::new(
+                deployment_service.clone(),
+                log_service.clone(),
+                encryption_service.clone(),
+            )
+            .map_err(|error| PluginError::PluginRegistrationFailed {
+                plugin_name: "deployments".to_string(),
+                error: format!("Failed to build FailureReportService: {error}"),
+            })?;
+            context.register_service(Arc::new(failure_report_service));
             // The node state stream (ADR-055 §7). Registered now so the
             // node routes can be built; the plane is handed to it once it
             // starts, in `initialize_plugin_services`.
@@ -1239,17 +1254,9 @@ impl TempsPlugin for DeploymentsPlugin {
         // only when metrics collection is enabled on this server.
         let metrics_store = context.get_service::<dyn temps_metrics::MetricsStore>();
 
-        // Deploy-failure reporting (redact + preview + send). See
-        // `crate::services::failure_report_service` -- deliberately separate
-        // from the anonymous telemetry pipeline, which never carries free text.
-        let failure_report_service = Arc::new(
-            crate::services::FailureReportService::new(
-                deployment_service.clone(),
-                log_service.clone(),
-                encryption_service.clone(),
-            )
-            .expect("Failed to build FailureReportService HTTP client"),
-        );
+        // Deploy-failure reporting, built in `register_services`.
+        let failure_report_service =
+            context.require_service::<crate::services::FailureReportService>();
 
         // WireGuard mesh and node pairing admin (ADR 048). Their handlers are
         // mounted with the admin node routes and read these as request

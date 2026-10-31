@@ -56,3 +56,6 @@ utoipa = ["dep:utoipa"]
 temps-shield = { path = ".", features = ["tokio", "crawlers", "netwatch"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

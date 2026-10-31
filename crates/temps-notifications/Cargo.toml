@@ -38,3 +38,6 @@ tower = { workspace = true }
 wiremock = { workspace = true }
 sea-orm-migration = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
+
+[lints]
+workspace = true

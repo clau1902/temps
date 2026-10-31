@@ -98,3 +98,6 @@ anyhow = { workspace = true }
 # image never logs "Ready for connections" to stdout/stderr, only to its log file.
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -23,3 +23,6 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 testcontainers = { workspace = true }
+
+[lints]
+workspace = true

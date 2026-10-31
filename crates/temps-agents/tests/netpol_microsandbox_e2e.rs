@@ -27,6 +27,15 @@
 //! the pinned runtime there on first run.
 
 #![cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

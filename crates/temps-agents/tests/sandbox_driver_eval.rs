@@ -32,6 +32,15 @@
 //! - Firecracker needs Linux with `/dev/kvm` and `TEMPS_FC_E2E=1` plus
 //!   `TEMPS_DATA_DIR` (see `firecracker_e2e.rs`).
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;

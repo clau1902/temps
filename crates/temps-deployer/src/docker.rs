@@ -1845,6 +1845,11 @@ impl DockerRuntime {
         use_buildkit: bool,
         network_name: String,
     ) -> Self {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "host lookup: DOCKER_HOST is the host's Docker client setting, read only to tell whether the daemon is local"
+        )]
+        let docker_host = std::env::var("DOCKER_HOST").ok();
         let secrets_root = default_secrets_root();
         // Best-effort: ensure the root exists with restrictive perms so the
         // first deploy after a fresh install doesn't race with the per-container
@@ -1880,7 +1885,7 @@ impl DockerRuntime {
             docker_socket_grant: DockerSocketGrant::default(),
             build_limits: Arc::new(LiveBuildLimits::default()),
             builds_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            daemon_is_local: docker_host_is_local(std::env::var("DOCKER_HOST").ok().as_deref()),
+            daemon_is_local: docker_host_is_local(docker_host.as_deref()),
             daemon_platform: Arc::new(std::sync::OnceLock::new()),
         }
     }

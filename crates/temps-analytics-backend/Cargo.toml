@@ -43,3 +43,6 @@ temps-database = { path = "../temps-database" }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 bollard = { workspace = true }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

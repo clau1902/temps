@@ -34,3 +34,6 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
+
+[lints]
+workspace = true

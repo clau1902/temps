@@ -83,3 +83,6 @@ hickory-resolver = { workspace = true }
 # The policy slot test: a restricted snapshot for the test client's address.
 temps-workload = { path = "../temps-workload" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
+
+[lints]
+workspace = true
