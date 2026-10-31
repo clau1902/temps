@@ -315,7 +315,7 @@ Each line is one PR, small, low-risk and independently reviewable.
 | 1 | `p4-cargo-hygiene` | P4 "safe now", P1.7 dependency centralisation, T1 edge cuts, unused deps (cargo machete) | merged (#1687) |
 | 1b | `p6-docs` | P6.1, P6.2, P6.4, P6.6, CLAUDE.md amendments for decisions 1 and 5 | merged (#1689) |
 | 1.5 | `renames` | Crate renames (solo) | merged (#1688) |
-| 2 | `split-*` (one per crate) | P2 mechanical splits + R5; one lane per crate, 3 at a time | merged: deployer (#1690, #1692), providers (#1691, #1694), projects (#1695); in progress: backup, deployments, git |
+| 2 | `split-*` (one per crate) | P2 mechanical splits + R5; one lane per crate, 3 at a time | merged: deployer (#1690, #1692), providers (#1691, #1694), projects (#1695), backup (#1696), git (#1697); in progress: deployments, ai-chat |
 | 3 | `p3-*`, `p5-*` | T2–T10, merges, P5 consolidation; mostly sequential | pending |
 | 4 | `redesign-*` | R1–R4, typed errors (P7.4), docker-util + lifecycle parity (P7.1 enabling steps), generated migration list (P6.7) | pending |
 
