@@ -9,6 +9,7 @@ import {
   legacyEnvironmentSlug,
   resolveDefaultEnvironment,
   resolveEnvironmentSelection,
+  withReachability,
 } from './project-environment-selection'
 
 const staging = { id: 1, slug: 'staging', is_preview: false }
@@ -186,4 +187,59 @@ test('a legacy ?environment= value is read as an id or a slug', () => {
   expect(legacyEnvironmentSlug(environments, 'production')).toBe('production')
   expect(legacyEnvironmentSlug(environments, '99')).toBeNull()
   expect(legacyEnvironmentSlug(environments, null)).toBeNull()
+})
+
+describe('withReachability', () => {
+  const live = {
+    tone: 'ok' as const,
+    label: 'Live',
+    detail: 'Serving its current deployment.',
+  }
+
+  test('a live environment keeps its label and names where it is public', () => {
+    expect(
+      withReachability(live, {
+        kind: 'public',
+        address: 'app.example.test',
+        url: 'https://app.example.test',
+      })
+    ).toEqual({ ...live, detail: 'Public at app.example.test.' })
+  })
+
+  test('a live environment nobody can reach is a warning that leads to the fix', () => {
+    expect(
+      withReachability(live, {
+        kind: 'not_reachable',
+        reason: 'No address points at it.',
+        canFix: true,
+      })
+    ).toEqual({
+      tone: 'warn',
+      label: 'Not reachable',
+      detail: 'No address points at it.',
+      explainedAt: 'reachability',
+    })
+  })
+
+  test('a failed deployment still says Failed, whatever the address', () => {
+    const failed = {
+      tone: 'error' as const,
+      label: 'Failed',
+      detail: 'The latest deployment failed.',
+      explainedAt: 'deployment' as const,
+    }
+    expect(
+      withReachability(failed, {
+        kind: 'not_reachable',
+        reason: 'No address points at it.',
+        canFix: false,
+      })
+    ).toBe(failed)
+  })
+
+  test('while the check runs, the status is unchanged', () => {
+    expect(
+      withReachability(live, { kind: 'checking', reason: 'Checking…' })
+    ).toBe(live)
+  })
 })

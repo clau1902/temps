@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import {
+  Boxes,
   ChevronRight,
   ExternalLink,
   MoreHorizontal,
@@ -10,15 +13,16 @@ import {
   Star,
 } from 'lucide-react'
 import { Link } from 'react-router'
+import { getEnvironmentReachabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse } from '@/api/client'
 import { Status } from '@temps-sdk/ds'
 import { ExternalBadge } from '@/components/dashboard/ProjectCard'
 import { ProjectServiceSwitcher } from '@/components/project-groups/ProjectServiceSwitcher'
 import {
+  AddToProjectDialog,
   ServiceGroupControl,
   useServiceGroup,
 } from '@/components/project-groups/ServiceGroupControl'
-import { ReachabilityStatus } from '@/components/reachability/ReachabilityStatus'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -38,11 +42,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   ALL_ENVIRONMENTS,
   type EnvironmentLiveStatus,
+  withReachability,
 } from '@/lib/project-environment-selection'
+import { reachabilityHeadline } from '@/lib/reachability'
+import { reachabilityPath } from '@/lib/reachability-page'
 import {
   describeDockerSocket,
   HOST_DOCKER_ACCESS_SHORT_LABEL,
@@ -70,7 +76,7 @@ function isExternallyHosted(project: ProjectResponse): boolean {
 function statusHref(
   projectSlug: string,
   status: EnvironmentLiveStatus,
-  environmentSlug: string,
+  environment: { id: number; slug: string },
   latestDeploymentId: number | undefined
 ): string | undefined {
   const root = projectRoot(projectSlug)
@@ -80,19 +86,22 @@ function statusHref(
         ? `${root}/deployments`
         : `${root}/deployments/${latestDeploymentId}`
     case 'environment':
-      return `${root}/environments?env=${encodeURIComponent(environmentSlug)}`
+      return `${root}/environments?env=${encodeURIComponent(environment.slug)}`
     case 'monitors':
       return `${root}/monitors`
+    case 'reachability':
+      return reachabilityPath(projectSlug, environment.id)
     case undefined:
       return undefined
   }
 }
 
 /**
- * The one place a project page's environment is chosen:
- * `project › environment  ● Live  Public at …` plus the project actions.
- * It is also the project's identity: its name is the page's top heading,
- * with the project (group) it belongs to and what it may do on its host.
+ * The one place a project page's environment is chosen, in one quiet row:
+ * `project › environment ● status` and the two actions people come for,
+ * Visit and Deploy. Everything else (the repository, the default
+ * environment, grouping) is one click away in the menu. The project's name
+ * is the page's top heading.
  */
 export function ProjectEnvironmentBar({
   project,
@@ -114,7 +123,10 @@ export function ProjectEnvironmentBar({
   const environment = selection.all ? undefined : selection.environment
   const isDefault = !!environment && environment.id === defaultEnvironment?.id
   const hint = SCOPE_HINT[scope]
-  const group = useServiceGroup(project.id).data?.group
+  const membership = useServiceGroup(project.id)
+  const group = membership.data?.group
+  const canGroup = membership.isSuccess && !group
+  const [addingToProject, setAddingToProject] = useState(false)
   const external = isExternallyHosted(project)
   const dockerSocket = describeDockerSocket(project.docker_socket)
   const repository = useProjectRepository(project)
@@ -127,34 +139,40 @@ export function ProjectEnvironmentBar({
     enabled: !external,
     onDeploymentSettled: retry,
   })
-  const status = health.status
+  // Per environment, per address (ADR 064 D3): where visitors open it, or
+  // why they cannot. A worker serves nothing to visit.
+  const checkReachability =
+    !!environment?.current_deployment_id && !external && !health.isWorker
+  const reachability = useQuery({
+    ...getEnvironmentReachabilityOptions({
+      path: { project_id: project.id, environment_id: environment?.id ?? 0 },
+    }),
+    enabled: checkReachability,
+    staleTime: 30_000,
+    refetchInterval: 60_000,
+    retry: false,
+  })
+  const status =
+    health.status &&
+    withReachability(
+      health.status,
+      checkReachability && reachability.data
+        ? reachabilityHeadline(reachability.data)
+        : undefined
+    )
   const href =
     status && environment
-      ? statusHref(
-          project.slug,
-          status,
-          environment.slug,
-          health.latestDeploymentId
-        )
+      ? statusHref(project.slug, status, environment, health.latestDeploymentId)
       : undefined
-  const showReachability =
-    !!environment?.current_deployment_id && !external && !health.isWorker
 
   return (
     // Same horizontal gutters as `PageContainer`, so the bar's left and right
     // edges line up with the page below it at every breakpoint.
-    <header className="flex shrink-0 items-center gap-x-3 gap-y-2 border-b px-4 py-2 sm:flex-wrap sm:px-6 lg:px-8">
+    <header className="flex shrink-0 items-center gap-3 border-b px-4 py-2 sm:px-6 lg:px-8">
       <nav
         aria-label="Project and environment"
         className="flex min-w-0 items-center gap-1.5"
       >
-        {/* The icon stays outside the heading: it has its own name, which
-            would otherwise become part of the project's. */}
-        <ServiceIcon
-          service={project}
-          size="sm"
-          className="shrink-0 max-sm:hidden"
-        />
         <h1 className="min-w-0 truncate text-sm font-semibold">
           {group ? (
             <ProjectServiceSwitcher project={project} group={group}>
@@ -169,7 +187,7 @@ export function ProjectEnvironmentBar({
             </Link>
           )}
         </h1>
-        <ServiceGroupControl project={project} />
+        {group && <ServiceGroupControl project={project} />}
         {external && <ExternalBadge />}
         {dockerSocket.state === 'granted' && (
           // Stays at every width: this is where the console states that the
@@ -228,57 +246,16 @@ export function ProjectEnvironmentBar({
               <Status tone={status.tone} label={status.label} variant="dot" />
             </span>
           ))}
+        {hint && (
+          <span className="truncate text-xs text-muted-foreground max-md:hidden">
+            {hint}
+          </span>
+        )}
       </nav>
 
-      {showReachability && environment && (
-        // Per environment, per address (ADR 064 D3): what a visitor can
-        // open, or why not and the button that fixes it. The overview and
-        // Domains say the same on a phone, where the bar keeps to one row.
-        <div className="min-w-0 max-md:hidden">
-          <ReachabilityStatus
-            projectId={project.id}
-            projectSlug={project.slug}
-            environmentId={environment.id}
-          />
-        </div>
-      )}
-
-      {hint && (
-        <span className="text-xs text-muted-foreground max-md:hidden">
-          {hint}
-        </span>
-      )}
-
-      <div className="ml-auto flex items-center gap-2 max-sm:hidden">
-        {environment && !isDefault && (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setDefault(environment.slug)}
-            title={`Open ${environment.name} by default for this project`}
-          >
-            <Star className="size-4" aria-hidden="true" />
-            Make default
-          </Button>
-        )}
-        {repository && (
-          <Button variant="outline" size="icon" className="size-9" asChild>
-            <a
-              href={repository.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label="Open repository in a new window"
-              title={repository.url}
-            >
-              <RepositoryProviderIcon
-                provider={repository.provider}
-                className="size-4"
-              />
-            </a>
-          </Button>
-        )}
+      <div className="ml-auto flex shrink-0 items-center gap-2">
         {environment?.main_url && (
-          <Button variant="outline" size="sm" asChild>
+          <Button variant="outline" size="sm" className="max-sm:hidden" asChild>
             <a
               href={environment.main_url}
               target="_blank"
@@ -292,68 +269,78 @@ export function ProjectEnvironmentBar({
         )}
         {/* Temps never deploys an app hosted elsewhere. */}
         {!external && (
-          <Button size="sm" onClick={onDeploy}>
+          <Button size="sm" className="max-sm:hidden" onClick={onDeploy}>
             <Rocket className="size-4" aria-hidden="true" />
             Deploy
           </Button>
         )}
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8"
+              aria-label="Project actions"
+            >
+              <MoreHorizontal className="size-4" aria-hidden="true" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {/* On a phone Visit and Deploy live here too, so the bar keeps
+                to one row. */}
+            {!external && (
+              <DropdownMenuItem className="sm:hidden" onSelect={onDeploy}>
+                <Rocket className="size-4" aria-hidden="true" />
+                Deploy
+              </DropdownMenuItem>
+            )}
+            {environment?.main_url && (
+              <DropdownMenuItem className="sm:hidden" asChild>
+                <a
+                  href={environment.main_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <ExternalLink className="size-4" aria-hidden="true" />
+                  Visit {environment.name}
+                </a>
+              </DropdownMenuItem>
+            )}
+            {repository && (
+              <DropdownMenuItem asChild>
+                <a
+                  href={repository.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  <RepositoryProviderIcon
+                    provider={repository.provider}
+                    className="size-4"
+                  />
+                  Open repository
+                </a>
+              </DropdownMenuItem>
+            )}
+            {environment && !isDefault && (
+              <DropdownMenuItem onSelect={() => setDefault(environment.slug)}>
+                <Star className="size-4" aria-hidden="true" />
+                Make {environment.name} the default
+              </DropdownMenuItem>
+            )}
+            {canGroup && (
+              <DropdownMenuItem onSelect={() => setAddingToProject(true)}>
+                <Boxes className="size-4" aria-hidden="true" />
+                Add to project…
+              </DropdownMenuItem>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
-
-      {/* On a phone the actions share one menu, so the project, its
-          environment and its state keep to a single row. */}
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <Button
-            variant="outline"
-            size="icon"
-            className="ml-auto size-8 sm:hidden"
-            aria-label="Project actions"
-          >
-            <MoreHorizontal className="size-4" aria-hidden="true" />
-          </Button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent align="end">
-          {!external && (
-            <DropdownMenuItem onSelect={onDeploy}>
-              <Rocket className="size-4" aria-hidden="true" />
-              Deploy
-            </DropdownMenuItem>
-          )}
-          {environment?.main_url && (
-            <DropdownMenuItem asChild>
-              <a
-                href={environment.main_url}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <ExternalLink className="size-4" aria-hidden="true" />
-                Visit {environment.name}
-              </a>
-            </DropdownMenuItem>
-          )}
-          {repository && (
-            <DropdownMenuItem asChild>
-              <a
-                href={repository.url}
-                target="_blank"
-                rel="noopener noreferrer"
-              >
-                <RepositoryProviderIcon
-                  provider={repository.provider}
-                  className="size-4"
-                />
-                Open repository
-              </a>
-            </DropdownMenuItem>
-          )}
-          {environment && !isDefault && (
-            <DropdownMenuItem onSelect={() => setDefault(environment.slug)}>
-              <Star className="size-4" aria-hidden="true" />
-              Make {environment.name} the default
-            </DropdownMenuItem>
-          )}
-        </DropdownMenuContent>
-      </DropdownMenu>
+      <AddToProjectDialog
+        project={project}
+        open={addingToProject}
+        onOpenChange={setAddingToProject}
+      />
     </header>
   )
 }

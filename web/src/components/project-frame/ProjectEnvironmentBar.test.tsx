@@ -90,17 +90,30 @@ function renderBar(
   )
 }
 
-test('the project name is the page heading, and a standalone service can join a project', async () => {
+/** Opens the bar's "⋯" menu and returns it. */
+async function openActions(view: ReturnType<typeof render>) {
+  fireEvent.pointerDown(view.getByRole('button', { name: 'Project actions' }), {
+    button: 0,
+    ctrlKey: false,
+    pointerType: 'mouse',
+  })
+  return view.findByRole('menu')
+}
+
+test('the project name is the page heading, and a standalone service can join a project from the menu', async () => {
   const view = renderBar(service)
 
   expect(
     view.getByRole('heading', { level: 1, name: 'synthetic-api' })
   ).toBeTruthy()
-  expect(
-    await view.findByRole('button', { name: 'Add to project' })
-  ).toBeTruthy()
   expect(view.getByRole('button', { name: 'Deploy' })).toBeTruthy()
   expect(view.queryByText('External', { exact: true })).toBeNull()
+  // Grouping is one click away, not a control in the row.
+  expect(view.queryByRole('button', { name: 'Add to project' })).toBeNull()
+  const menu = await openActions(view)
+  expect(
+    await within(menu).findByRole('menuitem', { name: 'Add to project…' })
+  ).toBeTruthy()
 })
 
 test('a grouped service names its project and switches between its services', async () => {
@@ -114,7 +127,10 @@ test('a grouped service names its project and switches between its services', as
       name: 'synthetic-api: switch to another service in Synthetic shop',
     })
   ).toBeTruthy()
-  expect(view.queryByRole('button', { name: 'Add to project' })).toBeNull()
+  const menu = await openActions(view)
+  expect(
+    within(menu).queryByRole('menuitem', { name: 'Add to project…' })
+  ).toBeNull()
 })
 
 test('an app hosted elsewhere is marked External and offers no deploy', () => {
@@ -188,42 +204,66 @@ test('a healthy environment reads Live, without a link', async () => {
   expect(view.queryByRole('link', { name: /^Live/ })).toBeNull()
 })
 
-test('the repository opens from the bar, without credentials in the link', () => {
+test('the repository opens from the menu, without credentials in the link', async () => {
   const view = renderBar({
     ...service,
     git_url: 'https://token:secret@github.com/example/synthetic-api.git',
   } as ProjectResponse)
 
+  const menu = await openActions(view)
   expect(
-    view
-      .getByRole('link', { name: 'Open repository in a new window' })
+    within(menu)
+      .getByRole('menuitem', { name: 'Open repository' })
       .getAttribute('href')
   ).toBe('https://github.com/example/synthetic-api')
 })
 
-test('a live environment says where visitors reach it', async () => {
+function reachabilityRoute(body: Record<string, unknown>) {
+  return {
+    'GET /projects/7/environments/3/reachability': () =>
+      jsonResponse({ environment_id: 3, addresses: [], ...body }),
+  }
+}
+
+test('a reachable environment reads Live, and its address is in the status', async () => {
   const view = renderBar(service, null, {
     environment: liveProduction,
-    routes: {
-      'GET /projects/7/environments/3/reachability': () =>
-        jsonResponse({
-          environment_id: 3,
+    routes: reachabilityRoute({
+      state: 'reachable',
+      summary: 'Public on the internet.',
+      primary_address: { address: 'synthetic-api.example.test' },
+      addresses: [
+        {
+          address: 'synthetic-api.example.test',
           state: 'reachable',
-          summary: 'Public on the internet.',
-          primary_address: { address: 'synthetic-api.example.test' },
-          addresses: [
-            {
-              address: 'synthetic-api.example.test',
-              state: 'reachable',
-              audience: 'public',
-              source: 'environment_domain',
-            },
-          ],
-        }),
-    },
+          audience: 'public',
+          source: 'environment_domain',
+        },
+      ],
+    }),
   })
 
-  expect(await view.findByText('synthetic-api.example.test')).toBeTruthy()
+  expect(
+    await view.findByRole('img', {
+      name: 'Live: Public at synthetic-api.example.test.',
+    })
+  ).toBeTruthy()
+})
+
+test('a live environment nobody can reach reads Not reachable and opens the fix', async () => {
+  const view = renderBar(service, null, {
+    environment: liveProduction,
+    routes: reachabilityRoute({
+      state: 'not_reachable',
+      summary: 'Deployed on the control plane, but nobody can reach it yet.',
+    }),
+  })
+
+  const status = await view.findByRole('link', { name: /^Not reachable: / })
+  expect(status.getAttribute('href')).toBe(
+    '/projects/synthetic-api/environments/3/reachability'
+  )
+  expect(status.getAttribute('aria-label')).toContain('nobody can reach it')
 })
 
 test('an app hosted elsewhere reports no deployment state of its own', async () => {
@@ -241,7 +281,7 @@ test('an app hosted elsewhere reports no deployment state of its own', async () 
   expect(view.queryByRole('img', { name: /^Live/ })).toBeNull()
 })
 
-test('on a phone the actions are one menu', async () => {
+test('the menu holds everything but the two main actions, and on a phone those too', async () => {
   const view = renderBar(
     {
       ...service,
@@ -251,14 +291,16 @@ test('on a phone the actions are one menu', async () => {
     { environment: liveProduction }
   )
 
-  const trigger = view.getByRole('button', { name: 'Project actions' })
-  fireEvent.pointerDown(trigger, {
-    button: 0,
-    ctrlKey: false,
-    pointerType: 'mouse',
-  })
-  const menu = await view.findByRole('menu')
-  for (const name of ['Deploy', 'Visit production', 'Open repository'])
+  const menu = await openActions(view)
+  await within(menu).findByRole('menuitem', { name: 'Add to project…' })
+  // Deploy and Visit are menu items only below `sm`; the classes hide
+  // them on wider screens, where the bar shows them as buttons.
+  for (const name of [
+    'Deploy',
+    'Visit production',
+    'Open repository',
+    'Add to project…',
+  ])
     expect(within(menu).getByRole('menuitem', { name })).toBeTruthy()
-  expect(within(menu).getAllByRole('menuitem')).toHaveLength(3)
+  expect(within(menu).getAllByRole('menuitem')).toHaveLength(4)
 })

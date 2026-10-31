@@ -3,6 +3,7 @@
 
 import { defaultDeployEnvironment } from '@/lib/project-deploy-action'
 import { isActiveDeploymentStatus } from '@/lib/recent-deployments'
+import type { ReachabilityHeadline } from '@/lib/reachability'
 
 /** URL search parameter that carries the selected environment's slug. */
 export const ENVIRONMENT_PARAM = 'env'
@@ -116,7 +117,7 @@ export interface EnvironmentLiveStatus {
   /** What the state means: the tooltip, and what screen readers announce. */
   detail: string
   /** Where a problem is explained and fixed. Set for problem states only. */
-  explainedAt?: 'deployment' | 'environment' | 'monitors'
+  explainedAt?: 'deployment' | 'environment' | 'monitors' | 'reachability'
 }
 
 /** What else is known about an environment, beyond its own record. */
@@ -205,5 +206,37 @@ export function environmentLiveStatus(
       signals.monitorStatus === 'operational'
         ? 'Serving its current deployment; uptime monitors are passing.'
         : 'Serving its current deployment.',
+  }
+}
+
+/**
+ * Folds where visitors reach a live environment into its status, so the
+ * project bar says it once: "Live" with the address in its detail, or "Not
+ * reachable" with the reason, which opens the page that fixes it. Any other
+ * state (failed, deploying, down) already says more and is left alone.
+ */
+export function withReachability(
+  status: EnvironmentLiveStatus,
+  headline: ReachabilityHeadline | undefined
+): EnvironmentLiveStatus {
+  if (status.tone !== 'ok' || !headline) return status
+  switch (headline.kind) {
+    case 'public':
+      return { ...status, detail: `Public at ${headline.address}.` }
+    case 'private':
+      return {
+        ...status,
+        detail: `Private at ${headline.address}${headline.network ? ` (${headline.network})` : ''}.`,
+      }
+    case 'not_reachable':
+      return {
+        tone: 'warn',
+        label: 'Not reachable',
+        detail: headline.reason,
+        explainedAt: 'reachability',
+      }
+    case 'checking':
+    case 'unknown':
+      return status
   }
 }
