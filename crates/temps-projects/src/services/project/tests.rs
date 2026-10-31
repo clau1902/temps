@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use super::create::initial_deployment_config;
 use super::naming::base_project_slug;
 use super::presets::{
     validate_compose_public_ports, validate_relaxed_capability_services,
