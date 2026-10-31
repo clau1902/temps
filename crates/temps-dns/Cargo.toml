@@ -5,6 +5,7 @@
 name = "temps-dns"
 version.workspace = true
 edition.workspace = true
+description = "DNS provider management (Cloudflare, Route 53, DigitalOcean and others) for automatic record setup, with manual instructions as fallback"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

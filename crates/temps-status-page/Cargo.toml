@@ -5,6 +5,7 @@
 name = "temps-status-page"
 version.workspace = true
 edition.workspace = true
+description = "Status pages: uptime monitors, health checks, incidents and the public status page routes"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

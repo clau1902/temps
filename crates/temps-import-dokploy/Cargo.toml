@@ -5,6 +5,7 @@
 name = "temps-import-dokploy"
 version.workspace = true
 edition.workspace = true
+description = "Dokploy importer: reads projects, applications, databases and domains over the Dokploy API and builds a migration plan"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

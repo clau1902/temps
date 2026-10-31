@@ -5,6 +5,7 @@
 name = "temps-migrations"
 version.workspace = true
 edition.workspace = true
+description = "Sea-ORM database migrations for the Temps PostgreSQL and TimescaleDB schema"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

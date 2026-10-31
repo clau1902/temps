@@ -5,6 +5,7 @@
 name = "temps-queue"
 version.workspace = true
 edition.workspace = true
+description = "Job queue implementing the temps-core JobQueue over tokio channels, with a PostgreSQL-backed durable mode for commands"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -5,6 +5,7 @@
 name = "temps-providers"
 version.workspace = true
 edition.workspace = true
+description = "Managed services (Postgres, MariaDB, MongoDB, Redis, S3): container lifecycle, upgrades, data import, health and query APIs"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

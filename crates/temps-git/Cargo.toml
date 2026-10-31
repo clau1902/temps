@@ -5,6 +5,7 @@
 name = "temps-git"
 version.workspace = true
 edition.workspace = true
+description = "Git provider integrations (GitHub, GitLab, Bitbucket, Gitea): connections, repository access, webhooks and PR comments"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

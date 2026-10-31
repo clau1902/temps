@@ -5,6 +5,7 @@
 name = "temps-deployments"
 version.workspace = true
 edition.workspace = true
+description = "Deployment pipeline: workflow jobs that build and roll out a project's containers, node scheduling and placement, and their HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

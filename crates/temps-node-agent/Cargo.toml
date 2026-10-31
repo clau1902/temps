@@ -5,6 +5,7 @@
 name = "temps-node-agent"
 version.workspace = true
 edition.workspace = true
+description = "Worker node agent: authenticated HTTP API over local Docker for builds, containers, compose, sandboxes, routes and ingress connectors"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

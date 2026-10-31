@@ -5,6 +5,7 @@
 name = "temps-database"
 version.workspace = true
 edition.workspace = true
+description = "PostgreSQL connection setup, schema compatibility guard, approximate row counts and database test utilities"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

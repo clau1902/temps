@@ -5,6 +5,7 @@
 name = "temps-node-dns"
 version.workspace = true
 edition.workspace = true
+description = "Per-node DNS resolver for the internal temps.local zone, synced from the control plane and serving stale records on failure"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

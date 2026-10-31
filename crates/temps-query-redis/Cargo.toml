@@ -5,6 +5,7 @@
 name = "temps-query-redis"
 version = "0.1.0"
 edition = "2021"
+description = "Redis backend for temps-query: browse logical databases and keys and read values"
 license.workspace = true
 
 [dependencies]

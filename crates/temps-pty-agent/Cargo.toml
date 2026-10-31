@@ -5,6 +5,7 @@
 name = "temps-pty-agent"
 version.workspace = true
 edition.workspace = true
+description = "In-sandbox PTY multiplexer binary and its framed protocol, serving workspace terminals over a Unix socket"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -5,6 +5,7 @@
 name = "temps-git-credential"
 version.workspace = true
 edition.workspace = true
+description = "In-sandbox git credential helper and daemon pair that mint per-operation scoped tokens without exposing them to user code"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

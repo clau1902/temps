@@ -5,6 +5,7 @@
 name = "temps-analytics-events"
 version.workspace = true
 edition.workspace = true
+description = "Web analytics event ingest and queries: page and custom events, traffic filters, ingest rate limiting and ClickHouse fan-out"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
