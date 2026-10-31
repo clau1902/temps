@@ -3316,7 +3316,6 @@ impl WorkflowExecutionService {
         Ok(selected)
     }
 
-    #[allow(dead_code)]
     /// Choose the node that builds a source image when the control plane
     /// has no Docker daemon.
     ///

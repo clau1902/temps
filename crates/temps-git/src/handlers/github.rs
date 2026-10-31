@@ -70,14 +70,6 @@ pub const GITHUB_REPO_WEBHOOK_PATH: &str = "/webhook/git/github/repo-events";
 
 // ===== Webhook Handlers =====
 
-#[derive(Deserialize)]
-#[allow(dead_code)] // Used for OAuth redirect query parsing
-struct RedirectQuery {
-    code: String,
-    state: String,
-    source: Option<String>,
-}
-
 /// Handle GitHub App manifest conversion with source tracking
 /// This is when creating a new GitHub App from a manifest
 async fn handle_manifest_conversion_with_source(
@@ -772,7 +764,7 @@ fn installation_failure_code(error: &GithubAppServiceError) -> OperationFailureC
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-#[allow(dead_code)] // Fields logged for debugging GitHub App installation webhooks
+#[allow(dead_code)] // query contract of the installation callback, documented in OpenAPI
 struct InstallWebhookParams {
     setup_action: String,
     source: Option<String>,

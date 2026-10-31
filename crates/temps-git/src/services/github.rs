@@ -1943,16 +1943,6 @@ pub struct CommitInfo {
     pub committer_email: String,
 }
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct TokenResponse {
-    access_token: String,
-    expires_in: i64,
-    refresh_token: String,
-    refresh_token_expires_in: i64,
-    scope: String,
-    token_type: String,
-}
 #[derive(Debug, Clone)]
 pub struct GithubAccountDetails {
     pub account_name: String,

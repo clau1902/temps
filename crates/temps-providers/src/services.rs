@@ -2232,8 +2232,6 @@ enum MonitorReachability {
 #[derive(Clone)]
 struct AddMemberPlan {
     service_id: i32,
-    #[allow(dead_code)]
-    service_name: String,
     spec: ClusterMemberSpec,
     container_name: String,
     member_fqdn: String,
@@ -10849,7 +10847,6 @@ echo "[restore] Pre-seed complete"
 
         Ok(AddMemberPlan {
             service_id,
-            service_name: service.name.clone(),
             spec,
             container_name,
             member_fqdn,
@@ -18020,7 +18017,6 @@ mod tests {
     fn local_member_plan(container_name: &str) -> AddMemberPlan {
         AddMemberPlan {
             service_id: 7,
-            service_name: "orders".to_string(),
             spec: ClusterMemberSpec {
                 role: "replica".to_string(),
                 node_id: None,

@@ -107,9 +107,9 @@ impl ResolvedAutofixConfig {
 pub struct AutofixerService {
     db: Arc<DatabaseConnection>,
     git_provider_manager: Arc<dyn GitProviderManagerTrait>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // injected but not used yet
     encryption_service: Arc<EncryptionService>,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // injected but not used yet
     queue: Arc<dyn JobQueue>,
     run_service: Arc<AgentRunService>,
     source_map_service: Arc<SourceMapService>,

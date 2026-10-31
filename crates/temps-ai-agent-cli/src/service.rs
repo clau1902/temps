@@ -27,7 +27,7 @@ use tokio::sync::Semaphore;
 use temps_agents::ai_cli::{
     cached_model_capabilities, cached_status, discover_model_capabilities_cached,
     get_status_cached, provider_capabilities_from_models, scrub_and_bound, scrub_secrets,
-    AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge, ProviderSessionMetadata,
+    AiCliProvider, AiRunConfig, OnEventCallback, PermissionBridge,
 };
 use temps_agents::error::AgentError;
 use temps_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
@@ -304,127 +304,6 @@ fn should_reuse_completed_refresh(
 }
 
 type NativeToolCalls = Arc<Mutex<HashMap<String, ToolCall>>>;
-
-#[allow(dead_code)] // retained only for legacy command-construction regression tests
-fn merge_session_metadata(
-    slot: &Arc<Mutex<Option<ProviderSessionMetadata>>>,
-    incoming: ProviderSessionMetadata,
-) {
-    let mut metadata = slot
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match metadata.as_mut() {
-        Some(current) => {
-            if incoming.session_id.is_some() {
-                current.session_id = incoming.session_id;
-            }
-            if incoming.title.is_some() {
-                current.title = incoming.title;
-            }
-        }
-        None => *metadata = Some(incoming),
-    }
-}
-
-#[allow(dead_code)]
-fn bounded_harness_title(value: &str) -> Option<String> {
-    const MAX_CHARS: usize = 120;
-    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return None;
-    }
-    Some(normalized.chars().take(MAX_CHARS).collect())
-}
-
-/// Claude currently stores its human-facing session label in local metadata
-/// rather than emitting it on `stream-json`. Newer indexes may write a
-/// `custom-title`; loose transcripts expose the first prompt. Temps sends a
-/// flattened role transcript as that prompt, so take its final `[user]`
-/// segment instead of using the system framing as a navigation label.
-#[allow(dead_code)]
-fn claude_session_title_from_transcript(contents: &[u8]) -> Option<String> {
-    let text = std::str::from_utf8(contents).ok()?;
-    let mut first_prompt: Option<String> = None;
-    for line in text.lines().take(40) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if value.get("type").and_then(serde_json::Value::as_str) == Some("custom-title") {
-            if let Some(title) = value
-                .get("customTitle")
-                .and_then(serde_json::Value::as_str)
-                .and_then(bounded_harness_title)
-            {
-                return Some(title);
-            }
-        }
-        if first_prompt.is_none()
-            && value.get("type").and_then(serde_json::Value::as_str) == Some("user")
-            && value
-                .pointer("/message/role")
-                .and_then(serde_json::Value::as_str)
-                == Some("user")
-        {
-            first_prompt = value
-                .pointer("/message/content")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|items| {
-                    items.iter().find_map(|item| {
-                        (item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
-                            .then(|| item.get("text").and_then(serde_json::Value::as_str))
-                            .flatten()
-                    })
-                })
-                .or_else(|| {
-                    value
-                        .pointer("/message/content")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .map(str::to_string);
-        }
-    }
-    let prompt = first_prompt?;
-    let user_prompt = prompt
-        .rsplit("\n\n[user]\n")
-        .next()
-        .unwrap_or(prompt.as_str());
-    let user_prompt = user_prompt
-        .split("\n\n[assistant]\n")
-        .next()
-        .unwrap_or(user_prompt);
-    bounded_harness_title(user_prompt)
-}
-
-#[allow(dead_code)]
-async fn resolve_sandbox_session_title(
-    provider_name: &str,
-    sandbox: &dyn SandboxProvider,
-    handle: &temps_agents::sandbox::SandboxHandle,
-    session_id: &str,
-) -> Option<String> {
-    if provider_name != "claude_cli"
-        || session_id.is_empty()
-        || session_id.len() > 200
-        || !session_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-    {
-        return None;
-    }
-    let path = format!("/home/temps/.claude/projects/-home-temps-workspace/{session_id}.jsonl");
-    match sandbox.read_file(handle, &path).await {
-        Ok(contents) => claude_session_title_from_transcript(&contents),
-        Err(error) => {
-            tracing::debug!(
-                provider = provider_name,
-                %session_id,
-                %error,
-                "provider session title metadata was unavailable"
-            );
-            None
-        }
-    }
-}
 
 struct StreamingSecretRedactor {
     secrets: Vec<String>,
@@ -4046,96 +3925,6 @@ async fn prepare_native_opencode_auth(
     Ok(())
 }
 
-/// Register the same turn-scoped platform MCP server with each supported
-/// sandbox harness. Only Claude needs a file; it lives on the sandbox tmpfs
-/// and is removed when the provider process finishes. Codex/OpenCode receive
-/// the bearer only in their process environment. In every case the value is a
-/// narrow capability, not a reusable user/API token.
-#[allow(dead_code)]
-fn configure_sandbox_mcp(
-    provider: &str,
-    command: &mut Vec<String>,
-    environment: &mut HashMap<String, String>,
-    secret_files: &mut Vec<(String, Vec<u8>)>,
-    server: Option<&temps_ai::HarnessMcpServer>,
-) -> Result<Option<String>, AiError> {
-    let Some(server) = server else {
-        return Ok(None);
-    };
-    match provider {
-        "claude_cli" => {
-            let secret_path = format!(
-                "/run/secrets/temps-chat-mcp-{}.json",
-                uuid::Uuid::new_v4().simple()
-            );
-            let contents = serde_json::to_vec(&serde_json::json!({
-                "mcpServers": {
-                    "temps-chat": {
-                        "type": "http",
-                        "url": server.url,
-                        "headers": {
-                            "Authorization": format!("Bearer {}", server.authorization_token),
-                        }
-                    }
-                }
-            }))
-            .map_err(|error| AiError::Provider {
-                purpose: "chat.application.mcp".to_string(),
-                reason: format!("could not encode sandbox MCP configuration: {error}"),
-            })?;
-            secret_files.push((secret_path.clone(), contents));
-            command.extend([
-                "--mcp-config".to_string(),
-                secret_path.clone(),
-                "--allowedTools".to_string(),
-                // Claude documents the bare server name as the way to allow
-                // every tool on that server; glob patterns are not supported.
-                // Platform tools remain scoped by the one-turn bearer and
-                // perform their own server-side authorization.
-                "mcp__temps-chat".to_string(),
-                "--permission-prompt-tool".to_string(),
-                "mcp__temps-chat__temps_native_permission".to_string(),
-            ]);
-            Ok(Some(secret_path))
-        }
-        "codex_cli" => {
-            command.extend([
-                "--config".to_string(),
-                format!("mcp_servers.temps_chat.url=\"{}\"", server.url),
-                "--config".to_string(),
-                "mcp_servers.temps_chat.bearer_token_env_var=\"TEMPS_CHAT_MCP_TOKEN\"".to_string(),
-            ]);
-            environment.insert(
-                "TEMPS_CHAT_MCP_TOKEN".to_string(),
-                server.authorization_token.clone(),
-            );
-            Ok(None)
-        }
-        "opencode" => {
-            merge_opencode_config(
-                environment,
-                serde_json::json!({
-                    "mcp": {
-                        "temps-chat": {
-                            "type": "remote",
-                            "url": server.url,
-                            "headers": {
-                                "Authorization": format!("Bearer {}", server.authorization_token),
-                            }
-                        }
-                    },
-                    "permission": {"temps_chat_*": "allow"}
-                }),
-            )?;
-            Ok(None)
-        }
-        other => Err(AiError::Provider {
-            purpose: "chat.application.mcp".to_string(),
-            reason: format!("sandbox MCP configuration is not implemented for '{other}'"),
-        }),
-    }
-}
-
 fn merge_opencode_config(
     environment: &mut HashMap<String, String>,
     addition: serde_json::Value,
@@ -4167,257 +3956,6 @@ fn merge_opencode_config(
             reason: format!("could not encode OpenCode relay configuration: {error}"),
         })?,
     );
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn sandbox_harness_command(
-    provider: &str,
-    prompt: &str,
-    request: &ChatTurnRequest,
-) -> Result<Vec<String>, AiError> {
-    let mut command = match provider {
-        "claude_cli" => {
-            let mut command = vec!["claude".to_string(), "--print".to_string()];
-            if let Some(session_id) = request.resume_session_id.as_deref() {
-                command.push("--resume".to_string());
-                command.push(session_id.to_string());
-            }
-            command.extend([
-                prompt.to_string(),
-                "--output-format".to_string(),
-                "stream-json".to_string(),
-                "--verbose".to_string(),
-                "--include-partial-messages".to_string(),
-            ]);
-            let mut roots = request
-                .sandbox_file_paths
-                .iter()
-                .map(|path| {
-                    if !valid_staged_attachment_path(path) {
-                        return Err(AiError::Provider {
-                            purpose: request.purpose.clone(),
-                            reason: "Claude attachment path is outside the root-owned turn staging directory".to_string(),
-                        });
-                    }
-                    Path::new(path)
-                        .parent()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .ok_or_else(|| AiError::Provider {
-                            purpose: request.purpose.clone(),
-                            reason: "Claude attachment path has no managed turn directory".to_string(),
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            roots.sort();
-            roots.dedup();
-            for root in roots {
-                command.push("--add-dir".to_string());
-                command.push(root);
-            }
-            command
-        }
-        "codex_cli" => {
-            let mut command = vec![
-                "codex".to_string(),
-                "exec".to_string(),
-                "--strict-config".to_string(),
-                "--ignore-user-config".to_string(),
-            ];
-            if let Some(session_id) = request.resume_session_id.as_deref() {
-                command.push("resume".to_string());
-                command.push(session_id.to_string());
-            }
-            for image_path in &request.sandbox_image_paths {
-                if !valid_staged_attachment_path(image_path) {
-                    return Err(AiError::Provider {
-                        purpose: request.purpose.clone(),
-                        reason: "sandbox image path is outside the managed attachment directory"
-                            .to_string(),
-                    });
-                }
-                command.push("--image".to_string());
-                command.push(image_path.clone());
-            }
-            command.extend([
-                prompt.to_string(),
-                "--json".to_string(),
-                "--skip-git-repo-check".to_string(),
-            ]);
-            command
-        }
-        "opencode" => {
-            let mut command = vec![
-                "opencode".to_string(),
-                "run".to_string(),
-                "--format".to_string(),
-                "json".to_string(),
-            ];
-            if let Some(session_id) = request.resume_session_id.as_deref() {
-                command.push("--session".to_string());
-                command.push(session_id.to_string());
-            }
-            for file_path in &request.sandbox_file_paths {
-                if !valid_staged_attachment_path(file_path) {
-                    return Err(AiError::Provider { purpose: request.purpose.clone(), reason: "OpenCode attachment path is outside the root-owned turn staging directory".to_string() });
-                }
-                command.push("--file".to_string());
-                command.push(file_path.clone());
-            }
-            command
-        }
-        _ => {
-            return Err(AiError::Provider {
-                purpose: request.purpose.clone(),
-                reason: format!("sandbox execution is not implemented for harness '{provider}'"),
-            })
-        }
-    };
-    if provider != "opencode" {
-        if let Some(model) = request.model.as_deref().filter(|model| !model.is_empty()) {
-            // All registered harnesses accept an explicit model flag. Claude's
-            // parser accepts it after --print's prompt (matching its native CLI).
-            command.push("--model".to_string());
-            command.push(model.to_string());
-        }
-    }
-    apply_sandbox_runtime_options(&mut command, provider, request)?;
-    if provider == "opencode" {
-        if let Some(model) = request.model.as_deref().filter(|model| !model.is_empty()) {
-            command.push("--model".to_string());
-            command.push(model.to_string());
-        }
-        command.push("--".to_string());
-        command.push(prompt.to_string());
-    }
-    Ok(command)
-}
-
-#[allow(dead_code)]
-fn valid_staged_attachment_path(path: &str) -> bool {
-    const PREFIX: &str = "/run/temps-attachments/";
-    let Some(suffix) = path.strip_prefix(PREFIX) else {
-        return false;
-    };
-    let mut components = suffix.split('/');
-    let (Some(turn_id), Some(file_name), None) =
-        (components.next(), components.next(), components.next())
-    else {
-        return false;
-    };
-    let valid_opaque_id = |value: &str| {
-        !value.is_empty()
-            && value.len() <= 128
-            && value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    };
-    path.len() <= 1024
-        && turn_id.starts_with("turn-")
-        && valid_opaque_id(turn_id)
-        && !file_name.is_empty()
-        && file_name.len() <= 255
-        && file_name.starts_with("attachment-")
-        && file_name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
-        && !file_name.contains('\r')
-        && !file_name.contains('\n')
-}
-
-/// Keep sandbox harness invocations honest about the controls shown in the
-/// composer.  The Docker/Firecracker sandbox remains the outer boundary, but
-/// it must not silently ignore the model's own effort or permission policy.
-///
-/// These flags mirror the provider adapters' normal `AiRunConfig` mappings.
-/// We keep the mapping here because sandbox execution deliberately avoids the
-/// host subprocess and its ambient configuration.
-#[allow(dead_code)]
-fn apply_sandbox_runtime_options(
-    command: &mut Vec<String>,
-    provider: &str,
-    request: &ChatTurnRequest,
-) -> Result<(), AiError> {
-    match provider {
-        "claude_cli" => {
-            let permission = match request.permission_mode.as_deref() {
-                Some("plan") => "plan",
-                _ => "default",
-            };
-            command.push("--permission-mode".to_string());
-            command.push(permission.to_string());
-
-            match request.thinking_level.as_deref() {
-                None | Some("default") => {}
-                Some("off") => {
-                    command.push("--effort".to_string());
-                    command.push("high".to_string());
-                    command.push("--settings".to_string());
-                    command.push(r#"{\"alwaysThinkingEnabled\":false}"#.to_string());
-                }
-                Some("ultracode") => {
-                    command.push("--effort".to_string());
-                    command.push("xhigh".to_string());
-                    command.push("--settings".to_string());
-                    command.push(r#"{\"ultracode\":true}"#.to_string());
-                }
-                Some(effort) => {
-                    command.push("--effort".to_string());
-                    command.push(effort.to_string());
-                }
-            }
-        }
-        "codex_cli" => {
-            match request.permission_mode.as_deref() {
-                Some("full-access") | Some("auto-review") | Some("auto") | None => {
-                    command.extend([
-                        "--config".to_string(),
-                        "sandbox_mode=\"workspace-write\"".to_string(),
-                        "--config".to_string(),
-                        "approval_policy=\"on-request\"".to_string(),
-                        "--config".to_string(),
-                        "approvals_reviewer=\"auto_review\"".to_string(),
-                    ]);
-                }
-                Some(mode) => {
-                    return Err(AiError::Provider {
-                        purpose: request.purpose.clone(),
-                        reason: format!("unsupported Codex sandbox permission mode '{mode}'"),
-                    });
-                }
-            }
-            if let Some(effort) = request
-                .thinking_level
-                .as_deref()
-                .filter(|effort| *effort != "default")
-            {
-                command.push("--config".to_string());
-                command.push(format!("model_reasoning_effort=\"{effort}\""));
-            }
-        }
-        "opencode" => {
-            // OpenCode calls its permission selection an agent and its
-            // reasoning selection a variant. Both precede the positional
-            // prompt, which `sandbox_harness_command` appends afterwards.
-            if let Some(agent) = request
-                .permission_mode
-                .as_deref()
-                .filter(|agent| *agent != "full-access")
-            {
-                command.push("--agent".to_string());
-                command.push(agent.to_string());
-            }
-            if let Some(variant) = request
-                .thinking_level
-                .as_deref()
-                .filter(|variant| *variant != "default")
-            {
-                command.push("--variant".to_string());
-                command.push(variant.to_string());
-            }
-        }
-        _ => {}
-    }
     Ok(())
 }
 
@@ -9984,65 +9522,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_harness_command_respects_claude_runtime_controls() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            model: Some("claude-opus-5".into()),
-            thinking_level: Some("high".into()),
-            permission_mode: Some("plan".into()),
-            ..Default::default()
-        };
-
-        let command = sandbox_harness_command("claude_cli", "build it", &request)
-            .expect("Claude sandbox command should build");
-
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--model", "claude-opus-5"]));
-        assert!(command.windows(2).any(|pair| pair == ["--effort", "high"]));
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "plan"]));
-        assert!(
-            !command
-                .iter()
-                .any(|arg| arg == "--dangerously-skip-permissions"),
-            "a selected permission mode must not be silently bypassed"
-        );
-    }
-
-    #[test]
-    fn sandbox_full_access_never_bypasses_the_server_authorization_gate() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            permission_mode: Some("full-access".into()),
-            ..Default::default()
-        };
-
-        let claude = sandbox_harness_command("claude_cli", "build it", &request)
-            .expect("Claude sandbox command should build");
-        assert!(claude
-            .windows(2)
-            .any(|pair| pair == ["--permission-mode", "default"]));
-        assert!(!claude.iter().any(|arg| arg == "bypassPermissions"));
-
-        let codex = sandbox_harness_command("codex_cli", "build it", &request)
-            .expect("Codex sandbox command should build");
-        assert!(!codex
-            .iter()
-            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
-        assert!(codex
-            .windows(2)
-            .any(|pair| pair == ["--config", "sandbox_mode=\"workspace-write\""]));
-
-        let opencode = sandbox_harness_command("opencode", "build it", &request)
-            .expect("OpenCode sandbox command should build");
-        assert!(!opencode
-            .windows(2)
-            .any(|pair| pair == ["--agent", "full-access"]));
-    }
-
-    #[test]
     fn retained_claude_explicit_native_auto_and_brokered_ui_auto_are_distinct() {
         assert_eq!(
             runtime_permission_mode(Provider::Claude, Some("auto"), "chat.application")
@@ -10272,40 +9751,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_harness_commands_resume_each_native_provider_session() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            resume_session_id: Some("session-123".into()),
-            ..Default::default()
-        };
-
-        let claude = sandbox_harness_command("claude_cli", "continue", &request)
-            .expect("Claude sandbox command should build");
-        assert!(claude
-            .windows(2)
-            .any(|pair| pair == ["--resume", "session-123"]));
-
-        let codex = sandbox_harness_command("codex_cli", "continue", &request)
-            .expect("Codex sandbox command should build");
-        assert!(codex
-            .windows(2)
-            .any(|pair| pair == ["--config", "sandbox_mode=\"workspace-write\""]));
-        assert!(
-            !codex.iter().any(|arg| arg == "--sandbox"),
-            "the resume subcommand rejects the exec-only --sandbox flag"
-        );
-        assert!(codex
-            .windows(3)
-            .any(|args| { args == ["resume", "session-123", "continue"] }));
-
-        let opencode = sandbox_harness_command("opencode", "continue", &request)
-            .expect("OpenCode sandbox command should build");
-        assert!(opencode
-            .windows(2)
-            .any(|pair| pair == ["--session", "session-123"]));
-    }
-
-    #[test]
     fn resumed_sandbox_prompt_sends_only_the_latest_user_turn() {
         let request = ChatTurnRequest {
             purpose: "chat.application".into(),
@@ -10326,84 +9771,6 @@ mod tests {
     }
 
     #[test]
-    fn all_harnesses_receive_only_staged_attachment_paths_on_fresh_and_resumed_turns() {
-        const ATTACHMENT_PATH: &str = "/run/temps-attachments/turn-abc123/attachment-0.png";
-        for (provider, resumed) in [
-            ("claude_cli", false),
-            ("claude_cli", true),
-            ("codex_cli", false),
-            ("codex_cli", true),
-            ("opencode", false),
-            ("opencode", true),
-        ] {
-            let attachment_context =
-                format!("The user attached an image/png file. Inspect it at: {ATTACHMENT_PATH}");
-            let request = ChatTurnRequest {
-                purpose: "chat.application".into(),
-                resume_session_id: resumed.then(|| "session-123".into()),
-                sandbox_image_paths: vec![ATTACHMENT_PATH.into()],
-                sandbox_file_paths: vec![ATTACHMENT_PATH.into()],
-                messages: vec![
-                    temps_ai::ChatMessage::user("older request"),
-                    temps_ai::ChatMessage::assistant("older response"),
-                    temps_ai::ChatMessage::user(format!(
-                        "{attachment_context}\n\nDescribe the attached image"
-                    )),
-                ],
-                ..Default::default()
-            };
-            let prompt = build_sandbox_chat_prompt(&request);
-            let command = sandbox_harness_command(provider, &prompt, &request).unwrap();
-
-            assert!(
-                command
-                    .iter()
-                    .any(|argument| argument.contains(ATTACHMENT_PATH)),
-                "{provider} must receive the mounted attachment path when resumed={resumed}"
-            );
-            if provider == "codex_cli" {
-                assert!(command
-                    .windows(2)
-                    .any(|arguments| arguments == ["--image", ATTACHMENT_PATH]));
-            } else if provider == "opencode" {
-                assert!(command
-                    .windows(2)
-                    .any(|arguments| arguments == ["--file", ATTACHMENT_PATH]));
-                assert!(command.windows(2).any(|arguments| arguments[0] == "--"));
-            } else {
-                assert!(!command.iter().any(|argument| argument == "--image"));
-            }
-        }
-    }
-
-    #[test]
-    fn harnesses_reject_untrusted_native_attachment_paths() {
-        for path in [
-            "/tmp/untrusted.png",
-            "/home/temps/workspace/.temps/chat-attachments/conversation/file/image.png",
-            "/home/temps/workspace/.temps/chat-attachments/other.png",
-        ] {
-            let request = ChatTurnRequest {
-                purpose: "chat.application".into(),
-                sandbox_image_paths: vec![path.into()],
-                ..Default::default()
-            };
-
-            assert!(matches!(
-                sandbox_harness_command("codex_cli", "inspect", &request),
-                Err(AiError::Provider { reason, .. })
-                    if reason.contains("outside the managed attachment directory")
-            ));
-            let request = ChatTurnRequest {
-                purpose: "chat.application".into(),
-                sandbox_file_paths: vec![path.into()],
-                ..Default::default()
-            };
-            assert!(sandbox_harness_command("opencode", "inspect", &request).is_err());
-        }
-    }
-
-    #[test]
     fn attachment_staging_accepts_only_non_writable_root_owned_directories() {
         assert!(trusted_root_directory_stat("directory:0:0:711\n"));
         assert!(!trusted_root_directory_stat("symbolic link:0:0:777\n"));
@@ -10419,12 +9786,6 @@ mod tests {
             is_image: false,
         };
         assert!(validate_sandbox_attachment_budget(&[oversized], "test").is_err());
-        assert!(valid_staged_attachment_path(
-            "/run/temps-attachments/turn-abc/attachment-0.png"
-        ));
-        assert!(!valid_staged_attachment_path(
-            "/home/temps/workspace/.temps/chat-attachments/c/a/image.png"
-        ));
     }
 
     fn cleanup_test_sandbox() -> (Arc<dyn SandboxProvider>, Arc<AtomicUsize>) {
@@ -10481,7 +9842,7 @@ mod tests {
     }
 
     #[test]
-    fn attachment_prompt_maps_original_names_and_claude_scopes_the_turn_directory() {
+    fn attachment_prompt_maps_original_names() {
         const PATH: &str = "/run/temps-attachments/turn-abc/attachment-0.txt";
         let attachments = vec![temps_ai::SandboxAttachment {
             name: "foo.txt".into(),
@@ -10490,17 +9851,6 @@ mod tests {
         }];
         let prompt = sandbox_attachment_prompt(&attachments, &[(PATH.into(), false)]);
         assert!(prompt.contains("\"foo.txt\" -> /run/temps-attachments/turn-abc/attachment-0.txt"));
-
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            sandbox_file_paths: vec![PATH.into()],
-            ..Default::default()
-        };
-        let command = sandbox_harness_command("claude_cli", "inspect foo.txt", &request)
-            .expect("Claude attachment command");
-        assert!(command
-            .windows(2)
-            .any(|args| { args == ["--add-dir", "/run/temps-attachments/turn-abc"] }));
     }
 
     #[test]
@@ -10520,123 +9870,6 @@ mod tests {
                 "{SANDBOX_RUNTIME_GUIDANCE}\n\n[system]\nplatform context\n\n[user]\nfirst request"
             )
         );
-    }
-
-    #[test]
-    fn sandbox_harness_command_places_opencode_flags_before_prompt() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            model: Some("openai/gpt-5.6".into()),
-            thinking_level: Some("max".into()),
-            permission_mode: Some("build".into()),
-            ..Default::default()
-        };
-
-        let command = sandbox_harness_command("opencode", "build it", &request)
-            .expect("OpenCode sandbox command should build");
-        let prompt = command
-            .iter()
-            .position(|arg| arg == "build it")
-            .expect("prompt is present");
-        let agent = command
-            .iter()
-            .position(|arg| arg == "--agent")
-            .expect("agent flag is present");
-        let variant = command
-            .iter()
-            .position(|arg| arg == "--variant")
-            .expect("variant flag is present");
-        assert!(agent < prompt && variant < prompt);
-    }
-
-    #[test]
-    fn sandbox_claude_registers_scoped_mcp_without_putting_bearer_in_arguments() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            ..Default::default()
-        };
-        let mut command = sandbox_harness_command("claude_cli", "build it", &request)
-            .expect("Claude sandbox command should build");
-        let mut environment = HashMap::new();
-        let mut secret_files = Vec::new();
-        let server = temps_ai::HarnessMcpServer {
-            url: "http://host.docker.internal:8080/api/ai/sandbox-tools/id/mcp".to_string(),
-            authorization_token: "tmcp_super_secret".to_string(),
-        };
-
-        let cleanup = configure_sandbox_mcp(
-            "claude_cli",
-            &mut command,
-            &mut environment,
-            &mut secret_files,
-            Some(&server),
-        )
-        .expect("MCP configuration should be generated");
-
-        let cleanup = cleanup.expect("Claude uses a temporary MCP config");
-        assert!(cleanup.starts_with("/run/secrets/temps-chat-mcp-"));
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--mcp-config", cleanup.as_str()]));
-        assert!(command
-            .windows(2)
-            .any(|pair| pair == ["--allowedTools", "mcp__temps-chat"]));
-        assert!(command.windows(2).any(|pair| {
-            pair == [
-                "--permission-prompt-tool",
-                "mcp__temps-chat__temps_native_permission",
-            ]
-        }));
-        assert!(!command
-            .iter()
-            .any(|argument| argument.contains("super_secret")));
-        let config: serde_json::Value =
-            serde_json::from_slice(&secret_files[0].1).expect("valid MCP JSON");
-        assert_eq!(
-            config["mcpServers"]["temps-chat"]["headers"]["Authorization"],
-            "Bearer tmcp_super_secret"
-        );
-        assert_eq!(
-            sandbox_secret_cleanup_command(std::slice::from_ref(&cleanup)),
-            ["/bin/rm", "-rf", "--", cleanup.as_str()]
-        );
-    }
-
-    #[test]
-    fn sandbox_codex_registers_scoped_mcp_through_process_environment() {
-        let request = ChatTurnRequest {
-            purpose: "chat.application".into(),
-            ..Default::default()
-        };
-        let mut command = sandbox_harness_command("codex_cli", "build it", &request)
-            .expect("Codex sandbox command should build");
-        let mut environment = HashMap::new();
-        let mut secret_files = Vec::new();
-        let server = temps_ai::HarnessMcpServer {
-            url: "http://host.docker.internal:8080/api/ai/sandbox-tools/id/mcp".to_string(),
-            authorization_token: "tmcp_super_secret".to_string(),
-        };
-
-        configure_sandbox_mcp(
-            "codex_cli",
-            &mut command,
-            &mut environment,
-            &mut secret_files,
-            Some(&server),
-        )
-        .expect("MCP configuration should be generated");
-
-        assert!(command.iter().any(|argument| {
-            argument == "mcp_servers.temps_chat.bearer_token_env_var=\"TEMPS_CHAT_MCP_TOKEN\""
-        }));
-        assert!(!command
-            .iter()
-            .any(|argument| argument.contains("super_secret")));
-        assert_eq!(
-            environment.get("TEMPS_CHAT_MCP_TOKEN").map(String::as_str),
-            Some("tmcp_super_secret")
-        );
-        assert!(secret_files.is_empty());
     }
 
     #[test]
@@ -10788,53 +10021,6 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_opencode_config_contains_only_the_relay_bearer_and_preserves_mcp() {
-        let relay = SandboxModelRelay {
-            base_url: "https://temps.example.test/relay/id".into(),
-            bearer: "tmodel_short_lived".into(),
-            provider_id: Some("anthropic"),
-            native_opencode_auth: None,
-            compatible_model: None,
-        };
-        let mut environment = HashMap::new();
-        environment.insert(
-            "OPENCODE_CONFIG_CONTENT".into(),
-            r#"{"plugin":["evil"],"permission":{"*":"allow"}}"#.into(),
-        );
-        environment.insert("OPENCODE_AUTH_CONTENT".into(), "real-provider-key".into());
-        let mut command = Vec::new();
-        let mut files = Vec::new();
-        configure_sandbox_model_relay(
-            "opencode",
-            &mut command,
-            &mut environment,
-            &mut files,
-            &relay,
-        )
-        .unwrap();
-        configure_sandbox_mcp(
-            "opencode",
-            &mut command,
-            &mut environment,
-            &mut files,
-            Some(&temps_ai::HarnessMcpServer {
-                url: "https://temps.example.test/mcp".into(),
-                authorization_token: "tmcp_short_lived".into(),
-            }),
-        )
-        .unwrap();
-        let auth = environment.get("OPENCODE_AUTH_CONTENT").unwrap();
-        assert!(auth.contains("tmodel_short_lived"));
-        assert!(!auth.contains("real-provider-key"));
-        let config = environment.get("OPENCODE_CONFIG_CONTENT").unwrap();
-        assert!(config.contains("temps-chat"));
-        assert!(config.contains("/relay/id/v1"));
-        assert!(config.contains("enabled_providers"));
-        assert!(!config.contains("evil"));
-        assert!(!config.contains(r#""*""#));
-    }
-
-    #[test]
     fn sandbox_opencode_native_auth_uses_runtime_private_store_without_secret_env() {
         let relay = SandboxModelRelay {
             base_url: "https://unused.example.test".into(),
@@ -10982,27 +10168,6 @@ mod tests {
             scratch.path().to_owned(),
             Duration::from_secs(30),
             0,
-        );
-    }
-
-    #[test]
-    fn claude_session_title_uses_current_user_segment_from_flattened_prompt() {
-        let transcript = br#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[system]\nOperate Temps safely.\n\n[user]\nCan you create a MongoDB instance?"}]}}
-"#;
-        assert_eq!(
-            claude_session_title_from_transcript(transcript).as_deref(),
-            Some("Can you create a MongoDB instance?")
-        );
-    }
-
-    #[test]
-    fn claude_session_title_prefers_provider_custom_title() {
-        let transcript = br#"{"type":"custom-title","customTitle":"  MongoDB   Service Setup  "}
-{"type":"user","message":{"role":"user","content":"ignored"}}
-"#;
-        assert_eq!(
-            claude_session_title_from_transcript(transcript).as_deref(),
-            Some("MongoDB Service Setup")
         );
     }
 

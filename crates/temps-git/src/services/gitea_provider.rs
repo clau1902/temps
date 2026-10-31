@@ -302,8 +302,6 @@ struct GiteaTag {
 
 #[derive(Deserialize)]
 struct GiteaFileContent {
-    #[allow(dead_code)]
-    name: String,
     path: String,
     content: Option<String>,
     encoding: Option<String>,
@@ -1585,8 +1583,6 @@ impl GitProviderService for GiteaProvider {
                 sha: String,
                 message: String,
                 author: Option<GiteaCommitAuthor>,
-                #[allow(dead_code)]
-                committer: Option<GiteaCommitCommitter>,
                 created: Option<String>,
             }
 

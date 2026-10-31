@@ -169,10 +169,10 @@ fn is_transient_migration_error(message: &str) -> bool {
 
 /// Shared container wrapper that holds the database container and connection details
 struct SharedContainer {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // held so the container is stopped on drop
     container: ContainerAsync<GenericImage>,
     database_url: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // kept with the container it describes
     port: u16,
 }
 
@@ -565,7 +565,7 @@ pub struct TestDatabase {
     pub db: Arc<DbConnection>,
     pub database_url: String,
     /// If this instance owns a dedicated container (not shared)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // held so the container is stopped on drop
     dedicated_container: Option<ContainerAsync<GenericImage>>,
     /// The unique schema name for this test instance
     schema_name: Option<String>,
@@ -1575,20 +1575,16 @@ impl TestDatabase {
 /// handling, consider using SeaORM's built-in transaction support.
 pub struct TestTransaction {
     pub db: Arc<DbConnection>,
-    #[allow(dead_code)]
-    transaction_id: String,
 }
 
 impl TestTransaction {
     /// Start a new test transaction
     pub async fn new(db: Arc<DbConnection>) -> anyhow::Result<Self> {
-        let transaction_id = uuid::Uuid::new_v4().to_string();
-
         // Start transaction
         let statement = Statement::from_string(DatabaseBackend::Postgres, "BEGIN".to_owned());
         db.execute(statement).await?;
 
-        Ok(TestTransaction { db, transaction_id })
+        Ok(TestTransaction { db })
     }
 
     /// Rollback the transaction
