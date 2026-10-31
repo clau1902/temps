@@ -203,6 +203,12 @@ impl TempsPlugin for BackupPlugin {
                 context.require_service::<temps_monitoring::alarm_service::AlarmService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
+            // Shared workspace JobQueue. Producers (BackupService) publish
+            // Job::BackupRequested here; the BackupJobProcessor subscribes
+            // and dispatches to the executor. Required up front: a missing
+            // queue fails plugin registration at startup instead of
+            // panicking on the first backup trigger.
+            let job_queue = context.require_service::<dyn temps_core::JobQueue>();
 
             // Create BackupService.
             let backup_service = Arc::new(BackupService::new(
@@ -211,6 +217,7 @@ impl TempsPlugin for BackupPlugin {
                 alarm_service.clone(),
                 config_service.clone(),
                 encryption_service.clone(),
+                Arc::clone(&job_queue),
             ));
             context.register_service(backup_service.clone());
             // The Cloud plugin creates and releases the managed destination's
@@ -286,11 +293,6 @@ impl TempsPlugin for BackupPlugin {
             let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
                 BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
             );
-
-            // Shared workspace JobQueue. Producers (BackupService) publish
-            // Job::BackupRequested here; the BackupJobProcessor subscribes
-            // and dispatches to the executor.
-            let job_queue = context.require_service::<dyn temps_core::JobQueue>();
 
             let mut executor_builder = BackupExecutorBuilder::new(db.clone())
                 .with_max_concurrent(executor_max_concurrent)
@@ -388,10 +390,6 @@ impl TempsPlugin for BackupPlugin {
             }
 
             let executor = Arc::new(executor_builder.build());
-
-            // Wire the JobQueue into BackupService so trigger paths can
-            // publish Job::BackupRequested messages.
-            backup_service.set_queue(Arc::clone(&job_queue));
 
             // Spawn the consumer loop. It subscribes to the workspace
             // queue and dispatches every Job::BackupRequested to the

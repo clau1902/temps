@@ -4,10 +4,10 @@
 //! In-memory zone state with on-disk snapshot persistence.
 //!
 //! The store is designed for one writer (the [`SyncClient`] task) and many
-//! readers (the Hickory authority handlers, one per request). The reader
-//! path is lock-free after a single `RwLock` read — we keep records in an
-//! `Arc<Inner>` so the read guard releases as soon as the snapshot is
-//! cloned by reference.
+//! readers (the Hickory authority handlers, one per request). Records live
+//! in an `Arc<Inner>` behind an `ArcSwap`: a reader's snapshot is one atomic
+//! load with no lock (so nothing a reader does can poison or block it), and
+//! a writer builds a new `Inner` and swaps it in whole.
 //!
 //! ## Disk format
 //!
@@ -28,19 +28,12 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use parking_lot_compat::RwLock;
+use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use crate::error::ResolverError;
 use crate::record::ZoneRecord;
-
-// We don't actually need parking_lot — std::sync::RwLock works fine for
-// this contention pattern (write is rare, reads are short). Wrap the alias
-// so call sites don't change if we ever want to swap.
-mod parking_lot_compat {
-    pub use std::sync::RwLock;
-}
 
 /// Wire shape of the on-disk snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,7 +50,7 @@ struct Inner {
 
 #[derive(Debug)]
 pub struct ZoneStore {
-    inner: RwLock<Arc<Inner>>,
+    inner: ArcSwap<Inner>,
     snapshot_path: PathBuf,
 }
 
@@ -66,7 +59,7 @@ impl ZoneStore {
     /// disk; call [`Self::load_from_disk`] explicitly to hydrate.
     pub fn new(snapshot_path: PathBuf) -> Self {
         Self {
-            inner: RwLock::new(Arc::new(Inner::default())),
+            inner: ArcSwap::from_pointee(Inner::default()),
             snapshot_path,
         }
     }
@@ -83,14 +76,13 @@ impl ZoneStore {
                         generation: snap.generation,
                         records,
                     };
-                    let mut guard = self.inner.write().expect("zone-store rwlock poisoned");
-                    *guard = Arc::new(new_inner);
                     info!(
                         path = %self.snapshot_path.display(),
-                        generation = guard.generation,
-                        records = guard.records.len(),
+                        generation = new_inner.generation,
+                        records = new_inner.records.len(),
                         "Loaded DNS zone snapshot"
                     );
+                    self.inner.store(Arc::new(new_inner));
                 }
                 Err(e) => {
                     warn!(
@@ -123,19 +115,19 @@ impl ZoneStore {
             generation,
             records: deduplicate_records(records),
         });
-        {
-            let mut guard = self.inner.write().expect("zone-store rwlock poisoned");
-            *guard = new_inner;
-        }
-        self.persist();
+        self.inner.store(Arc::clone(&new_inner));
+        self.persist(&new_inner);
         generation
     }
 
     /// Merge a diff: upsert each record by `id`, drop any with `id` in
     /// `removed_ids`. Bumps the stored generation to `new_generation`.
+    ///
+    /// Must not run concurrently with another write (`replace`/`apply_diff`):
+    /// the store has a single writer, the sync task, and the diff is applied
+    /// to the state that writer last stored.
     pub fn apply_diff(&self, new_generation: i64, upserts: Vec<ZoneRecord>, removed_ids: &[i64]) {
-        let mut guard = self.inner.write().expect("zone-store rwlock poisoned");
-        let current = guard.as_ref();
+        let current = self.inner.load_full();
         // Build the new record list: keep everything not removed and not
         // shadowed by an upsert, then append upserts.
         let upsert_ids: std::collections::HashSet<i64> = upserts.iter().map(|r| r.id).collect();
@@ -149,19 +141,18 @@ impl ZoneStore {
         new_records.extend(upserts);
         let new_records = deduplicate_records(new_records);
 
-        *guard = Arc::new(Inner {
+        let new_inner = Arc::new(Inner {
             generation: new_generation,
             records: new_records,
         });
-        drop(guard);
-        self.persist();
+        self.inner.store(Arc::clone(&new_inner));
+        self.persist(&new_inner);
     }
 
-    /// Snapshot read — cheap clone of the `Arc`, no lock held during use.
+    /// Snapshot read — one atomic load and an `Arc` clone, no lock.
     pub fn snapshot(&self) -> ZoneSnapshot {
-        let guard = self.inner.read().expect("zone-store rwlock poisoned");
         ZoneSnapshot {
-            inner: Arc::clone(&guard),
+            inner: self.inner.load_full(),
         }
     }
 
@@ -169,13 +160,11 @@ impl ZoneStore {
         self.snapshot().generation()
     }
 
-    fn persist(&self) {
-        let snap = {
-            let guard = self.inner.read().expect("zone-store rwlock poisoned");
-            Snapshot {
-                generation: guard.generation,
-                records: guard.records.clone(),
-            }
+    /// Write `state` — the value this writer just stored — to disk.
+    fn persist(&self, state: &Inner) {
+        let snap = Snapshot {
+            generation: state.generation,
+            records: state.records.clone(),
         };
         if let Err(e) = write_atomic(&self.snapshot_path, &snap) {
             warn!(
@@ -434,5 +423,50 @@ mod tests {
 
         assert_eq!(store.generation(), 165);
         assert_eq!(store.snapshot().records().len(), 1);
+    }
+
+    /// Readers see either the old or the new zone, never a torn one, and
+    /// never block on (or panic because of) the writer.
+    #[test]
+    fn readers_see_whole_snapshots_while_the_writer_replaces() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(ZoneStore::new(dir.path().join("zone.json")));
+        store.replace(1, vec![rec(1, "a.temps.local", "10.0.0.1", 1)]);
+
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let store = Arc::clone(&store);
+                std::thread::spawn(move || {
+                    for _ in 0..2_000 {
+                        let snapshot = store.snapshot();
+                        // Every generation this test writes has one record
+                        // whose IP encodes that generation.
+                        let records = snapshot.records();
+                        assert_eq!(records.len(), 1);
+                        let generation = snapshot.generation();
+                        assert_eq!(
+                            records[0].target_ip.as_deref(),
+                            Some(format!("10.0.0.{}", generation).as_str())
+                        );
+                    }
+                })
+            })
+            .collect();
+
+        for generation in 2..60 {
+            store.replace(
+                generation,
+                vec![rec(
+                    1,
+                    "a.temps.local",
+                    &format!("10.0.0.{generation}"),
+                    generation,
+                )],
+            );
+        }
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(store.generation(), 59);
     }
 }

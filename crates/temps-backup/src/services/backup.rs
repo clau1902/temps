@@ -1672,10 +1672,12 @@ pub struct BackupService {
     config_service: Arc<temps_config::ConfigService>,
     encryption_service: Arc<temps_core::EncryptionService>,
     /// Shared workspace `JobQueue` (typically backed by the in-memory
-    /// broadcast service in `temps-queue`). Set once during plugin init
-    /// via `set_queue`. Triggers publish `Job::BackupRequested` here;
-    /// the `BackupJobProcessor` subscribes and dispatches to the executor.
-    queue: std::sync::OnceLock<Arc<dyn temps_core::JobQueue>>,
+    /// broadcast service in `temps-queue`). Required at construction, so a
+    /// plugin-ordering mistake fails at startup (`require_service`) instead
+    /// of panicking on the first backup trigger. Triggers publish
+    /// `Job::BackupRequested` here; the `BackupJobProcessor` subscribes and
+    /// dispatches to the executor.
+    queue: Arc<dyn temps_core::JobQueue>,
 }
 
 impl BackupService {
@@ -1707,6 +1709,7 @@ impl BackupService {
         alarm_service: Arc<AlarmService>,
         serve_config: Arc<temps_config::ConfigService>,
         encryption_service: Arc<temps_core::EncryptionService>,
+        queue: Arc<dyn temps_core::JobQueue>,
     ) -> Self {
         Self {
             db,
@@ -1714,14 +1717,8 @@ impl BackupService {
             alarm_service,
             config_service: serve_config,
             encryption_service,
-            queue: std::sync::OnceLock::new(),
+            queue,
         }
-    }
-
-    /// Wire the workspace `JobQueue` that this service should publish on.
-    /// Called once by `BackupPlugin::register_services`. Idempotent.
-    pub fn set_queue(&self, queue: Arc<dyn temps_core::JobQueue>) {
-        let _ = self.queue.set(queue);
     }
 
     /// Fire-and-forget S3 bucket lifecycle reconcile for the given source.
@@ -1754,13 +1751,6 @@ impl BackupService {
                 }
             }
         });
-    }
-
-    /// Internal accessor — panics if `set_queue` was never called.
-    fn queue(&self) -> &Arc<dyn temps_core::JobQueue> {
-        self.queue
-            .get()
-            .expect("BackupService.queue not set — plugin init did not call set_queue")
     }
 
     async fn sha256_s3_object(
@@ -4747,20 +4737,19 @@ SELECT cp.id
         // Tell anyone cataloging this instance's backups elsewhere. Best
         // effort: the deletion is done either way, and the Cloud mirror has
         // its own presence check for events that never arrive.
-        if let Some(queue) = self.queue.get() {
-            if let Err(error) = queue
-                .send(temps_core::Job::BackupDeleted(
-                    temps_core::BackupDeletedJob {
-                        backup_id: backup.id,
-                        backup_uuid: backup.backup_id.clone(),
-                        engine: engine.to_string(),
-                        s3_location: backup.s3_location.clone(),
-                    },
-                ))
-                .await
-            {
-                warn!(backup_id = %backup.backup_id, error = %error, "could not publish BackupDeleted");
-            }
+        if let Err(error) = self
+            .queue
+            .send(temps_core::Job::BackupDeleted(
+                temps_core::BackupDeletedJob {
+                    backup_id: backup.id,
+                    backup_uuid: backup.backup_id.clone(),
+                    engine: engine.to_string(),
+                    s3_location: backup.s3_location.clone(),
+                },
+            ))
+            .await
+        {
+            warn!(backup_id = %backup.backup_id, error = %error, "could not publish BackupDeleted");
         }
         Ok((backup, deleted_objects))
     }
@@ -7207,7 +7196,7 @@ OFFSET $3
         // marked the row as failed; this signal stops the running
         // container so the sidecar gets reaped promptly.
         if let Err(e) = self
-            .queue()
+            .queue
             .send(temps_core::Job::BackupCancelRequested(
                 temps_core::BackupCancelRequestedJob { backup_id },
             ))
@@ -7280,7 +7269,7 @@ OFFSET $3
 
         // Publish a cancel signal per live child so any in-flight engine
         // tasks fire their cancel tokens and exit cleanly.
-        let queue = self.queue();
+        let queue = &self.queue;
         for child in live_children {
             if let Err(e) = queue
                 .send(temps_core::Job::BackupCancelRequested(
@@ -7747,7 +7736,7 @@ RETURNING id
         // ── Publish queue messages after commit ───────────────────────────────
         // Publishing after commit guarantees the consumer never dispatches
         // an engine against a backups row that the txn might roll back.
-        let queue = self.queue();
+        let queue = &self.queue;
         for req in deferred_messages {
             let backup_id = req.backup_id;
             if let Err(e) = queue.send(temps_core::Job::BackupRequested(req)).await {
@@ -7830,7 +7819,7 @@ RETURNING id
         // `pending`; the next boot's reconcile will flip it to `failed`.
         let max_runtime_secs = trigger.max_runtime_secs.unwrap_or(4 * 60 * 60);
         if let Err(e) = self
-            .queue()
+            .queue
             .send(temps_core::Job::BackupRequested(
                 temps_core::BackupRequestedJob {
                     backup_id,
@@ -8069,7 +8058,7 @@ RETURNING id
         let backup_id = parent.id;
         let max_runtime_secs = trigger.max_runtime_secs.unwrap_or(4 * 60 * 60);
         if let Err(e) = self
-            .queue()
+            .queue
             .send(temps_core::Job::BackupRequested(
                 temps_core::BackupRequestedJob {
                     backup_id,
@@ -10147,6 +10136,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         )
     }
 
@@ -11787,6 +11777,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let s3_source = S3Source {
@@ -11829,6 +11820,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         // Valid schedule: every day at 2 AM (24 hours apart) - cron format with seconds
@@ -11856,6 +11848,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         // Invalid schedule: every 30 minutes (too frequent) - cron format with seconds
@@ -11888,6 +11881,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         // Invalid cron expression
@@ -11914,6 +11908,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let result = backup_service.list_s3_sources().await;
@@ -11966,6 +11961,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let request = CreateS3SourceRequest {
@@ -12007,6 +12003,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let request = CreateS3SourceRequest {
@@ -12051,6 +12048,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let result = backup_service.list_backup_schedules().await;
@@ -12077,6 +12075,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let result = backup_service.get_s3_source(999).await;
@@ -12106,6 +12105,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let result = backup_service.get_backup_schedule(999).await;
@@ -12205,15 +12205,15 @@ mod tests {
 
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let published = Arc::new(RecordingJobQueue::new());
         let backup_service = BackupService::new(
             test_db.db.clone(),
             external_service_manager,
             alarm_service,
             config_service,
             encryption_service,
+            published.clone(),
         );
-        let published = Arc::new(RecordingJobQueue::new());
-        backup_service.set_queue(published.clone());
 
         // Create a test user for backup operations
         use sea_orm::{ActiveModelTrait, Set};
@@ -12627,6 +12627,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let s3_source = backup_service
@@ -12864,6 +12865,7 @@ mod tests {
             alarm_service.clone(),
             source_config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         // Create a test user in source database
@@ -12993,6 +12995,7 @@ mod tests {
             alarm_service,
             target_config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         // Create the S3 source in the target database
@@ -13192,6 +13195,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let request = CreateS3SourceRequest {
@@ -13240,6 +13244,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let request = CreateS3SourceRequest {
@@ -13288,6 +13293,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         let invalid_request = CreateS3SourceRequest {
@@ -13694,6 +13700,7 @@ mod tests {
             alarm_service,
             config_service,
             encryption_service,
+            Arc::new(NoopJobQueue),
         );
 
         // DB-only path (include_s3_scan = false) — no S3 access in tests.
@@ -13743,6 +13750,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         )
     }
 
@@ -13840,6 +13848,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let request = UpdateBackupScheduleRequest {
@@ -13900,6 +13909,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let request = UpdateBackupScheduleRequest {
@@ -13959,6 +13969,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let request = UpdateBackupScheduleRequest {
@@ -14228,6 +14239,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let request = UpdateBackupScheduleRequest {
@@ -14332,6 +14344,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let response = svc
@@ -14373,6 +14386,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         // page=-5 must be treated as page=1 (offset=0).
@@ -14407,6 +14421,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         // page_size=999 must be clamped to 100. The call itself must succeed.
@@ -14434,6 +14449,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let result = svc.list_schedule_runs(9999, 1, 20).await;
@@ -14659,6 +14675,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let report = service
@@ -14698,6 +14715,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let error = service
@@ -14726,6 +14744,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
         let expected = vec!["uuid-42".to_string()];
 
@@ -14805,6 +14824,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let children = svc
@@ -14842,6 +14862,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let children = svc
@@ -14869,6 +14890,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let result = svc.list_child_backups(9999).await;
@@ -14916,6 +14938,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         ))
     }
 
@@ -15023,6 +15046,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let schedule = service
@@ -15264,6 +15288,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         // 1) Attach both services.
@@ -15446,6 +15471,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         // Attach svc-a to the specific schedule.
@@ -15597,6 +15623,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let request = CreateBackupScheduleRequest {
@@ -15676,6 +15703,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         let result = svc.reconcile_default_external_service_schedules().await;
@@ -15765,6 +15793,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         svc.reconcile_default_external_service_schedules()
@@ -15943,6 +15972,7 @@ mod tests {
             create_mock_alarm_service(),
             create_mock_config_service(),
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap()),
+            Arc::new(NoopJobQueue),
         );
 
         svc.attach_services_to_schedule(schedule.id, &[svc_pg.id])
@@ -16188,6 +16218,7 @@ mod tests {
                 EncryptionService::new("test_encryption_key_1234567890ab")
                     .expect("test encryption key"),
             ),
+            Arc::new(NoopJobQueue),
         );
 
         svc.update_backup_schedule(
