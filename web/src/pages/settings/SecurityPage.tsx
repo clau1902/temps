@@ -14,6 +14,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { AdminGateCard } from '@/components/settings/AdminGateCard'
 import { SecuritySettings } from '@/components/settings/SecuritySettings'
+import { DEFAULT_RATE_LIMITING } from '@/components/settings/rate-limiting'
 import { ShieldPlatformSettings } from '@/components/settings/ShieldPlatformSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -69,13 +70,7 @@ export function SecurityPage() {
         referrer_policy: 'strict-origin-when-cross-origin',
         permissions_policy: null,
       },
-      rate_limiting: {
-        enabled: false,
-        max_requests_per_minute: 60,
-        max_requests_per_hour: 1000,
-        whitelist_ips: [],
-        blacklist_ips: [],
-      },
+      rate_limiting: DEFAULT_RATE_LIMITING,
       trust_loopback_forwarded_ip: false,
       loopback_ja4_header: '',
       trusted_private_networks_text: '',
@@ -115,13 +110,7 @@ export function SecurityPage() {
             referrer_policy: 'strict-origin-when-cross-origin',
             permissions_policy: null,
           },
-          rate_limiting: settings.rate_limiting || {
-            enabled: false,
-            max_requests_per_minute: 60,
-            max_requests_per_hour: 1000,
-            whitelist_ips: [],
-            blacklist_ips: [],
-          },
+          rate_limiting: settings.rate_limiting || DEFAULT_RATE_LIMITING,
           trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
           loopback_ja4_header: settings.loopback_ja4_header ?? '',
           trusted_private_networks_text: (

@@ -2,19 +2,20 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { PageHeader, SaveRow, SettingsSection } from '@temps-sdk/ds'
+import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { RateLimitFields } from '@/components/settings/RateLimitFields'
+import {
+  DEFAULT_RATE_LIMITING,
+  RATE_LIMITING_DESCRIPTION,
+} from '@/components/settings/rate-limiting'
 import { isForbiddenRead } from '@/lib/read-failure'
-import { Button } from '@/components/ui/button'
 
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { Separator } from '@/components/ui/separator'
-import { Switch } from '@/components/ui/switch'
 import { IpAccessControl } from '@/components/settings/IpAccessControl'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
-import { ListFilter, Loader2, Plus, Shield, Trash2 } from 'lucide-react'
+import { Gauge, ListFilter } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -30,22 +31,13 @@ export function RateLimitingPage() {
   const updateSettings = useUpdateSettings()
 
   const {
-    register,
     handleSubmit,
     control,
     formState: { isDirty, isSubmitting },
     reset,
     setValue,
   } = useForm<RateLimitingFormData>({
-    defaultValues: {
-      rate_limiting: {
-        enabled: false,
-        max_requests_per_minute: 60,
-        max_requests_per_hour: 1000,
-        whitelist_ips: [],
-        blacklist_ips: [],
-      },
-    },
+    defaultValues: { rate_limiting: DEFAULT_RATE_LIMITING },
   })
 
   const rateLimiting = useWatch({ control, name: 'rate_limiting' })
@@ -62,13 +54,7 @@ export function RateLimitingPage() {
   useEffect(() => {
     if (settings) {
       reset({
-        rate_limiting: settings.rate_limiting || {
-          enabled: false,
-          max_requests_per_minute: 60,
-          max_requests_per_hour: 1000,
-          whitelist_ips: [],
-          blacklist_ips: [],
-        },
+        rate_limiting: settings.rate_limiting || DEFAULT_RATE_LIMITING,
       })
     }
   }, [settings, reset])
@@ -83,35 +69,8 @@ export function RateLimitingPage() {
     }
   }
 
-  const handleAddWhitelistIp = () => {
-    const current = rateLimiting?.whitelist_ips || []
-    setValue('rate_limiting.whitelist_ips', [...current, ''], {
-      shouldDirty: true,
-    })
-  }
-
-  const handleRemoveWhitelistIp = (index: number) => {
-    const current = rateLimiting?.whitelist_ips || []
-    setValue(
-      'rate_limiting.whitelist_ips',
-      current.filter((_: string, i: number) => i !== index),
-      { shouldDirty: true }
-    )
-  }
-
-  const handleUpdateWhitelistIp = (index: number, value: string) => {
-    const current = rateLimiting?.whitelist_ips || []
-    const updated = [...current]
-    updated[index] = value
-    setValue('rate_limiting.whitelist_ips', updated, { shouldDirty: true })
-  }
-
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center min-h-[400px]">
-        <Loader2 className="h-8 w-8 animate-spin" />
-      </div>
-    )
+    return <SettingsFormSkeleton label="Loading rate limiting settings" />
   }
 
   if (error) {
@@ -128,115 +87,15 @@ export function RateLimitingPage() {
       <PageHeader title="Rate limiting" />
       <SettingsSection
         title="Requests per IP"
-        description="Limit how many requests each IP address can make"
-        icon={Shield}
+        description={RATE_LIMITING_DESCRIPTION}
+        icon={Gauge}
       >
-        <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="rate-limiting-enabled">
-                Enable rate limiting
-              </Label>
-              <p className="text-sm text-muted-foreground">
-                Limit requests per IP address
-              </p>
-            </div>
-            <Switch
-              id="rate-limiting-enabled"
-              checked={rateLimiting?.enabled}
-              onCheckedChange={(checked) =>
-                setValue('rate_limiting.enabled', checked, {
-                  shouldDirty: true,
-                })
-              }
-            />
-          </div>
-
-          {rateLimiting?.enabled && (
-            <>
-              <Separator />
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="max-requests-per-minute">
-                    Max requests per minute
-                  </Label>
-                  <Input
-                    id="max-requests-per-minute"
-                    type="number"
-                    min="1"
-                    placeholder="60"
-                    {...register('rate_limiting.max_requests_per_minute', {
-                      valueAsNumber: true,
-                    })}
-                  />
-                  <p className="text-sm text-muted-foreground">
-                    Maximum requests allowed per IP per minute
-                  </p>
-                </div>
-
-                <div className="space-y-2">
-                  <Label htmlFor="max-requests-per-hour">
-                    Max requests per hour
-                  </Label>
-                  <Input
-                    id="max-requests-per-hour"
-                    type="number"
-                    min="1"
-                    placeholder="1000"
-                    {...register('rate_limiting.max_requests_per_hour', {
-                      valueAsNumber: true,
-                    })}
-                  />
-                  <p className="text-sm text-muted-foreground">
-                    Maximum requests allowed per IP per hour
-                  </p>
-                </div>
-              </div>
-
-              <Separator />
-
-              <div>
-                <Label>Whitelist IPs</Label>
-                <p className="text-sm text-muted-foreground mb-2">
-                  IPs that bypass rate limiting
-                </p>
-                <div className="space-y-2">
-                  {(rateLimiting?.whitelist_ips || []).map(
-                    (ip: string, index: number) => (
-                      <div key={`whitelist-${index}`} className="flex gap-2">
-                        <Input
-                          value={ip}
-                          onChange={(e) =>
-                            handleUpdateWhitelistIp(index, e.target.value)
-                          }
-                          placeholder="192.168.1.1 or 10.0.0.0/24"
-                        />
-                        <Button
-                          aria-label="Remove IP address"
-                          type="button"
-                          variant="outline"
-                          size="icon"
-                          onClick={() => handleRemoveWhitelistIp(index)}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    )
-                  )}
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    onClick={handleAddWhitelistIp}
-                  >
-                    <Plus className="h-4 w-4 mr-2" />
-                    Add whitelist IP
-                  </Button>
-                </div>
-              </div>
-            </>
-          )}
-        </div>
+        <RateLimitFields
+          value={rateLimiting}
+          onChange={(next) =>
+            setValue('rate_limiting', next, { shouldDirty: true })
+          }
+        />
       </SettingsSection>
 
       <SaveRow dirty={isDirty} saving={isSubmitting} />

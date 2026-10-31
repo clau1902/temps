@@ -15,7 +15,6 @@ import {
   Key,
   KeyRound,
   LockKeyhole,
-  Monitor,
   Network,
   RadioTower,
   Server,
@@ -143,7 +142,7 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         icon: Network,
         keywords: ['egress', 'ingress', 'firewall', 'rules', 'isolation'],
       },
-      { title: 'Rate limiting', url: '/settings/rate-limiting', icon: Monitor },
+      { title: 'Rate limiting', url: '/settings/rate-limiting', icon: Gauge },
       {
         title: 'Disk monitoring',
         url: '/settings/disk-monitoring',
