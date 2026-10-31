@@ -1059,21 +1059,6 @@ impl TestDatabase {
         Ok(test_db)
     }
 
-    /// Create a test database with custom configuration
-    ///
-    /// Note: This method now creates an isolated container.
-    /// Use `new()` for shared container (recommended) or `new_isolated()` for explicit isolation.
-    #[deprecated(
-        note = "Use TestDatabase::new() for shared container or TestDatabase::new_isolated_with_config() for isolated container"
-    )]
-    pub async fn with_config(
-        db_name: &str,
-        username: &str,
-        password: &str,
-    ) -> anyhow::Result<Self> {
-        Self::new_isolated_with_config(db_name, username, password).await
-    }
-
     /// Create a test database and run migrations
     ///
     /// This is a convenience method that uses temps_migrations::Migrator.

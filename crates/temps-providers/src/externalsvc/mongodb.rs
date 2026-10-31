@@ -1087,18 +1087,6 @@ impl MongodbService {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn list_databases(&self) -> Result<Vec<String>> {
-        let client = self.get_mongo_client().await?;
-
-        let databases = client
-            .list_database_names()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to list MongoDB databases: {}", e))?;
-
-        Ok(databases)
-    }
-
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     #[allow(dead_code)]

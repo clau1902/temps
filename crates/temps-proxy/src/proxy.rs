@@ -3085,30 +3085,6 @@ impl LoadBalancer {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn is_page_visit(&self, upstream_response: &ResponseHeader, _ctx: &ProxyContext) -> bool {
-        let mut is_page_visit = upstream_response
-            .headers
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|content_type| {
-                content_type.starts_with("text/html")
-                    || content_type.starts_with("text/plain")
-                    || content_type.starts_with("application/json")
-            })
-            .unwrap_or(false);
-
-        // Note: Removed is_web_app check - all projects are now preset-based
-        // Page visits are determined by URL patterns
-
-        let status_code = upstream_response.status.as_u16();
-        if status_code >= 400 {
-            is_page_visit = true;
-        }
-
-        is_page_visit
-    }
-
     fn add_response_timing(
         &self,
         upstream_response: &mut ResponseHeader,

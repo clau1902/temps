@@ -53,9 +53,6 @@ mod workload_ops;
 pub use workload_ops::{
     RecreateOutcome, WorkloadModeChange, WorkloadModeStatus, SHADOW_BATCH, SHADOW_INTERVAL,
 };
-// Add these constants at the top of the file proper key management
-#[allow(dead_code)]
-const NONCE_LENGTH: usize = 12;
 
 /// Local cluster ports are published on Docker's IPv4 loopback interface.
 /// Keep control-plane connections on the same address: `localhost` may resolve
