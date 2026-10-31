@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
@@ -207,8 +207,13 @@ fn host_config_missing_init(host_config: &bollard::models::HostConfig) -> bool {
 }
 
 fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
-    let metadata: serde_json::Value = serde_json::from_str(&backup.metadata)
-        .with_context(|| format!("Backup {} has invalid metadata JSON", backup.backup_id))?;
+    let metadata: serde_json::Value = serde_json::from_str(&backup.metadata).map_err(|e| {
+        anyhow::anyhow!(
+            "Backup {} has invalid metadata JSON: {}",
+            backup.backup_id,
+            e
+        )
+    })?;
     let Some(version) = metadata.get("walg_identity_version") else {
         return Ok(None);
     };
@@ -235,10 +240,11 @@ fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Opti
             backup.backup_id
         ));
     }
-    Ok(Some(serde_json::to_string(value).with_context(|| {
-        format!(
-            "Failed to serialize WAL-G target user data for backup {}",
-            backup.backup_id
+    Ok(Some(serde_json::to_string(value).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to serialize WAL-G target user data for backup {}: {}",
+            backup.backup_id,
+            e
         )
     })?))
 }
@@ -556,6 +562,10 @@ fn parse_extra_allowed_images(raw: &str) -> (Vec<String>, Vec<String>) {
 fn extra_allowed_postgres_docker_images() -> &'static [String] {
     static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     EXTRA.get_or_init(|| {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "documented host-level operator policy: TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES (CLAUDE.md env table)"
+        )]
         let Ok(raw) = std::env::var(EXTRA_POSTGRES_IMAGES_ENV) else {
             return Vec::new();
         };
@@ -4118,8 +4128,13 @@ impl ExternalService for PostgresService {
 
         // Serialize the full runtime config to save to database
         // This ensures auto-generated values (password, port) are persisted
-        let runtime_config_json = serde_json::to_value(&postgres_config)
-            .context("Failed to serialize PostgreSQL runtime config")?;
+        let runtime_config_json = serde_json::to_value(&postgres_config).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to serialize PostgreSQL runtime config for service {}: {}",
+                self.name,
+                e
+            )
+        })?;
 
         let runtime_config_map = runtime_config_json
             .as_object()
@@ -4297,15 +4312,24 @@ impl ExternalService for PostgresService {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let username = parameters
-            .get("username")
-            .context("Missing username parameter")?;
-        let password = parameters
-            .get("password")
-            .context("Missing password parameter")?;
-        let database = parameters
-            .get("database")
-            .context("Missing database parameter")?;
+        let username = parameters.get("username").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing username parameter for PostgreSQL service {}",
+                self.name
+            )
+        })?;
+        let password = parameters.get("password").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing password parameter for PostgreSQL service {}",
+                self.name
+            )
+        })?;
+        let database = parameters.get("database").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing database parameter for PostgreSQL service {}",
+                self.name
+            )
+        })?;
 
         // Always use container name and internal port for container-to-container
         // communication. An imported service's real container name (stored raw
@@ -4394,7 +4418,13 @@ impl ExternalService for PostgresService {
                         None::<bollard::query_parameters::StartContainerOptions>,
                     )
                     .await
-                    .context("Failed to start imported PostgreSQL container")?;
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "Failed to start imported PostgreSQL container {}: {}",
+                            container_name,
+                            e
+                        )
+                    })?;
             }
             self.wait_for_container_health(&self.docker, &container_name)
                 .await?;
@@ -4557,8 +4587,11 @@ impl ExternalService for PostgresService {
                         // "already started" is benign — we raced ourselves.
                         let error_msg = e.to_string();
                         if !error_msg.contains("already started") {
-                            return Err(e)
-                                .context("Failed to start existing PostgreSQL container")?;
+                            return Err(anyhow::anyhow!(
+                                "Failed to start existing PostgreSQL container {}: {}",
+                                container_name,
+                                e
+                            ));
                         }
                         info!("PostgreSQL container {} is already started", container_name);
                     }
@@ -4673,7 +4706,13 @@ impl ExternalService for PostgresService {
             self.docker
                 .stop_container(&container_name, None::<StopContainerOptions>)
                 .await
-                .context("Failed to stop PostgreSQL container")?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to stop PostgreSQL container {}: {}",
+                        container_name,
+                        e
+                    )
+                })?;
 
             // Remove the container
             self.docker
@@ -4685,7 +4724,13 @@ impl ExternalService for PostgresService {
                     }),
                 )
                 .await
-                .context("Failed to remove PostgreSQL container")?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to remove PostgreSQL container {}: {}",
+                        container_name,
+                        e
+                    )
+                })?;
         }
 
         // Remove volume
@@ -4710,15 +4755,24 @@ impl ExternalService for PostgresService {
     ) -> Result<HashMap<String, String>> {
         let mut env_vars = HashMap::new();
 
-        let database = parameters
-            .get("database")
-            .context("Missing database parameter")?;
-        let username = parameters
-            .get("username")
-            .context("Missing username parameter")?;
-        let password = parameters
-            .get("password")
-            .context("Missing password parameter")?;
+        let database = parameters.get("database").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing database parameter for PostgreSQL service {}",
+                self.name
+            )
+        })?;
+        let username = parameters.get("username").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing username parameter for PostgreSQL service {}",
+                self.name
+            )
+        })?;
+        let password = parameters.get("password").ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing password parameter for PostgreSQL service {}",
+                self.name
+            )
+        })?;
 
         // Always use container name and internal port for container-to-container
         // communication. An imported service's real container name (stored raw

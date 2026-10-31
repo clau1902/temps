@@ -3260,7 +3260,8 @@ SELECT cp.id
         // to buffer the chunked transfer encoding internally, leading to unbounded memory
         // growth (19+ GB) even when we weren't reading stdout data.
         // Instead we redirect stderr to a file inside the container and poll for completion.
-        let stderr_path = format!("/backup/{}.stderr", uuid::Uuid::new_v4());
+        let stderr_file_name = format!("{}.stderr", uuid::Uuid::new_v4());
+        let stderr_path = format!("/backup/{}", stderr_file_name);
         // pg_dumpall dumps the entire cluster: all databases, roles, and tablespaces.
         // `--database` is only the bootstrap connection target used to enumerate DBs.
         let pg_dump_shell_cmd = format!(
@@ -3306,8 +3307,7 @@ SELECT cp.id
         }
 
         // Read stderr from the file inside the container (via bind mount on host)
-        let host_stderr_path =
-            backup_dir.join(std::path::Path::new(&stderr_path).file_name().unwrap());
+        let host_stderr_path = backup_dir.join(&stderr_file_name);
         let stderr_data = tokio::fs::read(&host_stderr_path).await.unwrap_or_default();
         let _ = tokio::fs::remove_file(&host_stderr_path).await;
 
@@ -3846,7 +3846,8 @@ SELECT cp.id
         );
 
         // Capture stderr in a file for diagnostics
-        let stderr_path = format!("/restore/{}.stderr", uuid::Uuid::new_v4());
+        let stderr_file_name = format!("{}.stderr", uuid::Uuid::new_v4());
+        let stderr_path = format!("/restore/{}", stderr_file_name);
         let full_cmd = format!("{} 2>{}", restore_cmd, stderr_path);
 
         let exec = docker
@@ -3898,8 +3899,7 @@ SELECT cp.id
         }
 
         // Read stderr from bind mount for diagnostics
-        let host_stderr_path =
-            restore_dir.join(std::path::Path::new(&stderr_path).file_name().unwrap());
+        let host_stderr_path = restore_dir.join(&stderr_file_name);
         let stderr_data = tokio::fs::read(&host_stderr_path).await.unwrap_or_default();
         let _ = tokio::fs::remove_file(&host_stderr_path).await;
 
@@ -9524,11 +9524,9 @@ ORDER BY a.opened_at DESC
                 // Sleep until next hour or cancellation
                 let next_hour = (now + chrono::Duration::hours(1))
                     .with_minute(0)
-                    .unwrap()
-                    .with_second(0)
-                    .unwrap()
-                    .with_nanosecond(0)
-                    .unwrap();
+                    .and_then(|t| t.with_second(0))
+                    .and_then(|t| t.with_nanosecond(0))
+                    .unwrap_or(now + chrono::Duration::hours(1));
                 let sleep_duration = next_hour - now;
 
                 tokio::select! {
@@ -9571,11 +9569,9 @@ ORDER BY a.opened_at DESC
             // Sleep until next hour or cancellation
             let next_hour = (now + chrono::Duration::hours(1))
                 .with_minute(0)
-                .unwrap()
-                .with_second(0)
-                .unwrap()
-                .with_nanosecond(0)
-                .unwrap();
+                .and_then(|t| t.with_second(0))
+                .and_then(|t| t.with_nanosecond(0))
+                .unwrap_or(now + chrono::Duration::hours(1));
             let sleep_duration = next_hour - now;
 
             tokio::select! {
@@ -11376,7 +11372,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires system TLS certificates (fails on some macOS configurations)
     async fn delete_backup_model_removes_failed_backup_with_no_remote_artifact() {
         // Regression test: a backup whose upload never completed (state
         // "failed") has no s3_location on the parent row or any child
@@ -11773,7 +11768,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires system TLS certificates (fails on some macOS configurations)
     async fn test_create_s3_client() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
 
@@ -11928,7 +11922,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires system TLS certificates (fails on some macOS configurations)
+    #[ignore = "known broken: create_s3_source now probes the endpoint, so this MockDatabase test needs a live S3 on localhost:9000 that accepts its fixed key; port it to a stub S3 server"]
     async fn test_create_s3_source() {
         let s3_source = s3_sources::Model {
             id: 1,
@@ -11988,7 +11982,11 @@ mod tests {
         };
 
         let result = backup_service.create_s3_source(request).await;
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "create_s3_source failed: {:?}",
+            result.as_ref().err()
+        );
         let source = result.unwrap();
         assert_eq!(source.name, "test-source");
         assert_eq!(source.bucket_name, "test-bucket");
@@ -13180,7 +13178,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires system TLS certificates (fails on some macOS configurations)
     async fn test_create_s3_client_from_request_valid() {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
@@ -13218,8 +13215,18 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires actual S3 connection
     async fn test_create_s3_source_with_bucket_creation() {
+        // Needs a MinIO on localhost:9000; skip at runtime without one
+        // (CLAUDE.md: no `#[ignore]` on tests that need a service).
+        let minio = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::net::TcpStream::connect("127.0.0.1:9000"),
+        )
+        .await;
+        if !matches!(minio, Ok(Ok(_))) {
+            println!("MinIO not reachable on localhost:9000, skipping");
+            return;
+        }
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let external_service_manager = create_mock_external_service_manager(db.clone());
         let alarm_service = create_mock_alarm_service();

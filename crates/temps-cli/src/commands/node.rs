@@ -179,14 +179,14 @@ fn api_url(base: &str, path: &str) -> String {
     management_api_url(base, &format!("/internal{}", path))
 }
 
-fn make_client() -> reqwest::Client {
+fn make_client() -> anyhow::Result<reqwest::Client> {
     // Strict TLS — CLI talks to the control plane over the public
     // internet. Skipping verification here would let a MitM steal the
     // user's session token. The server-side opt-in (AppSettings.insecure_tls)
     // does NOT apply to CLI binaries.
     reqwest::Client::builder()
         .build()
-        .expect("Failed to build HTTP client")
+        .map_err(|e| anyhow::anyhow!("Failed to build HTTP client for the control-plane API: {e}"))
 }
 
 async fn handle_api_error(response: reqwest::Response) -> anyhow::Error {
@@ -242,7 +242,7 @@ impl NodeCommand {
 }
 
 async fn execute_list(cmd: NodeListCommand) -> anyhow::Result<()> {
-    let client = make_client();
+    let client = make_client()?;
     let url = api_url(&cmd.api_url, "/nodes");
 
     let response = client
@@ -308,7 +308,7 @@ async fn execute_list(cmd: NodeListCommand) -> anyhow::Result<()> {
 }
 
 async fn execute_show(cmd: NodeShowCommand) -> anyhow::Result<()> {
-    let client = make_client();
+    let client = make_client()?;
 
     let node_url = api_url(&cmd.api_url, &format!("/nodes/{}", cmd.node_id));
     let containers_url = api_url(&cmd.api_url, &format!("/nodes/{}/containers", cmd.node_id));
@@ -395,7 +395,7 @@ async fn execute_show(cmd: NodeShowCommand) -> anyhow::Result<()> {
 }
 
 async fn execute_drain(cmd: NodeDrainCommand) -> anyhow::Result<()> {
-    let client = make_client();
+    let client = make_client()?;
     let url = api_url(&cmd.api_url, &format!("/nodes/{}/drain", cmd.node_id));
 
     println!(
@@ -506,7 +506,7 @@ struct UndrainNodeResponse {
 }
 
 async fn execute_undrain(cmd: NodeUndrainCommand) -> anyhow::Result<()> {
-    let client = make_client();
+    let client = make_client()?;
     let url = api_url(&cmd.api_url, &format!("/nodes/{}/drain", cmd.node_id));
 
     println!(
@@ -542,7 +542,7 @@ async fn execute_undrain(cmd: NodeUndrainCommand) -> anyhow::Result<()> {
 async fn execute_remove(cmd: NodeRemoveCommand) -> anyhow::Result<()> {
     if !cmd.yes {
         // Show node info first
-        let client = make_client();
+        let client = make_client()?;
         let show_url = api_url(&cmd.api_url, &format!("/nodes/{}", cmd.node_id));
         let resp = client
             .get(&show_url)
@@ -572,7 +572,7 @@ async fn execute_remove(cmd: NodeRemoveCommand) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let client = make_client();
+    let client = make_client()?;
     let mut url = api_url(&cmd.api_url, &format!("/nodes/{}", cmd.node_id));
     if cmd.force {
         url.push_str("?force=true");

@@ -78,7 +78,14 @@ impl SandboxProvider for LocalSandboxProvider {
             reason: format!("Failed to spawn process: {}", e),
         })?;
 
-        let stdout_handle = child.stdout.take().expect("stdout was piped");
+        let stdout_handle = child
+            .stdout
+            .take()
+            .ok_or_else(|| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: handle.sandbox_id.clone(),
+                reason: format!("Spawned process '{}' has no piped stdout handle", cmd[0]),
+            })?;
 
         let stream_task = tokio::spawn(async move {
             let reader = BufReader::new(stdout_handle);

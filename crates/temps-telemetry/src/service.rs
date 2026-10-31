@@ -133,6 +133,10 @@ impl TelemetryService {
     ) -> Result<Self, TelemetryInitError> {
         let version = temps_version.into();
         let env_opted_out = !Self::enabled_from_env();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_TELEMETRY_ENDPOINT"
+        )]
         let endpoint = std::env::var("TEMPS_TELEMETRY_ENDPOINT")
             .ok()
             .filter(|s| !s.is_empty())
@@ -249,6 +253,10 @@ impl TelemetryService {
 
     /// Read the `TEMPS_TELEMETRY` opt-out flag. Enabled by default; treats
     /// `0`/`false`/`off`/`no`/`disabled` (case-insensitive) as opt-out.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_TELEMETRY"
+    )]
     pub fn enabled_from_env() -> bool {
         match std::env::var("TEMPS_TELEMETRY") {
             Ok(v) => !matches!(

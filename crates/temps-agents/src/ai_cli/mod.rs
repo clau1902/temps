@@ -53,6 +53,10 @@ pub(crate) fn sanitize_command_environment(command: &mut Command) {
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
     ];
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "subprocess passthrough: forwards an allow-listed subset of the operator's environment to the AI CLI child process"
+    )]
     let preserved = ALLOWED
         .iter()
         .filter_map(|name| std::env::var_os(name).map(|value| (*name, value)))
@@ -61,10 +65,31 @@ pub(crate) fn sanitize_command_environment(command: &mut Command) {
     command.envs(preserved);
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "subprocess passthrough: copies one named variable from the operator's environment into the AI CLI child process"
+)]
 pub(crate) fn copy_environment_variable(command: &mut Command, name: &str) {
     if let Some(value) = std::env::var_os(name) {
         command.env(name, value);
     }
+}
+
+/// Take a stdio handle that was configured with `Stdio::piped()` from a
+/// spawned AI CLI child. Tokio only leaves it `None` when the stream was not
+/// piped or was already taken, so this is a programming error surfaced as a
+/// typed error naming the CLI and the stream instead of a panic.
+pub(crate) fn take_piped<T>(
+    handle: Option<T>,
+    provider: &str,
+    stream: &str,
+) -> Result<T, AgentError> {
+    handle.ok_or_else(|| {
+        AgentError::Io(std::io::Error::other(format!(
+            "AI CLI '{}' child process has no piped {} handle (not configured as piped or already taken)",
+            provider, stream
+        )))
+    })
 }
 
 /// Callback invoked for each line of AI CLI output (for real-time streaming)

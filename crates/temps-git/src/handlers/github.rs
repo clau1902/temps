@@ -158,7 +158,10 @@ async fn handle_manifest_conversion_with_source(
             );
 
             let mut response_headers = HeaderMap::new();
-            response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+            response_headers.insert(
+                "Cache-Control",
+                axum::http::HeaderValue::from_static("no-store"),
+            );
 
             Ok((response_headers, Redirect::to(&redirect_url)))
         }
@@ -945,7 +948,10 @@ async fn github_app_auth_callback(
         };
 
         let mut response_headers = HeaderMap::new();
-        response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+        response_headers.insert(
+            "Cache-Control",
+            axum::http::HeaderValue::from_static("no-store"),
+        );
 
         return Ok((response_headers, Redirect::to(&redirect_url)));
     }
@@ -969,7 +975,10 @@ async fn github_app_auth_callback(
     let redirect_url = format!("{}/dashboard", external_url);
 
     let mut response_headers = HeaderMap::new();
-    response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+    response_headers.insert(
+        "Cache-Control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
 
     Ok((response_headers, Redirect::to(&redirect_url)))
 }
@@ -1063,7 +1072,10 @@ async fn github_app_installation_callback(
     let redirect_url = format!("{}/dashboard", external_url);
 
     let mut response_headers = HeaderMap::new();
-    response_headers.insert("Cache-Control", "no-store".parse().unwrap());
+    response_headers.insert(
+        "Cache-Control",
+        axum::http::HeaderValue::from_static("no-store"),
+    );
 
     Ok((response_headers, Redirect::to(&redirect_url)))
 }

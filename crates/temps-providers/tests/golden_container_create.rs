@@ -11,6 +11,15 @@
 //! (`temps-agent`'s `create_service`) differs today (defect 1).
 //! `TEMPS_UPDATE_GOLDEN=1` rewrites them.
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

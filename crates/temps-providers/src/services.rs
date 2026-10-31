@@ -10727,9 +10727,10 @@ echo "[restore] Pre-seed complete"
         // makes delete+add idempotent from the cluster's point of view.
         let used_ordinals: std::collections::BTreeSet<i32> =
             existing_members.iter().map(|m| m.ordinal).collect();
-        let next_ordinal: i32 = (1..)
-            .find(|n| !used_ordinals.contains(n))
-            .expect("ordinal range is unbounded");
+        let mut next_ordinal: i32 = 1;
+        while used_ordinals.contains(&next_ordinal) {
+            next_ordinal += 1;
+        }
 
         let has_any_remote =
             existing_members.iter().any(|m| m.node_id.is_some()) || node_id.is_some();
@@ -26617,7 +26618,10 @@ mod tests {
 /// loopback, which is exactly what `--private-address` is on a real host.
 ///
 /// Run: `cargo test --lib -p temps-providers --features docker-tests -- cross_host_cluster_docker`
-#[cfg(all(test, feature = "docker-tests"))]
+// Two attributes rather than `cfg(all(test, ..))`: clippy only applies
+// `allow-unwrap-in-tests` when it sees a top-level `cfg(test)`.
+#[cfg(test)]
+#[cfg(feature = "docker-tests")]
 mod cross_host_cluster_docker_tests {
     use super::*;
     use crate::externalsvc::postgres_cluster::{

@@ -285,6 +285,10 @@ const TEMPLATE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 
 /// Identifies this test run, so every process of one nextest run shares one
 /// template and no run can reuse a template built from different migrations.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test/dev-only toggle: NEXTEST_RUN_ID is set by the test runner; this module is test support only"
+)]
 fn test_run_scope() -> &'static str {
     static SCOPE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     SCOPE.get_or_init(|| match std::env::var("NEXTEST_RUN_ID") {
@@ -313,6 +317,10 @@ fn template_database_name<M: MigratorTrait>(run_scope: &str) -> String {
 
 /// `TEMPS_TEST_DATABASE_URL`, treating an empty value as unset: GitHub
 /// Actions cannot omit a variable conditionally, only empty it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test/dev-only toggle: TEMPS_TEST_DATABASE_URL points test support at an external database"
+)]
 fn external_database_url() -> Option<String> {
     std::env::var("TEMPS_TEST_DATABASE_URL")
         .ok()

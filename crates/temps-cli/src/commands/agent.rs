@@ -484,7 +484,10 @@ impl AgentCommand {
                 let proxy_shutdown = route_sync_shutdown.clone();
                 tokio::spawn(async move {
                     let bridge_ip = loop {
-                        if let Some(ip) = *bridge_slot.read().expect("bridge slot poisoned") {
+                        if let Some(ip) = *bridge_slot
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        {
                             break ip;
                         }
                         // Fallback path: the bridge IP is also visible

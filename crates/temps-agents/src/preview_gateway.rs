@@ -24,7 +24,7 @@
 //! continue serving. The workspace preview feature is degraded until the
 //! gateway is up, but the rest of Temps keeps running.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use bollard::models::{
     ContainerCreateBody, HostConfig, NetworkCreateRequest, PortBinding, RestartPolicy,
     RestartPolicyNameEnum,
@@ -108,11 +108,16 @@ pub fn ensure_shared_secret(data_dir: &std::path::Path) -> Result<String> {
 
             // Make sure the parent dir exists.
             if !data_dir.exists() {
-                std::fs::create_dir_all(data_dir)
-                    .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
+                std::fs::create_dir_all(data_dir).map_err(|e| {
+                    anyhow!("failed to create data dir {}: {e}", data_dir.display())
+                })?;
             }
-            std::fs::write(&path, &hex)
-                .with_context(|| format!("failed to write {}", path.display()))?;
+            std::fs::write(&path, &hex).map_err(|e| {
+                anyhow!(
+                    "failed to write preview gateway secret {}: {e}",
+                    path.display()
+                )
+            })?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -630,7 +635,13 @@ pub async fn reconcile(
             // halves before surfacing the incompatibility.
             remove_gateway_pair(&docker, &spec.container_name)
                 .await
-                .context("failed to disable an unverified preview gateway")?;
+                .map_err(|e| {
+                    anyhow!(
+                        "failed to disable unverified preview gateway {}: {}",
+                        spec.container_name,
+                        error_chain(&e)
+                    )
+                })?;
             return Err(error.context("preview gateway disabled because its image is unverified"));
         }
     };
@@ -678,7 +689,12 @@ async fn connect_sandbox_networks(
     let networks = docker
         .list_networks(None::<ListNetworksOptions>)
         .await
-        .context("failed to discover isolated sandbox networks")?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!("failed to discover isolated sandbox networks for {container_name}"),
+                e,
+            )
+        })?;
     for network in networks {
         let Some(network_name) = managed_sandbox_network_name(
             &network,
@@ -889,7 +905,12 @@ async fn ensure_ingress_network_named(docker: &Docker, network_name: &str) -> Re
     let networks = docker
         .list_networks(None::<ListNetworksOptions>)
         .await
-        .context("failed to list Docker networks for preview ingress")?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!("failed to list Docker networks for preview ingress {network_name}"),
+                e,
+            )
+        })?;
     if let Some(network) = networks
         .iter()
         .find(|network| network.name.as_deref() == Some(network_name))
@@ -924,7 +945,12 @@ async fn ensure_ingress_network_named(docker: &Docker, network_name: &str) -> Re
     docker
         .create_network(preview_gateway_ingress_network_request_named(network_name))
         .await
-        .context("failed to create preview gateway ingress network")?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!("failed to create preview gateway ingress network {network_name}"),
+                e,
+            )
+        })?;
     Ok(())
 }
 
@@ -1399,12 +1425,22 @@ async fn create_and_start_on_ingress(
             body,
         )
         .await
-        .with_context(|| format!("failed to create container {}", spec.container_name))?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!("failed to create container {}", spec.container_name),
+                e,
+            )
+        })?;
 
     docker
         .start_container(&spec.container_name, None::<StartContainerOptions>)
         .await
-        .with_context(|| format!("failed to start container {}", spec.container_name))?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!("failed to start container {}", spec.container_name),
+                e,
+            )
+        })?;
 
     // A recreated gateway starts with only its control-network attachment.
     // Restore every existing workspace route as part of creation so callers
@@ -1484,7 +1520,12 @@ async fn create_and_start_ingress(
             body,
         )
         .await
-        .with_context(|| format!("failed to create preview ingress container {name}"))?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!("failed to create preview ingress container {name}"),
+                e,
+            )
+        })?;
     docker
         .connect_network(
             &spec.network,
@@ -1494,11 +1535,24 @@ async fn create_and_start_ingress(
             },
         )
         .await
-        .with_context(|| format!("failed to attach preview ingress {name} to control network"))?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!(
+                    "failed to attach preview ingress {name} to control network {}",
+                    spec.network
+                ),
+                e,
+            )
+        })?;
     docker
         .start_container(&name, None::<StartContainerOptions>)
         .await
-        .with_context(|| format!("failed to start preview ingress container {name}"))?;
+        .map_err(|e| {
+            docker_operation_error(
+                format!("failed to start preview ingress container {name}"),
+                e,
+            )
+        })?;
     Ok(())
 }
 
@@ -1572,8 +1626,19 @@ pub async fn ensure_shared_secret_db(
     pg.shared_secret = secret.clone();
 
     // Persist back.
+    let pg_value = match serde_json::to_value(&pg) {
+        Ok(value) => value,
+        Err(e) => {
+            warn!(
+                "failed to serialize preview-gateway settings for settings row 1: {} — continuing with in-memory value",
+                e
+            );
+            export_env(&secret);
+            return secret;
+        }
+    };
     full.as_object_mut()
-        .map(|m| m.insert("preview_gateway".into(), serde_json::to_value(&pg).unwrap()));
+        .map(|m| m.insert("preview_gateway".into(), pg_value));
 
     let now = chrono::Utc::now();
     let persist_result = match row {

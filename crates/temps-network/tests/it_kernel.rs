@@ -21,6 +21,10 @@
 //!   crates/temps-network/tests/dind/run.sh
 
 #![cfg(all(feature = "integration_kernel", target_os = "linux"))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 
 use ipnet::Ipv4Net;
 use std::net::{IpAddr, Ipv4Addr};

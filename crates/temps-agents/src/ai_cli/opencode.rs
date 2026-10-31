@@ -307,8 +307,8 @@ impl AiCliProvider for OpenCodeCliProvider {
             }
         })?;
 
-        let stdout_handle = child.stdout.take().expect("stdout was piped");
-        let stderr_handle = child.stderr.take().expect("stderr was piped");
+        let stdout_handle = super::take_piped(child.stdout.take(), self.name(), "stdout")?;
+        let stderr_handle = super::take_piped(child.stderr.take(), self.name(), "stderr")?;
         let on_event = config.on_event.clone();
 
         let stream_task = tokio::spawn(async move {
@@ -434,8 +434,8 @@ impl AiCliProvider for OpenCodeCliProvider {
             }
         })?;
 
-        let stdout_handle = child.stdout.take().expect("stdout was piped");
-        let stderr_handle = child.stderr.take().expect("stderr was piped");
+        let stdout_handle = super::take_piped(child.stdout.take(), self.name(), "stdout")?;
+        let stderr_handle = super::take_piped(child.stderr.take(), self.name(), "stderr")?;
         let on_event = config.on_event.clone();
 
         let stream_task = tokio::spawn(async move {

@@ -18,6 +18,10 @@
 //! only, and `TEMPS_RUN_DIND_TESTS=1`.
 
 #![cfg(all(feature = "integration_kernel", target_os = "linux"))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 
 use ipnet::Ipv4Net;
 use temps_network::mesh::{ensure_lockdown, lockdown_state, LockdownState, MeshLockdown};

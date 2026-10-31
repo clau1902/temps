@@ -15,6 +15,11 @@
 //!   - and a subsequent `start` from the same snapshot dir serves the
 //!     persisted records *before* the first sync (proves disk persistence).
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;

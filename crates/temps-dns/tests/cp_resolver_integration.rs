@@ -14,6 +14,17 @@
 //! Uses an ephemeral loopback DNS port so real UDP verification runs without
 //! root privileges. Skips gracefully only when Docker/Postgres is unavailable.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 

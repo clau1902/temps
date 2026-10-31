@@ -289,6 +289,10 @@ async fn credential_file_exists(
         .is_some_and(|(_, metadata)| metadata.len() > 0))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "subprocess passthrough: discovers the provider API key the operator exports for the agent CLI child process (e.g. ANTHROPIC_API_KEY)"
+)]
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()
@@ -296,12 +300,20 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "host lookup: HOME locates the operator's CLI credential files, not Temps configuration"
+)]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "host lookup: CODEX_HOME is the codex CLI's own config location on this host, not Temps configuration"
+)]
 fn codex_credential_path() -> Option<PathBuf> {
     std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -310,6 +322,10 @@ fn codex_credential_path() -> Option<PathBuf> {
         .map(|directory| directory.join("auth.json"))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "host lookup: XDG_DATA_HOME is the host's XDG data directory where opencode keeps its auth, not Temps configuration"
+)]
 fn opencode_credential_path() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .filter(|value| !value.is_empty())

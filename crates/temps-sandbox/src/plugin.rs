@@ -52,6 +52,10 @@ impl Default for SandboxPlugin {
 /// Root directory on the host where per-sandbox working directories live.
 /// Mirrors the `agent-sessions` pattern used by `temps-agents::executor`.
 fn data_root() -> PathBuf {
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+    )]
     let root = std::env::var("TEMPS_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {

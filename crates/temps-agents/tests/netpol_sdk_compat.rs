@@ -8,6 +8,11 @@
 //! fails here instead of silently opening a microVM's network.
 
 #![cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_netpol::{

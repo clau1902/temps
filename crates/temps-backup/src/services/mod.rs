@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 mod alerts;
+#[allow(
+    clippy::expect_used,
+    reason = "TEMPORARY: lane p0-stability replaces the `BackupService.queue not set` expect with constructor injection; drop this allow when that lands"
+)]
 mod backup;
 mod capability;
 mod notifier;

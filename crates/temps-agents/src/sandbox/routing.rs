@@ -69,11 +69,17 @@ impl RoutingSandboxProvider {
     /// stamped by the provider that created/recovered it — no name parsing.
     /// Falls back to the default if that backend isn't registered (e.g. a
     /// handle recovered for a backend later disabled).
-    fn owner_of(&self, handle: &SandboxHandle) -> &Arc<dyn SandboxProvider> {
+    fn owner_of(&self, handle: &SandboxHandle) -> Result<&Arc<dyn SandboxProvider>, AgentError> {
         self.backends
             .get(&handle.backend)
             .or_else(|| self.backends.get(&self.default))
-            .expect("default backend registered")
+            .ok_or_else(|| AgentError::SandboxProviderUnavailable {
+                provider: handle.backend.to_string(),
+                reason: format!(
+                    "neither sandbox {}'s backend '{}' nor the default backend '{}' is registered",
+                    handle.sandbox_id, handle.backend, self.default
+                ),
+            })
     }
 
     /// Iteration order for recovery scans: default backend first, then the
@@ -90,20 +96,20 @@ impl RoutingSandboxProvider {
 #[async_trait]
 impl SandboxProvider for RoutingSandboxProvider {
     async fn image_identity(&self, handle: &SandboxHandle) -> Result<String, AgentError> {
-        self.owner_of(handle).image_identity(handle).await
+        self.owner_of(handle)?.image_identity(handle).await
     }
     async fn check_agent_runtime(
         &self,
         handle: &SandboxHandle,
     ) -> Result<RuntimeCompatibility, AgentError> {
-        self.owner_of(handle).check_agent_runtime(handle).await
+        self.owner_of(handle)?.check_agent_runtime(handle).await
     }
     async fn recover_agent_harness(
         &self,
         handle: &SandboxHandle,
         epoch: u64,
     ) -> Result<(), AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .recover_agent_harness(handle, epoch)
             .await
     }
@@ -117,7 +123,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         handle: &SandboxHandle,
         control_plane_url: &str,
     ) -> Result<String, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .model_relay_base_url(handle, control_plane_url)
             .await
     }
@@ -127,7 +133,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         handle: &SandboxHandle,
         control_plane_url: &str,
     ) -> Result<String, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .git_relay_base_url(handle, control_plane_url)
             .await
     }
@@ -138,7 +144,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         control_plane_url: &str,
         registered_url: &str,
     ) -> Result<String, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .harness_mcp_url(handle, control_plane_url, registered_url)
             .await
     }
@@ -150,7 +156,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .exec(handle, cmd, env, on_output)
             .await
     }
@@ -162,7 +168,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .exec_as_root(handle, cmd, env, on_output)
             .await
     }
@@ -175,7 +181,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         env: HashMap<String, String>,
         on_output: Option<OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .exec_as_user(handle, user, cmd, env, on_output)
             .await
     }
@@ -187,13 +193,13 @@ impl SandboxProvider for RoutingSandboxProvider {
         env: HashMap<String, String>,
         on_event: Option<OnStreamEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .exec_streamed(handle, cmd, env, on_event)
             .await
     }
 
     async fn is_alive(&self, handle: &SandboxHandle) -> Result<bool, AgentError> {
-        self.owner_of(handle).is_alive(handle).await
+        self.owner_of(handle)?.is_alive(handle).await
     }
 
     async fn write_file(
@@ -203,13 +209,13 @@ impl SandboxProvider for RoutingSandboxProvider {
         contents: &[u8],
         mode: u32,
     ) -> Result<(), AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .write_file(handle, path, contents, mode)
             .await
     }
 
     async fn read_file(&self, handle: &SandboxHandle, path: &str) -> Result<Vec<u8>, AgentError> {
-        self.owner_of(handle).read_file(handle, path).await
+        self.owner_of(handle)?.read_file(handle, path).await
     }
 
     async fn read_file_bounded(
@@ -218,7 +224,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         path: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .read_file_bounded(handle, path, max_bytes)
             .await
     }
@@ -229,7 +235,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         local_dir: &std::path::Path,
         target_path: &str,
     ) -> Result<(), AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .write_directory(handle, local_dir, target_path)
             .await
     }
@@ -239,7 +245,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         handle: &SandboxHandle,
         host_dir: &std::path::Path,
     ) -> Result<(), AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .sync_workspace_to_host(handle, host_dir)
             .await
     }
@@ -250,32 +256,32 @@ impl SandboxProvider for RoutingSandboxProvider {
         pattern: &str,
         signal: KillSignal,
     ) -> Result<(), AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .kill_processes(handle, pattern, signal)
             .await
     }
 
     async fn destroy(&self, handle: &SandboxHandle, purge_volumes: bool) -> Result<(), AgentError> {
-        self.owner_of(handle).destroy(handle, purge_volumes).await
+        self.owner_of(handle)?.destroy(handle, purge_volumes).await
     }
 
     async fn stop(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
-        self.owner_of(handle).stop(handle).await
+        self.owner_of(handle)?.stop(handle).await
     }
 
     async fn start(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
-        self.owner_of(handle).start(handle).await
+        self.owner_of(handle)?.start(handle).await
     }
 
     async fn restart(&self, handle: &SandboxHandle) -> Result<(), AgentError> {
-        self.owner_of(handle).restart(handle).await
+        self.owner_of(handle)?.restart(handle).await
     }
 
     /// Delegate to whichever backend owns this sandbox. Without this the
     /// trait's default would fire and report "not supported by provider
     /// 'routing'" even for a Docker sandbox that supports it perfectly well.
     async fn attach_pty(&self, handle: &SandboxHandle) -> Result<super::PtyAttachment, AgentError> {
-        self.owner_of(handle).attach_pty(handle).await
+        self.owner_of(handle)?.attach_pty(handle).await
     }
 
     async fn connect_port(
@@ -283,7 +289,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         handle: &SandboxHandle,
         port: u16,
     ) -> Result<super::PtyAttachment, AgentError> {
-        self.owner_of(handle).connect_port(handle, port).await
+        self.owner_of(handle)?.connect_port(handle, port).await
     }
 
     async fn resize_disk(
@@ -291,7 +297,9 @@ impl SandboxProvider for RoutingSandboxProvider {
         handle: &SandboxHandle,
         new_size_mb: u64,
     ) -> Result<(), AgentError> {
-        self.owner_of(handle).resize_disk(handle, new_size_mb).await
+        self.owner_of(handle)?
+            .resize_disk(handle, new_size_mb)
+            .await
     }
 
     async fn set_egress_policy(
@@ -299,7 +307,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         handle: &SandboxHandle,
         policy: &super::SandboxEgressPolicy,
     ) -> Result<(), AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .set_egress_policy(handle, policy)
             .await
     }
@@ -310,7 +318,7 @@ impl SandboxProvider for RoutingSandboxProvider {
         label: Option<String>,
         max_size_bytes: u64,
     ) -> Result<SnapshotArtifact, AgentError> {
-        self.owner_of(handle)
+        self.owner_of(handle)?
             .take_snapshot(handle, label, max_size_bytes)
             .await
     }

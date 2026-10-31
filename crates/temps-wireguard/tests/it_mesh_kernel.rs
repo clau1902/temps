@@ -16,6 +16,10 @@
 //! accidental local run never creates interfaces on a developer's host.
 
 #![cfg(all(feature = "integration_kernel", target_os = "linux"))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 
 use std::net::Ipv4Addr;
 

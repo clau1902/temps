@@ -590,6 +590,10 @@ pub async fn get_global_sandbox_status(
         )
     };
 
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+    )]
     let data_dir = std::env::var("TEMPS_DATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {

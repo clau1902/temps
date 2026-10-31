@@ -598,6 +598,10 @@ impl TempsPlugin for DeployerPlugin {
                 let mesh_key_dir = temps_network::mesh::key_dir(&server_config.data_dir);
                 if local_workloads_enabled {
                     let docker = docker.clone();
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_UNDERLAY_DEV"
+                    )]
                     let underlay_dev = std::env::var("TEMPS_UNDERLAY_DEV").ok();
                     let watcher_db = db.clone();
                     spawn_control_plane_overlay_setup_watcher(db, move || {

@@ -28,6 +28,10 @@ pub mod on_demand;
 pub mod on_demand_cert;
 pub mod plugin;
 pub mod preview_auth;
+#[allow(
+    clippy::disallowed_methods,
+    reason = "TEMPORARY: lane p0-stability removes the per-request PREVIEW_GATEWAY_SHARED_SECRET env read; drop this allow when that lands"
+)]
 pub mod proxy;
 pub mod rate_limiter;
 pub mod redaction;

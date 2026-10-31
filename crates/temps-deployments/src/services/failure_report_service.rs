@@ -189,6 +189,10 @@ impl FailureReportService {
         log_service: Arc<temps_logs::LogService>,
         encryption_service: Arc<EncryptionService>,
     ) -> Result<Self, FailureReportError> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_FAILURE_REPORT_ENDPOINT"
+        )]
         let endpoint = std::env::var("TEMPS_FAILURE_REPORT_ENDPOINT")
             .ok()
             .filter(|s| !s.is_empty())
@@ -219,6 +223,10 @@ impl FailureReportService {
     /// Temps. Mirrors `temps_telemetry::TelemetryService::enabled_from_env`
     /// exactly (same env var, same accepted opt-out values) rather than
     /// depending on that crate just for this one check.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_TELEMETRY"
+    )]
     fn reporting_enabled_from_env() -> bool {
         match std::env::var("TEMPS_TELEMETRY") {
             Ok(v) => !matches!(
@@ -327,7 +335,12 @@ impl FailureReportService {
         job_id: &str,
     ) -> Result<FailureReportPreview, FailureReportError> {
         let jobs = self.jobs_up_to(project_id, deployment_id, job_id).await?;
-        let failed_job = jobs.last().expect("jobs_up_to always returns >= 1 job");
+        // `jobs_up_to` ends at the requested job, so this only fails if that
+        // invariant ever breaks; report it as the missing job it would be.
+        let failed_job = jobs.last().ok_or_else(|| FailureReportError::JobNotFound {
+            deployment_id,
+            job_id: job_id.to_string(),
+        })?;
         let failed_job_type = failed_job.job_type.clone();
         let error_message = failed_job.error_message.clone();
 
@@ -399,7 +412,12 @@ impl FailureReportService {
         }
 
         let jobs = self.jobs_up_to(project_id, deployment_id, job_id).await?;
-        let failed_job = jobs.last().expect("jobs_up_to always returns >= 1 job");
+        // `jobs_up_to` ends at the requested job, so this only fails if that
+        // invariant ever breaks; report it as the missing job it would be.
+        let failed_job = jobs.last().ok_or_else(|| FailureReportError::JobNotFound {
+            deployment_id,
+            job_id: job_id.to_string(),
+        })?;
         let secrets = self.known_secret_values(&jobs);
         let safe_text = prepare_report_text(report_text, &secrets)?;
 

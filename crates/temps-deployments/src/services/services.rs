@@ -6910,15 +6910,19 @@ impl DeploymentService {
         environment_id: Option<i32>,
         days: i32,
     ) -> Result<crate::handlers::types::ActivityGraphResponse, DeploymentError> {
-        use chrono::{Duration, NaiveDate, Utc};
+        use chrono::{Duration, NaiveDate, NaiveTime, Utc};
         use std::collections::HashMap;
 
         let end_date = Utc::now().date_naive();
         let start_date = end_date - Duration::days(days as i64 - 1);
 
-        // Convert NaiveDate to DateTime for comparison
-        let start_datetime = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-        let end_datetime = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+        // Convert NaiveDate to DateTime for comparison: start of the first
+        // day through 23:59:59 of the last.
+        let start_datetime = start_date.and_time(NaiveTime::MIN).and_utc();
+        let end_datetime = end_date.and_time(NaiveTime::MIN).and_utc()
+            + Duration::hours(23)
+            + Duration::minutes(59)
+            + Duration::seconds(59);
 
         // Build query using Sea-ORM
         let mut query = deployments::Entity::find()

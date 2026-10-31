@@ -659,8 +659,10 @@ impl AgentExecutor {
 
                         match flavor.map(|f| f.format) {
                             Some(crate::ai_cli::catalog::CredentialFormat::ApiKey) => {
-                                let env_var = flavor.unwrap().env_var;
-                                sandbox_env.insert(env_var.to_string(), key);
+                                // `flavor` is `Some` in this arm: the match is over `flavor.map(..)`.
+                                if let Some(flavor) = flavor {
+                                    sandbox_env.insert(flavor.env_var.to_string(), key);
+                                }
                             }
                             Some(crate::ai_cli::catalog::CredentialFormat::OauthToken) => {
                                 use crate::ai_cli::credential_snapshot::{
@@ -752,6 +754,10 @@ impl AgentExecutor {
         // Workflow memory + platform env vars
         sandbox_env.insert("TEMPS_PROJECT_ID".to_string(), project.id.to_string());
         sandbox_env.insert("TEMPS_WORKFLOW_SLUG".to_string(), agent_slug.to_string());
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_INTERNAL_API_URL"
+        )]
         sandbox_env.insert(
             "TEMPS_API_URL".to_string(),
             std::env::var("TEMPS_INTERNAL_API_URL")
@@ -1898,6 +1904,10 @@ impl AgentExecutor {
             None => return, // No session to extract
         };
 
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+        )]
         let data_dir = std::env::var("TEMPS_DATA_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| {
@@ -4735,11 +4745,12 @@ mod tests {
 
     // ---- Integration tests ----
 
+    // MockDatabase's FIFO queue can't follow the executor's query interleaving;
+    // this needs a real TestDatabase to run. The other executor tests
+    // (no_changes, too_many_files, clone_failure, ai_failure, no_git_connection)
+    // cover the individual failure paths.
     #[tokio::test]
-    #[ignore] // MockDatabase FIFO queue can't handle the executor's complex query interleaving.
-              // This test needs a real TestDatabase to work reliably. The other executor tests
-              // (no_changes, too_many_files, clone_failure, ai_failure, no_git_connection) cover
-              // the individual failure paths.
+    #[ignore = "known broken: MockDatabase cannot model the executor's query order; port to TestDatabase"]
     async fn test_executor_happy_path_clones_pushes_creates_pr() {
         let run_id = 1;
         let project_id = 1;

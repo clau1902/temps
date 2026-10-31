@@ -27,6 +27,10 @@
 //! (see `bin_path`). Skips, saying why, without Docker, `alpine:3.21`, the
 //! nft helper image or that binary.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
