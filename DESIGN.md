@@ -74,6 +74,13 @@ in a narrower column.
   Metrics page), the title stays for screen readers only and the description
   and actions keep their place. One row of tabs per page: a page inside a
   tabbed section does not add its own tab strip for the same pages.
+- Tabs that switch between sections of a page, or between choices in a
+  form, carry an icon before the label through `TabsTrigger`'s `icon` prop
+  (never a hand-drawn icon in the children), every tab in the strip or none.
+  Reuse the icon the sidebar or project navigation already gives the same
+  concept. Counts go in the `count` prop, not in brackets in the label. Leave
+  icons off code-language switchers, compact metric pickers beside a chart,
+  strips that show brand logos, and strips where each tab is a record.
 - Every group of settings is saved the same way: `SaveRow` from
   `@temps-sdk/ds`, a rule with a hint on the left and Save on the right,
   always mounted and disabled until something changed. A page saved as one
