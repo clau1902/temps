@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { ipDetailPath } from '@/lib/ip-detail'
 import {
   getProxyLogByIdOptions,
   getProxyLogByRequestIdOptions,
@@ -442,7 +443,7 @@ export function ProxyLogDetail({
                 </div>
                 {log.client_ip ? (
                   <RouterLink
-                    to={`/ip/${log.client_ip}`}
+                    to={ipDetailPath(log.client_ip)}
                     className="text-sm text-muted-foreground font-mono hover:text-primary underline"
                   >
                     {log.client_ip}

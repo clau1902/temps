@@ -17,12 +17,14 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { formatLocalDateTime } from '@/lib/date'
+import { ipDetailPath } from '@/lib/ip-detail'
 import {
   formatSolveMs,
   shieldEventKindLabel,
   shieldVerdictBadge,
 } from '@/lib/shield'
 import { useQuery } from '@tanstack/react-query'
+import { Link } from 'react-router'
 import { ArrowRight, ShieldCheck } from 'lucide-react'
 import type { ShieldEnvironmentPath } from './EnvironmentShieldView'
 import { ShieldSection } from './ShieldSection'
@@ -139,7 +141,13 @@ function EventRow({ event }: { event: ShieldEventResponse }) {
       <TableCell
         className={`font-mono text-xs ${event.ip.includes(':') ? 'break-all' : 'whitespace-nowrap'}`}
       >
-        {event.ip}
+        <Link
+          to={ipDetailPath(event.ip)}
+          className="underline-offset-4 hover:underline"
+          title={`Where ${event.ip} is, and what else it requested`}
+        >
+          {event.ip}
+        </Link>
       </TableCell>
       <TableCell className="hidden max-w-[18rem] md:table-cell">
         <p className="truncate text-sm" title={`${event.host}${event.path}`}>
