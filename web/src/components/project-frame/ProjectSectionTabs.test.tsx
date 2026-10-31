@@ -47,3 +47,34 @@ test('tab icons sit before the label and drop on a phone', () => {
   expect(icon?.getAttribute('aria-hidden')).toBe('true')
   expect(icon?.getAttribute('class')).toContain('max-sm:hidden')
 })
+
+test('on a narrow strip, the current tab is scrolled into view', () => {
+  // A 300px strip whose tabs are 100px apart: Check-ins, the sixth, starts
+  // past the edge.
+  const original = HTMLElement.prototype.getBoundingClientRect
+  HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+    if (this.tagName === 'NAV')
+      return { left: 0, right: 300, width: 300 } as DOMRect
+    const index = Array.from(this.parentElement?.children ?? []).indexOf(this)
+    const left = index * 100 - (this.parentElement?.scrollLeft ?? 0)
+    return { left, right: left + 80, width: 80 } as DOMRect
+  }
+  try {
+    const view = renderTabs('check-ins')
+    const nav = view.getByRole('navigation', { name: 'Monitoring pages' })
+    expect(
+      view.getByRole('link', { name: 'Check-ins' }).getAttribute('aria-current')
+    ).toBe('page')
+    // Centred: 500 - 0 - (300 - 80) / 2.
+    expect(nav.scrollLeft).toBe(390)
+  } finally {
+    HTMLElement.prototype.getBoundingClientRect = original
+  }
+})
+
+test('a tab already in view leaves the strip where it is', () => {
+  const view = renderTabs('metrics/explore')
+  expect(
+    view.getByRole('navigation', { name: 'Monitoring pages' }).scrollLeft
+  ).toBe(0)
+})
