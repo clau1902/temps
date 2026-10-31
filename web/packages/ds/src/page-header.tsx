@@ -18,15 +18,17 @@ import {
 
 /**
  * How wide a page's content may grow:
- * - `form`: settings and other forms, a centered column of about 1024px, so
- *   fields and their explanations stay readable.
+ * - `form`: settings and other forms, a column of about 1024px that starts
+ *   at the left edge with the bar above it, so fields and their explanations
+ *   stay readable and the page does not float in the middle of a wide
+ *   screen.
  * - `full`: everything else (lists, tables, dashboards, logs), edge to edge
  *   with the gutters, so the page lines up with the bar above it.
  */
 export type PageWidth = 'form' | 'full'
 
 const PAGE_WIDTH_CLASS: Record<PageWidth, string> = {
-  form: 'mx-auto max-w-5xl',
+  form: 'max-w-5xl',
   full: '',
 }
 

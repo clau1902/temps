@@ -12,12 +12,13 @@ test('a page container is full width unless asked otherwise', () => {
   expect(html).not.toContain('max-w-')
 })
 
-test('a form page is a capped, centered column', () => {
+test('a form page is a capped column aligned with the bar above it', () => {
   const form = renderToStaticMarkup(
     <PageContainer width="form">Body</PageContainer>
   )
   expect(form).toContain('data-page-width="form"')
-  expect(form).toContain('mx-auto max-w-5xl')
+  expect(form).toContain('max-w-5xl')
+  expect(form).not.toContain('mx-auto')
 })
 
 test('a page container inside another adds no second gutter or cap', () => {
