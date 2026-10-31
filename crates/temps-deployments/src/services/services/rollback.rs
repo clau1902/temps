@@ -3,6 +3,7 @@
 
 //! Rollback to an earlier deployment of the same environment.
 
+use super::reuse::{clean_up_failed_completion, deployment_asset_origin};
 use super::*;
 
 impl DeploymentService {
