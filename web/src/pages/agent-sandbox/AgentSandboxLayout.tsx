@@ -3,6 +3,7 @@
 
 import { Outlet, useLocation, useNavigate } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { harnessSectionHref } from './harness-onboarding'
 import {
@@ -20,7 +21,7 @@ const sections = [
   { id: 'overview', label: 'Overview', path: '/agent-sandbox' },
   { id: 'providers', label: 'Harnesses', path: '/agent-sandbox/providers' },
   { id: 'sandbox', label: 'Sandbox', path: '/agent-sandbox/sandbox' },
-  { id: 'preview', label: 'Preview Gateway', path: '/agent-sandbox/preview' },
+  { id: 'preview', label: 'Preview gateway', path: '/agent-sandbox/preview' },
   { id: 'secrets', label: 'Secrets', path: '/agent-sandbox/secrets' },
 ] as const
 
@@ -49,16 +50,14 @@ export function AgentSandboxLayout() {
 
   return (
     <div className="space-y-6 px-4 sm:px-0">
-      <div>
-        <h1 className="text-2xl font-semibold">
-          {current === 'providers' ? 'Harnesses' : 'AI runtime settings'}
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          {current === 'providers'
+      <PageHeader
+        title={current === 'providers' ? 'Harnesses' : 'AI runtime settings'}
+        description={
+          current === 'providers'
             ? 'Connect your AI accounts and configure workspace access.'
-            : 'AI providers, sandbox runtime, secrets, and the workspace preview gateway. Each surface owns its own status and settings.'}
-        </p>
-      </div>
+            : 'AI providers, sandbox runtime, secrets, and the workspace preview gateway. Each surface owns its own status and settings.'
+        }
+      />
 
       {/* Mobile select */}
       <div className="sm:hidden">
