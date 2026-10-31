@@ -8,6 +8,10 @@ use super::presets::{
 };
 use super::queries::has_ready_deployment;
 use super::source_directory::public_directory_provider;
+use super::templates::{
+    applied_service_template_from_model, apply_new_template_default_when_unmodified,
+    production_configured_variable_keys, validate_service_binding_compatibility,
+};
 use super::*;
 
 // ------------------------------------------------------------------
