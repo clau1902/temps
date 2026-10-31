@@ -613,7 +613,7 @@ async fn create_git_provider(
 }
 
 async fn verify_cloudflare_token(token: &str) -> anyhow::Result<bool> {
-    let provider = CloudflareDnsProvider::new(token.to_string());
+    let provider = CloudflareDnsProvider::new(token.to_string())?;
     match provider.test_api_access().await {
         Ok(true) => Ok(true),
         Ok(false) => Err(anyhow::anyhow!(
@@ -2226,7 +2226,7 @@ impl SetupCommand {
 
                 let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
                 print_section("DNS A Record Setup");
                 let wildcard_record_name = if subdomain_prefix.is_empty() {
@@ -2353,7 +2353,7 @@ impl SetupCommand {
 
                 let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
                 print_section("DNS A Record Setup");
                 let wildcard_record_name = if subdomain_prefix.is_empty() {
@@ -2446,7 +2446,7 @@ impl SetupCommand {
         print_step(1, 8, "Verifying Cloudflare zone and detecting server IP");
         let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
         // Extract base domain from wildcard (e.g., "*.app.example.com" -> "example.com")
         let base_domain = wildcard_domain
@@ -2549,7 +2549,6 @@ impl SetupCommand {
 
         // Set Let's Encrypt environment based on --letsencrypt-staging flag
         if self.letsencrypt_staging {
-            std::env::set_var("LETSENCRYPT_MODE", "staging");
             print_substep(&format!(
                 "{} Using Let's Encrypt staging environment",
                 "ℹ".bright_blue()
@@ -2563,7 +2562,15 @@ impl SetupCommand {
                 encryption_service_arc.clone(),
             ));
         let cert_provider: std::sync::Arc<dyn temps_domains::tls::CertificateProvider> =
-            std::sync::Arc::new(LetsEncryptProvider::new(repository.clone()));
+            std::sync::Arc::new(
+                LetsEncryptProvider::new(repository.clone()).with_environment(
+                    if self.letsencrypt_staging {
+                        "staging"
+                    } else {
+                        "production"
+                    },
+                ),
+            );
         let domain_service = DomainService::new(
             db.clone(),
             cert_provider,

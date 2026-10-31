@@ -149,7 +149,7 @@ impl TlsService {
     pub fn new(
         repository: Arc<dyn CertificateRepository>,
         cert_provider: Arc<dyn CertificateProvider>,
-    ) -> Self {
+    ) -> Result<Self, BuilderError> {
         // Create a cached DNS resolver
         let mut options = ResolverOpts::default();
         options.cache_size = 256;
@@ -158,7 +158,8 @@ impl TlsService {
         options.ip_strategy = LookupIpStrategy::Ipv4Only;
         options.try_tcp_on_error = true;
 
-        // Building from a static, known-valid config cannot fail in practice.
+        // The config is static; building can still fail while loading the
+        // resolver's TLS roots, so surface that instead of panicking.
         let resolver = Arc::new(
             Resolver::builder_with_config(
                 ResolverConfig::udp_and_tcp(&CLOUDFLARE),
@@ -166,10 +167,12 @@ impl TlsService {
             )
             .with_options(options)
             .build()
-            .expect("failed to build DNS resolver from static Cloudflare config"),
+            .map_err(|e| BuilderError::DnsResolver {
+                reason: e.to_string(),
+            })?,
         );
 
-        Self {
+        Ok(Self {
             repository,
             cert_provider,
             resolver,
@@ -181,7 +184,7 @@ impl TlsService {
             dns_automation_gate: None,
             audit_logger: None,
             dns_propagation_delay: Duration::from_secs(30),
-        }
+        })
     }
 
     /// Wire the `AlarmService` after construction. Idempotent — only the
@@ -1496,8 +1499,8 @@ impl TlsService {
                     .collect();
             }
             Err(e) => {
-                if error.is_some() {
-                    error = Some(format!("{}, IPv6 lookup failed: {}", error.unwrap(), e));
+                if let Some(ipv4_error) = error.take() {
+                    error = Some(format!("{}, IPv6 lookup failed: {}", ipv4_error, e));
                 }
             }
         }
@@ -1575,27 +1578,14 @@ impl TlsService {
             let now = chrono::Utc::now();
 
             // Calculate time until next 3:00 AM UTC
+            let today_3am = now.date_naive().and_time(chrono::NaiveTime::MIN).and_utc()
+                + chrono::Duration::hours(3);
             let next_run = if now.hour() >= 3 {
                 // Next 3 AM is tomorrow
-                (now + chrono::Duration::days(1))
-                    .with_hour(3)
-                    .unwrap()
-                    .with_minute(0)
-                    .unwrap()
-                    .with_second(0)
-                    .unwrap()
-                    .with_nanosecond(0)
-                    .unwrap()
+                today_3am + chrono::Duration::days(1)
             } else {
                 // Next 3 AM is today
-                now.with_hour(3)
-                    .unwrap()
-                    .with_minute(0)
-                    .unwrap()
-                    .with_second(0)
-                    .unwrap()
-                    .with_nanosecond(0)
-                    .unwrap()
+                today_3am
             };
 
             let sleep_duration = next_run - now;
@@ -1724,10 +1714,10 @@ impl TlsServiceBuilder {
     }
 
     pub fn build(self) -> Result<TlsService, BuilderError> {
-        Ok(TlsService::new(
+        TlsService::new(
             self.repository.ok_or(BuilderError::MissingRepository)?,
             self.cert_provider.ok_or(BuilderError::MissingProvider)?,
-        ))
+        )
     }
 }
 
@@ -1767,6 +1757,7 @@ mod tests {
             cert.expiration_time = cert.last_renewed.unwrap() + chrono::Duration::days(90);
             repo.save_certificate(cert).await.unwrap();
             let report = TlsService::new(repo, provider)
+                .unwrap()
                 .check_and_renew_certificates(90)
                 .await
                 .unwrap();
@@ -1904,7 +1895,7 @@ mod tests {
             crate::domain_service::CertificateRenewalMode::Manual
         );
 
-        let service = TlsService::new(repo, provider).with_db(db);
+        let service = TlsService::new(repo, provider).unwrap().with_db(db);
         let report = service.check_and_renew_certificates(30).await.unwrap();
         assert_eq!(report.total_checked, 1);
         assert_eq!(report.manual_action_needed.len(), 1);
@@ -2319,6 +2310,7 @@ mod tests {
 
             let audit = Arc::new(RecordingAuditLogger::default());
             let mut service = TlsService::new(repository.clone(), certificate_provider.clone())
+                .unwrap()
                 .with_config_service(config_service.clone())
                 .with_domain_service(domain_service.clone())
                 .with_dns_provider_service(dns_provider_service.clone())
@@ -2461,6 +2453,7 @@ mod tests {
         let gate = Arc::new(DenyingDnsAutomationGate::default());
         let audit = Arc::new(RecordingAuditLogger::default());
         let service = TlsService::new(repository.clone(), certificate_provider.clone())
+            .unwrap()
             .with_config_service(config_service)
             .with_domain_service(domain_service.clone())
             .with_dns_provider_service(dns_provider_service.clone())
@@ -2649,6 +2642,7 @@ mod tests {
 
         let audit = Arc::new(RecordingAuditLogger::default());
         let mut service = TlsService::new(repository, certificate_provider.clone())
+            .unwrap()
             .with_config_service(config_service)
             .with_dns_automation_gate(Arc::new(AllowingDnsAutomationGate))
             .with_audit_logger(audit.clone());
@@ -2998,7 +2992,7 @@ mod tests {
         let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
         let provider = Arc::new(MockCertificateProvider::new());
 
-        let service = TlsService::new(repo.clone(), provider);
+        let service = TlsService::new(repo.clone(), provider).unwrap();
 
         // Test provisioning a certificate
         let cert = service
@@ -3043,7 +3037,7 @@ mod tests {
         // Create service and renew
         let provider = Arc::new(MockCertificateProvider::new());
 
-        let service = TlsService::new(repo.clone(), provider);
+        let service = TlsService::new(repo.clone(), provider).unwrap();
 
         let renewed = service
             .renew_certificate("renew.example.com", "test@example.com")
@@ -3297,7 +3291,7 @@ mod tests {
     ///
     /// To run: cargo test --lib -p temps-domains test_http01_with_pebble -- --ignored
     #[tokio::test]
-    #[ignore = "Requires Pebble CA certificate trust setup"]
+    #[ignore = "manual: needs Pebble's CA trusted by the host; not run in CI"]
     async fn test_http01_with_pebble() {
         // Start Pebble container with validation always passing (for testing)
         let container = GenericImage::new("letsencrypt/pebble", "latest")
@@ -3327,7 +3321,6 @@ mod tests {
             "ACME_DIRECTORY_URL",
             format!("https://localhost:{}/dir", acme_port),
         );
-        std::env::set_var("LETSENCRYPT_MODE", "staging");
 
         let provider = Arc::new(LetsEncryptProvider::new(repo.clone()));
 
@@ -3386,7 +3379,7 @@ mod tests {
     ///
     /// To run: cargo test --lib -p temps-domains test_dns01_wildcard_with_pebble -- --ignored
     #[tokio::test]
-    #[ignore = "Requires Pebble CA certificate trust setup"]
+    #[ignore = "manual: needs Pebble's CA trusted by the host; not run in CI"]
     async fn test_dns01_wildcard_with_pebble() {
         // Start Pebble container with validation always passing
         let container = GenericImage::new("letsencrypt/pebble", "latest")
@@ -3473,7 +3466,7 @@ mod tests {
     /// Note: This test is ignored by default because it requires Pebble CA certificate trust setup.
     /// To run: cargo test --lib -p temps-domains test_http01_rejected_for_wildcard_with_pebble -- --ignored
     #[tokio::test]
-    #[ignore = "Requires Pebble CA certificate trust setup"]
+    #[ignore = "manual: needs Pebble's CA trusted by the host; not run in CI"]
     async fn test_http01_rejected_for_wildcard_with_pebble() {
         let container = GenericImage::new("letsencrypt/pebble", "latest")
             .with_env_var("PEBBLE_VA_ALWAYS_VALID", "1")
@@ -3531,7 +3524,7 @@ mod tests {
         let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password("test"));
         let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
         let provider = Arc::new(MockCertificateProvider::new());
-        let service = TlsService::new(repo.clone(), provider);
+        let service = TlsService::new(repo.clone(), provider).unwrap();
 
         // Create certificate expiring soon
         let expiring_cert = Certificate {
@@ -3639,7 +3632,9 @@ mod tests {
             .await
             .unwrap();
 
-        let service = TlsService::new(repo, provider).with_config_service(config_service.clone());
+        let service = TlsService::new(repo, provider)
+            .unwrap()
+            .with_config_service(config_service.clone());
 
         assert_eq!(service.get_acme_email().await, "ops@example.com");
     }
@@ -3655,7 +3650,7 @@ mod tests {
         let repo = Arc::new(DefaultCertificateRepository::new(db, encryption_service));
         let provider = Arc::new(MockCertificateProvider::new());
 
-        let service = TlsService::new(repo, provider);
+        let service = TlsService::new(repo, provider).unwrap();
 
         assert_eq!(service.get_acme_email().await, "");
     }
@@ -3710,8 +3705,9 @@ mod tests {
         repo.save_certificate(expiring_cert("renew.example.test", "http-01"))
             .await
             .unwrap();
-        let service =
-            TlsService::new(repo, Arc::new(MockCertificateProvider::new())).with_db(db.clone());
+        let service = TlsService::new(repo, Arc::new(MockCertificateProvider::new()))
+            .unwrap()
+            .with_db(db.clone());
         let report = service.check_and_renew_certificates(30).await.unwrap();
         assert_eq!(report.total_checked, 1);
         assert_eq!(
@@ -3724,8 +3720,9 @@ mod tests {
         repo.save_certificate(expiring_cert("manual.example.test", "manual"))
             .await
             .unwrap();
-        let service =
-            TlsService::new(repo, Arc::new(MockCertificateProvider::new())).with_db(db.clone());
+        let service = TlsService::new(repo, Arc::new(MockCertificateProvider::new()))
+            .unwrap()
+            .with_db(db.clone());
         assert!(service
             .check_and_renew_certificates(30)
             .await
@@ -3752,7 +3749,7 @@ mod tests {
         // No config_service → empty ACME email → provision_certificate returns
         // Err(TlsError::Configuration), so the HTTP-01 handler pushes the domain
         // into renewal_failed (proves it took the HTTP-01 path, not manual).
-        let service = TlsService::new(repo, provider);
+        let service = TlsService::new(repo, provider).unwrap();
         let report = service
             .check_and_renew_certificates(30)
             .await
@@ -3786,7 +3783,7 @@ mod tests {
             .await
             .unwrap();
 
-        let service = TlsService::new(repo, provider);
+        let service = TlsService::new(repo, provider).unwrap();
         let report = service
             .check_and_renew_certificates(30)
             .await
@@ -3828,7 +3825,7 @@ mod tests {
         .await
         .unwrap();
 
-        let service = TlsService::new(repo, provider);
+        let service = TlsService::new(repo, provider).unwrap();
         let report = service
             .check_and_renew_certificates(30)
             .await

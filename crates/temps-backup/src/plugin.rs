@@ -94,6 +94,98 @@ impl Default for BackupPlugin {
     }
 }
 
+/// Deprecated environment variable replaced by `backup_executor.max_concurrent`.
+const BACKUP_EXECUTOR_MAX_CONCURRENT_ENV: &str = "TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT";
+const BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING: &str = "backup_executor.max_concurrent";
+
+/// One-release shim: read the deprecated variable once at boot.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "one-release deprecation shim: read once at boot and persisted into \
+              backup_executor.max_concurrent; never read again at runtime"
+)]
+fn backup_executor_env_value() -> Option<String> {
+    std::env::var(BACKUP_EXECUTOR_MAX_CONCURRENT_ENV).ok()
+}
+
+/// What the deprecated variable means for the stored setting. Pure, so the
+/// shim's decision is testable without process environment.
+fn plan_backup_executor_env_migration(
+    env_value: Option<&str>,
+    stored: &temps_core::BackupExecutorSettings,
+) -> temps_core::EnvSettingMigration<u32> {
+    temps_core::decide_env_setting_migration(
+        env_value,
+        &stored.max_concurrent,
+        &temps_core::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
+        |raw| match raw.parse::<u32>() {
+            Ok(value) if (1..=temps_core::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT).contains(&value) => {
+                Ok(value)
+            }
+            _ => Err(format!(
+                "expected an integer between 1 and {}",
+                temps_core::MAX_BACKUP_EXECUTOR_MAX_CONCURRENT
+            )),
+        },
+    )
+}
+
+/// Resolve the backup executor settings, persisting a value from the
+/// deprecated `TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT` once when the setting has
+/// never been configured. A settings read or write failure never blocks
+/// startup: the defaults (or, if only the write failed, the environment
+/// value for this boot) apply and the failure is logged.
+async fn migrate_backup_executor_env(
+    config_service: &temps_config::ConfigService,
+    audit: &dyn temps_core::AuditLogger,
+) -> temps_core::BackupExecutorSettings {
+    let stored = match config_service.get_settings().await {
+        Ok(settings) => settings.backup_executor,
+        Err(e) => {
+            error!(
+                "Failed to read backup_executor settings; using the default concurrency of {}: {}",
+                temps_core::DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT,
+                e
+            );
+            return temps_core::BackupExecutorSettings::default();
+        }
+    };
+
+    let env_value = backup_executor_env_value();
+    let plan = plan_backup_executor_env_migration(env_value.as_deref(), &stored);
+    plan.log(
+        BACKUP_EXECUTOR_MAX_CONCURRENT_ENV,
+        BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING,
+    );
+    let Some(value) = plan.into_persist() else {
+        return stored;
+    };
+
+    match config_service
+        .update_backup_executor_settings(|settings| settings.max_concurrent = value)
+        .await
+    {
+        Ok(saved) => {
+            temps_core::record_env_setting_persisted(
+                Some(audit),
+                BACKUP_EXECUTOR_MAX_CONCURRENT_ENV,
+                BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING,
+            )
+            .await;
+            saved
+        }
+        Err(e) => {
+            error!(
+                "Failed to persist {} into {}; honouring it for this boot only: {}",
+                BACKUP_EXECUTOR_MAX_CONCURRENT_ENV, BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING, e
+            );
+            temps_core::BackupExecutorSettings {
+                max_concurrent: value,
+            }
+        }
+    }
+}
+
 impl TempsPlugin for BackupPlugin {
     fn name(&self) -> &'static str {
         "backup"
@@ -183,10 +275,13 @@ impl TempsPlugin for BackupPlugin {
             context.register_service(pg_upgrade_service.clone());
 
             // ── BackupExecutor: registers all 7 engines ──────────────────────
-            let executor_max_concurrent = std::env::var("TEMPS_BACKUP_EXECUTOR_MAX_CONCURRENT")
-                .ok()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(4);
+            // Concurrency comes from the `backup_executor` setting; a value
+            // left in the deprecated environment variable is migrated into
+            // it once (see `migrate_backup_executor_env`).
+            let executor_max_concurrent =
+                migrate_backup_executor_env(&config_service, audit_service.as_ref())
+                    .await
+                    .effective_max_concurrent();
 
             let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
                 BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
@@ -855,6 +950,41 @@ fn report_lifecycle_reconcile_failure(
 
 #[cfg(test)]
 mod tests {
+    use temps_core::EnvSettingMigration;
+
+    #[test]
+    fn backup_executor_env_is_persisted_when_the_setting_is_unset() {
+        let stored = temps_core::BackupExecutorSettings::default();
+        assert_eq!(
+            super::plan_backup_executor_env_migration(Some("8"), &stored),
+            EnvSettingMigration::Persist(8)
+        );
+    }
+
+    #[test]
+    fn backup_executor_env_is_ignored_when_the_setting_is_set() {
+        let stored = temps_core::BackupExecutorSettings { max_concurrent: 2 };
+        assert_eq!(
+            super::plan_backup_executor_env_migration(Some("8"), &stored),
+            EnvSettingMigration::SettingAlreadySet
+        );
+        assert_eq!(
+            super::plan_backup_executor_env_migration(None, &stored),
+            EnvSettingMigration::EnvUnset
+        );
+    }
+
+    #[test]
+    fn backup_executor_env_rejects_zero_and_garbage() {
+        let stored = temps_core::BackupExecutorSettings::default();
+        for raw in ["0", "-1", "lots", "65"] {
+            assert!(matches!(
+                super::plan_backup_executor_env_migration(Some(raw), &stored),
+                EnvSettingMigration::Invalid { .. }
+            ));
+        }
+    }
+
     use super::*;
 
     #[test]

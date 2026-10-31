@@ -35,8 +35,8 @@ pub struct ScreenshotService {
 
 /// The active provider and the settings it was built from.
 ///
-/// `source` is `None` when the provider is pinned (by `TEMPS_SCREENSHOT_PROVIDER`
-/// or an embedder) and must never be replaced. Otherwise the provider is rebuilt
+/// `source` is `None` when the provider is pinned by an embedder (see
+/// [`ScreenshotService::with_provider`]) and must never be replaced. Otherwise the provider is rebuilt
 /// whenever Settings → Screenshots selects a different one, so an operator who
 /// follows a "provider unavailable" error to Settings does not also need to
 /// restart the server.
@@ -48,11 +48,58 @@ struct ProviderSlot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProviderSource {
     Local,
-    Remote { url: String },
+    Remote {
+        url: String,
+    },
+    /// Screenshots switched off (`noop`), e.g. on a host without Chrome.
+    Disabled,
+}
+
+/// `screenshots.provider` values that select the no-op provider.
+const DISABLED_PROVIDER_VALUES: [&str; 3] = ["noop", "disabled", "none"];
+
+/// Deprecated environment variable replaced by `screenshots.provider`.
+const SCREENSHOT_PROVIDER_ENV: &str = "TEMPS_SCREENSHOT_PROVIDER";
+const SCREENSHOT_PROVIDER_SETTING: &str = "screenshots.provider";
+
+/// One-release shim: read the deprecated variable once, when the service is
+/// built at startup. `temps serve --screenshot-provider` still sets it.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "one-release deprecation shim: read once at startup and persisted into \
+              screenshots.provider; never read again at runtime"
+)]
+fn screenshot_provider_env_value() -> Option<String> {
+    std::env::var(SCREENSHOT_PROVIDER_ENV).ok()
+}
+
+/// What `TEMPS_SCREENSHOT_PROVIDER` means for the stored `screenshots.provider`.
+/// Pure, so the shim's decision is testable without process environment.
+fn plan_screenshot_provider_env_migration(
+    env_value: Option<&str>,
+    stored: &temps_core::ScreenshotSettings,
+) -> temps_core::EnvSettingMigration<String> {
+    let unset = temps_core::ScreenshotSettings::default().provider;
+    temps_core::decide_env_setting_migration(env_value, &stored.provider, &unset, |raw| {
+        let normalized = raw.to_ascii_lowercase();
+        if DISABLED_PROVIDER_VALUES.contains(&normalized.as_str()) {
+            Ok("noop".to_string())
+        } else if normalized == "local" || normalized == "remote" {
+            Ok(normalized)
+        } else {
+            Err(format!(
+                "unknown provider '{raw}'; expected local, remote, noop, disabled or none"
+            ))
+        }
+    })
 }
 
 impl ProviderSource {
     fn from_settings(settings: &temps_core::AppSettings) -> Self {
+        let provider = settings.screenshots.provider.to_ascii_lowercase();
+        if DISABLED_PROVIDER_VALUES.contains(&provider.as_str()) {
+            return Self::Disabled;
+        }
         if !settings.screenshots.url.is_empty() && settings.screenshots.provider == "remote" {
             Self::Remote {
                 url: settings.screenshots.url.clone(),
@@ -80,6 +127,13 @@ impl ProviderSource {
                 info!("Using local headless Chrome screenshot provider");
                 Ok(Arc::new(LocalScreenshotProvider::new()))
             }
+            Self::Disabled => {
+                info!(
+                    "Screenshots are disabled (screenshots.provider = noop); using the noop \
+                     provider"
+                );
+                Ok(Arc::new(NoopScreenshotProvider::new()))
+            }
         }
     }
 }
@@ -94,67 +148,22 @@ impl ProviderSlot {
 }
 
 impl ScreenshotService {
-    /// Create a new screenshot service
+    /// Create a new screenshot service.
     ///
-    /// Provider selection priority:
-    /// 1. Environment variable `TEMPS_SCREENSHOT_PROVIDER` (values: "noop", "local", "remote")
-    /// 2. Settings in database (screenshots.provider)
-    /// 3. Default to "local" (headless Chrome)
+    /// The provider follows `screenshots.provider` (`local` — headless Chrome,
+    /// the default; `remote` with `screenshots.url`; or `noop`), and is
+    /// rebuilt whenever that setting changes. A value left in the deprecated
+    /// `TEMPS_SCREENSHOT_PROVIDER` is persisted into the setting once at
+    /// startup (see [`Self::migrate_provider_env`]).
     pub async fn new(config_service: Arc<ConfigService>) -> ScreenshotResult<Self> {
-        let settings = config_service
+        let mut settings = config_service
             .get_settings()
             .await
             .map_err(|e| ScreenshotError::ConfigError(format!("Failed to get settings: {}", e)))?;
 
-        // Check environment variable first (highest priority)
-        let env_provider = std::env::var("TEMPS_SCREENSHOT_PROVIDER").ok();
-
-        // Determine which provider to use
-        let slot = match env_provider.as_deref() {
-            Some("noop") | Some("disabled") | Some("none") => {
-                info!(
-                    "Using noop screenshot provider (TEMPS_SCREENSHOT_PROVIDER={}). \
-                    Screenshots are disabled.",
-                    env_provider.as_deref().unwrap_or("noop")
-                );
-                ProviderSlot::pinned(Arc::new(NoopScreenshotProvider::new()))
-            }
-            Some("remote") => {
-                if settings.screenshots.url.is_empty() {
-                    return Err(ScreenshotError::ConfigError(
-                        "TEMPS_SCREENSHOT_PROVIDER=remote but screenshots.url is not configured"
-                            .to_string(),
-                    ));
-                }
-                info!(
-                    "Using remote screenshot provider at {} (from TEMPS_SCREENSHOT_PROVIDER)",
-                    settings.screenshots.url
-                );
-                ProviderSlot::pinned(Arc::new(
-                    RemoteScreenshotProvider::new(settings.screenshots.url.clone(), None).map_err(
-                        |e| {
-                            error!("Failed to create remote screenshot provider: {}", e);
-                            e
-                        },
-                    )?,
-                ))
-            }
-            Some("local") => {
-                info!("Using local headless Chrome screenshot provider (from TEMPS_SCREENSHOT_PROVIDER)");
-                ProviderSlot::pinned(Arc::new(LocalScreenshotProvider::new()))
-            }
-            Some(unknown) => {
-                warn!(
-                    "Unknown TEMPS_SCREENSHOT_PROVIDER value '{}', falling back to settings or default",
-                    unknown
-                );
-                Self::slot_from_settings(&settings)?
-            }
-            None => {
-                // No env var, use settings or default
-                Self::slot_from_settings(&settings)?
-            }
-        };
+        settings.screenshots =
+            Self::migrate_provider_env(&config_service, settings.screenshots).await;
+        let slot = Self::slot_from_settings(&settings)?;
         let provider = Arc::clone(&slot.provider);
 
         // Spawn a background task so the availability check never blocks plugin
@@ -211,6 +220,46 @@ impl ScreenshotService {
             durable_store,
             capture_permits: CAPTURE_PERMITS.clone(),
         })
+    }
+
+    /// One-release shim for `TEMPS_SCREENSHOT_PROVIDER`: persist it into
+    /// `screenshots.provider` when that setting was never changed from its
+    /// default, otherwise warn that it is ignored. Returns the settings to
+    /// use. If the write fails, the value is honoured for this boot only.
+    async fn migrate_provider_env(
+        config_service: &ConfigService,
+        stored: temps_core::ScreenshotSettings,
+    ) -> temps_core::ScreenshotSettings {
+        let env_value = screenshot_provider_env_value();
+        let plan = plan_screenshot_provider_env_migration(env_value.as_deref(), &stored);
+        plan.log(SCREENSHOT_PROVIDER_ENV, SCREENSHOT_PROVIDER_SETTING);
+        let Some(provider) = plan.into_persist() else {
+            return stored;
+        };
+        let persisted = provider.clone();
+        match config_service
+            .update_screenshot_settings(move |screenshots| screenshots.provider = persisted)
+            .await
+        {
+            Ok(saved) => {
+                // No audit logger is reachable from this service; the
+                // structured `info!` is the record.
+                temps_core::record_env_setting_persisted(
+                    None,
+                    SCREENSHOT_PROVIDER_ENV,
+                    SCREENSHOT_PROVIDER_SETTING,
+                )
+                .await;
+                saved
+            }
+            Err(e) => {
+                error!(
+                    "Failed to persist {} into {}; honouring it for this boot only: {}",
+                    SCREENSHOT_PROVIDER_ENV, SCREENSHOT_PROVIDER_SETTING, e
+                );
+                temps_core::ScreenshotSettings { provider, ..stored }
+            }
+        }
     }
 
     /// Build a provider that follows database settings (no env var override).
@@ -700,6 +749,58 @@ mod provider_selection_tests {
             durable_store: None,
             capture_permits: Arc::new(Semaphore::new(1)),
         }
+    }
+
+    #[test]
+    fn noop_provider_setting_disables_screenshots() {
+        let mut settings = temps_core::AppSettings::default();
+        for value in ["noop", "disabled", "none", "NOOP"] {
+            settings.screenshots.provider = value.to_string();
+            assert_eq!(
+                ProviderSource::from_settings(&settings),
+                ProviderSource::Disabled
+            );
+        }
+        let provider = ProviderSource::Disabled.build().expect("noop builds");
+        assert_eq!(
+            provider.provider_name(),
+            NoopScreenshotProvider::new().provider_name()
+        );
+    }
+
+    #[test]
+    fn screenshot_provider_env_is_persisted_over_the_default_only() {
+        use temps_core::EnvSettingMigration;
+        let default = temps_core::ScreenshotSettings::default();
+        assert_eq!(
+            plan_screenshot_provider_env_migration(Some("disabled"), &default),
+            EnvSettingMigration::Persist("noop".to_string())
+        );
+        assert_eq!(
+            plan_screenshot_provider_env_migration(Some("remote"), &default),
+            EnvSettingMigration::Persist("remote".to_string())
+        );
+        assert_eq!(
+            plan_screenshot_provider_env_migration(Some("local"), &default),
+            EnvSettingMigration::AlreadyPersisted
+        );
+        assert!(matches!(
+            plan_screenshot_provider_env_migration(Some("chrome"), &default),
+            EnvSettingMigration::Invalid { .. }
+        ));
+        assert_eq!(
+            plan_screenshot_provider_env_migration(None, &default),
+            EnvSettingMigration::EnvUnset
+        );
+
+        let remote = temps_core::ScreenshotSettings {
+            provider: "remote".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            plan_screenshot_provider_env_migration(Some("noop"), &remote),
+            EnvSettingMigration::SettingAlreadySet
+        );
     }
 
     #[test]
