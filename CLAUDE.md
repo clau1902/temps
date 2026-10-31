@@ -29,7 +29,7 @@ resource limits, migrations) and a pre-PR checklist.
 - Use plain text logging -- ALWAYS use structured JSONL logging
 - Overwrite `apps/temps-cli/openapi.json` with the raw server response (`curl ... > openapi.json`) -- the committed file is ~92,000 lines of sorted, indented JSON and the server serves it minified on one line, so a direct write reports **-92,000 deletions** and buries the real change. ALWAYS use `cd apps/temps-cli && bun run spec:update` (see [Regenerating the OpenAPI clients](#regenerating-the-openapi-clients))
 - Create markdown documentation files unless explicitly requested
-- Mark Docker tests with `#[ignore]` -- they MUST skip gracefully at runtime instead
+- Mark Docker tests with `#[ignore]` -- they MUST skip gracefully at runtime instead. The only allowed `#[ignore]` is `#[ignore = "reason"]` on a test that a dedicated CI job runs explicitly with `--ignored`
 - Create error types with generic messages -- ALWAYS include IDs, names, and operation context
 - Expose internal dependencies via public accessors (e.g. `service.db()`) -- pass dependencies directly via constructor or AppState
 - Use `Option<T>` for dependencies that are required -- use `Arc<T>` and fail at startup if missing
@@ -57,7 +57,7 @@ resource limits, migrations) and a pre-PR checklist.
 - Implement pagination (default: 20, max: 100) and sorting (default: `created_at` DESC)
 - Use typed error handling with proper propagation
 - Follow the three-layer architecture pattern
-- Keep Rust unit tests in the same file as the code they test. Frontend TypeScript/React tests belong in adjacent `.test.ts` or `.test.tsx` files so test-runner imports are excluded from production modules.
+- Keep Rust unit tests next to the code they test: in the same file, or -- when inline tests would push a file past ~1,500 lines -- in a sibling `tests.rs` declared as `#[cfg(test)] mod tests;` (e.g. `backup/mod.rs` + `backup/tests.rs`). Never in a distant directory. Frontend TypeScript/React tests belong in adjacent `.test.ts` or `.test.tsx` files so test-runner imports are excluded from production modules.
 - Return dates in ISO 8601 format with `Z` suffix
 - Use `permission_guard!` macro for authorization in handlers
 - Add audit logging for all write operations (CREATE, UPDATE, DELETE)
@@ -509,7 +509,7 @@ Tests must verify both success and failure paths. Error-case testing is as impor
 
 ### Test Structure
 
-Rust tests live in `#[cfg(test)] mod tests` at the bottom of each Rust source file:
+Rust tests live in `#[cfg(test)] mod tests` at the bottom of each Rust source file, or in a sibling `tests.rs` (`#[cfg(test)] mod tests;`) once a file is large -- see the ALWAYS rule above:
 
 ```rust
 #[cfg(test)]
