@@ -13,7 +13,7 @@ description = "Bridge between AiService and AiCliProvider for subscription-backe
 
 [dependencies]
 temps-ai = { path = "../temps-ai" }
-temps-agents = { path = "../temps-agents" }
+temps-ai-agents = { path = "../temps-ai-agents" }
 temps-sandbox = { path = "../temps-sandbox" }
 temps-agent-runtime = { workspace = true }
 async-trait = { workspace = true }

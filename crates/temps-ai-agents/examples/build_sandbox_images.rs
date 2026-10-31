@@ -10,7 +10,7 @@
 //! to the Claude install path) without spinning up the full server.
 //!
 //! Usage:
-//!     cargo run -p temps-agents --example build_sandbox_images
+//!     cargo run -p temps-ai-agents --example build_sandbox_images
 //!
 //! Pass `--only <runtime>` to build a single image, or `--no-cache` to force
 //! a clean rebuild.
@@ -21,8 +21,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
-use temps_agents::sandbox::docker::{dockerfile_for_runtime, image_name_for_runtime};
-use temps_agents::sandbox::pty_agent_bundle::BUNDLE as PTY_AGENT_BUNDLE;
+use temps_ai_agents::sandbox::docker::{dockerfile_for_runtime, image_name_for_runtime};
+use temps_ai_agents::sandbox::pty_agent_bundle::BUNDLE as PTY_AGENT_BUNDLE;
 
 const RUNTIMES: &[&str] = &["node", "bun", "python", "rust", "go", "full"];
 

@@ -16,8 +16,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
-use temps_agents::sandbox::docker::{DockerSandboxConfig, DockerSandboxProvider};
-use temps_agents::sandbox::{SandboxCreateConfig, SandboxProvider};
+use temps_ai_agents::sandbox::docker::{DockerSandboxConfig, DockerSandboxProvider};
+use temps_ai_agents::sandbox::{SandboxCreateConfig, SandboxProvider};
 use temps_docker_capture::{assert_golden, golden_value, FakeDocker, Method, CAPTURED_MESSAGE};
 
 const IMAGE: &str = "alpine:3.20";

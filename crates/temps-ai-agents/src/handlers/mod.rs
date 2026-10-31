@@ -24,7 +24,7 @@ use crate::services::executor::AgentExecutor;
 use crate::services::run_service::AgentRunService;
 use crate::services::secret_service::SecretService;
 
-/// OpenAPI document for the temps-agents crate (`/projects/{project_id}/agents/*`,
+/// OpenAPI document for the temps-ai-agents crate (`/projects/{project_id}/agents/*`,
 /// `/projects/{project_id}/autofixer/*`, etc.).
 ///
 /// This document is merged into the unified Temps OpenAPI at

@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use temps_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
+use temps_ai_agents::sandbox::{stage_pty_agent_binary, TerminalCapability, PTY_AGENT_BINARY_NAME};
 
 use super::upgrade::{
     fetch_guest_agents_from_release, guest_agent_needs_fetch, ReleaseGuestAgents,
@@ -59,7 +59,7 @@ const SMOKE_IMAGE: &str = "busybox:stable";
 const SMOKE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Command that stages the guest terminal agent, shown with the reason when
 /// it is missing.
-const PTY_AGENT_SETUP_HINT: &str = temps_agents::sandbox::firecracker::PTY_AGENT_SETUP_COMMAND;
+const PTY_AGENT_SETUP_HINT: &str = temps_ai_agents::sandbox::firecracker::PTY_AGENT_SETUP_COMMAND;
 
 /// Manage the Firecracker microVM sandbox backend
 #[derive(Args)]

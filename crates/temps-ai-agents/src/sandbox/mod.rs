@@ -860,13 +860,13 @@ pub fn is_linux_elf(header: &[u8]) -> bool {
 /// # Boundary contract
 ///
 /// This trait is **the** sandbox boundary for the workspace. Every consumer
-/// — `temps-agents` executor, `temps-sandbox` standalone API, autofixer,
+/// — `temps-ai-agents` executor, `temps-sandbox` standalone API, autofixer,
 /// workspace session manager — holds `Arc<dyn SandboxProvider>` and must
 /// never reach past it into Docker, bollard, or any specific backend. Adding
 /// a new sandbox backend means adding a new `impl SandboxProvider`, not a
 /// new trait.
 ///
-/// The trait lives in `temps-agents` (rather than a neutral crate) because
+/// The trait lives in `temps-ai-agents` (rather than a neutral crate) because
 /// historically agent runs were the only consumer. It stays here for now
 /// to avoid churning 10+ downstream imports; if a third family of consumers
 /// appears, lift it into a dedicated `temps-sandbox-api` crate.
@@ -2055,7 +2055,7 @@ mod tests {
     /// Compile-time assertion that `SandboxProvider` is object-safe — i.e.
     /// `Arc<dyn SandboxProvider>` is legal. Every consumer holds the trait
     /// behind dynamic dispatch; breaking object-safety (by adding a generic
-    /// method or a `Self` return type) would cascade through `temps-agents`
+    /// method or a `Self` return type) would cascade through `temps-ai-agents`
     /// and `temps-sandbox`.
     ///
     /// This test does not run any code at runtime — the assertion is that

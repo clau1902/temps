@@ -13,7 +13,7 @@
 //! breaks the build.
 //!
 //! Usage:
-//!     cargo run -p temps-agents --example print_bundle -- <target-dir>
+//!     cargo run -p temps-ai-agents --example print_bundle -- <target-dir>
 //!
 //! The directory is created if it doesn't exist. Existing files are
 //! overwritten.
@@ -21,8 +21,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use temps_agents::sandbox::git_credential_bundle::BUNDLE as GIT_CREDENTIAL_BUNDLE;
-use temps_agents::sandbox::pty_agent_bundle::{BundleFile, BUNDLE as PTY_AGENT_BUNDLE};
+use temps_ai_agents::sandbox::git_credential_bundle::BUNDLE as GIT_CREDENTIAL_BUNDLE;
+use temps_ai_agents::sandbox::pty_agent_bundle::{BundleFile, BUNDLE as PTY_AGENT_BUNDLE};
 
 fn main() {
     let target = match std::env::args().nth(1) {

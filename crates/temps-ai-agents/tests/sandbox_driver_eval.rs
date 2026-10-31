@@ -47,10 +47,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
-use temps_agents::error::AgentError;
-use temps_agents::sandbox::driver::{capabilities_for, SandboxBackendDriver};
-use temps_agents::sandbox::facade::DriverSandboxProvider;
-use temps_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
+use temps_ai_agents::error::AgentError;
+use temps_ai_agents::sandbox::driver::{capabilities_for, SandboxBackendDriver};
+use temps_ai_agents::sandbox::facade::DriverSandboxProvider;
+use temps_ai_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
 use temps_workload::{ConditionKind, ConditionStatus, SandboxExt};
 
 /// Sandbox images the Docker run may use, best first. Only local images are
@@ -114,7 +114,7 @@ fn facade(backend: SandboxBackend, inner: Arc<dyn SandboxProvider>) -> Arc<Drive
     Arc::new(DriverSandboxProvider::new(vec![driver], backend, inner))
 }
 
-fn show(result: &temps_agents::sandbox::SandboxExecResult) -> String {
+fn show(result: &temps_ai_agents::sandbox::SandboxExecResult) -> String {
     format!(
         "exit {} stdout {:?} stderr {:?}",
         result.exit_code, result.stdout, result.stderr
@@ -373,16 +373,17 @@ async fn docker_driver_passes_the_sandbox_contract() {
         return;
     };
     let _serial = SERIAL.lock().await;
-    let inner: Arc<dyn SandboxProvider> =
-        Arc::new(temps_agents::sandbox::docker::DockerSandboxProvider::new(
+    let inner: Arc<dyn SandboxProvider> = Arc::new(
+        temps_ai_agents::sandbox::docker::DockerSandboxProvider::new(
             docker,
-            temps_agents::sandbox::docker::DockerSandboxConfig {
+            temps_ai_agents::sandbox::docker::DockerSandboxConfig {
                 runtime: "custom".to_string(),
                 custom_image: image.clone(),
                 network_mode: "none".to_string(),
                 ..Default::default()
             },
-        ));
+        ),
+    );
     let label = format!("p6eval-{}", suffix());
     println!("docker driver eval: image {image}, sandbox temps-sandbox-{label}");
     let proven = contract(
@@ -410,7 +411,7 @@ fn msb_data_dir() -> Result<PathBuf, String> {
     if !shared.join("bin").join("msb").exists() {
         return Err(format!(
             "no microsandbox runtime under {} (install it with \
-             TEMPS_E2E_MICROSANDBOX_INSTALL=1 cargo test -p temps-agents --test \
+             TEMPS_E2E_MICROSANDBOX_INSTALL=1 cargo test -p temps-ai-agents --test \
              netpol_microsandbox_e2e)",
             shared.display()
         ));
@@ -431,7 +432,7 @@ fn msb_data_dir() -> Result<PathBuf, String> {
 
 #[tokio::test]
 async fn microsandbox_driver_passes_the_sandbox_contract() {
-    use temps_agents::sandbox::microsandbox::{
+    use temps_ai_agents::sandbox::microsandbox::{
         MicrosandboxSandboxConfig, MicrosandboxSandboxProvider,
     };
     let data_dir = match msb_data_dir() {
@@ -509,7 +510,7 @@ fn firecracker_or_skip() -> Option<PathBuf> {
 
 #[tokio::test]
 async fn firecracker_driver_passes_the_sandbox_contract() {
-    use temps_agents::sandbox::firecracker::{
+    use temps_ai_agents::sandbox::firecracker::{
         FirecrackerSandboxConfig, FirecrackerSandboxProvider,
     };
     let Some(data_dir) = firecracker_or_skip() else {

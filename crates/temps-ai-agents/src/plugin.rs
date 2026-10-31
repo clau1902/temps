@@ -1010,7 +1010,7 @@ impl TempsPlugin for AgentsPlugin {
             );
             // Register the bare sandbox provider as `dyn SandboxProvider` so
             // other plugins (e.g. workspace) can pick it up via the trait
-            // without depending on temps-agents directly.
+            // without depending on temps-ai-agents directly.
             context.register_service(sandbox_provider.clone());
             // ADR-055 Phase 10: offered to the deployments plugin's workload
             // plane, which runs `micro_vm` replicas on it. Absent when this

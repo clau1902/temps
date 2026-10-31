@@ -16,7 +16,7 @@ use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use temps_agents::AgentsPlugin;
+use temps_ai_agents::AgentsPlugin;
 use temps_analytics::AnalyticsPlugin;
 use temps_analytics_events::EventsPlugin;
 use temps_analytics_funnels::FunnelsPlugin;

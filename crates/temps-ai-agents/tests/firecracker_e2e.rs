@@ -10,7 +10,7 @@
 //! — same pattern as the Docker-gated eval harness.
 //!
 //!   TEMPS_FC_E2E=1 TEMPS_DATA_DIR=~/.temps-fc-test \
-//!     cargo test -p temps-agents --test firecracker_e2e -- --nocapture
+//!     cargo test -p temps-ai-agents --test firecracker_e2e -- --nocapture
 //!
 //! Everything goes through `Arc<dyn SandboxProvider>` on the routing
 //! provider — the exact seam every consumer uses.
@@ -29,9 +29,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use temps_agents::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};
-use temps_agents::sandbox::routing::RoutingSandboxProvider;
-use temps_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
+use temps_ai_agents::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};
+use temps_ai_agents::sandbox::routing::RoutingSandboxProvider;
+use temps_ai_agents::sandbox::{SandboxBackend, SandboxCreateConfig, SandboxProvider};
 
 fn gated() -> Option<PathBuf> {
     if std::env::var("TEMPS_FC_E2E").as_deref() != Ok("1") {

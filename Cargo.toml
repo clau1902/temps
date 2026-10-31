@@ -101,7 +101,7 @@ members = [
     "crates/temps-wireguard",
     "crates/temps-ai-agent-cli",
     "crates/temps-ai-gateway",
-    "crates/temps-agents",
+    "crates/temps-ai-agents",
     "crates/temps-agents-mcp-proxy",
     "crates/temps-memory",
     "crates/temps-sandbox",

@@ -193,7 +193,7 @@ Network access is part of the workload spec, so it is chosen when the workload i
 | `temps-workload-docker` | `container_create_body` places every container under its workload slice (`cgroup_parent`, §4.15), sets its Temps-assigned address (`EndpointIpamConfig.ipv4_address`, §4.8) and attaches a sandbox to the overlay as a second interface, only when its node enforces (§4.4); Temps networks created from now on get Docker's `IPRange` fence (§4.8) |
 | `temps-workload-env` | sandbox service variables use `primary.<svc>.temps.local` for clusters and `<svc>.temps.local` for single instances |
 | `temps-providers` (`sandbox_*.rs`) | remove `require_local`; provision through the worker data address |
-| `temps-agents` (`sandbox/firecracker.rs`) | `restricted` uses the rule model on the VM's TAP instead of falling back to no network (§4.12) |
+| `temps-ai-agents` (`sandbox/firecracker.rs`) | `restricted` uses the rule model on the VM's TAP instead of falling back to no network (§4.12) |
 | `temps-workload-ingress` | the HTTP ingress (the proxy) is a `system` source for workloads with restricted ingress (§4.14); its own endpoint and access policies are unchanged |
 | `temps-workload-activator`, `temps-workload-volumes`, `temps-workload-wasm` | unchanged, apart from WASM reporting `none` at admission (§4.6) |
 | `web` | `NetworkAccessFields`, the "Network access" card, the node enforcement flow, the §5 messages |

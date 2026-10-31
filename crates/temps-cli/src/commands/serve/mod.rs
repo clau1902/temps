@@ -1106,7 +1106,7 @@ impl ServeCommand {
                         .unwrap_or_else(|| PathBuf::from("."))
                         .join(".temps")
                 });
-            temps_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
+            temps_ai_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
         }
 
         // Traefik-label discovery: adopt containers the operator already runs

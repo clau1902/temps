@@ -38,7 +38,7 @@ use std::time::Duration;
 
 use bollard::Docker;
 use futures::StreamExt;
-use temps_agents::sandbox::docker::dockerfile_for_runtime;
+use temps_ai_agents::sandbox::docker::dockerfile_for_runtime;
 
 /// Generate the build-context tar bytes the sandbox image expects. Mirrors
 /// the in-crate `build_context_tar` (private) by walking the public bundle
@@ -59,8 +59,8 @@ fn build_test_context() -> Vec<u8> {
         header.set_cksum();
         tar_builder.append(&header, dockerfile_bytes).unwrap();
 
-        temps_agents::sandbox::pty_agent_bundle::append_to_tar(&mut tar_builder).unwrap();
-        temps_agents::sandbox::git_credential_bundle::append_to_tar(&mut tar_builder).unwrap();
+        temps_ai_agents::sandbox::pty_agent_bundle::append_to_tar(&mut tar_builder).unwrap();
+        temps_ai_agents::sandbox::git_credential_bundle::append_to_tar(&mut tar_builder).unwrap();
 
         tar_builder.finish().unwrap();
     }

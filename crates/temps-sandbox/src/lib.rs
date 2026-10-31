@@ -12,8 +12,8 @@
 //! API, it has no multi-phase workflow or PR creation.
 //!
 //! Architecture:
-//! - One shared [`SandboxProvider`](temps_agents::sandbox::SandboxProvider)
-//!   instance is registered by the `temps-agents` plugin and consumed here.
+//! - One shared [`SandboxProvider`](temps_ai_agents::sandbox::SandboxProvider)
+//!   instance is registered by the `temps-ai-agents` plugin and consumed here.
 //! - Sandboxes are persisted in the `sandboxes` table so that the API can
 //!   enumerate them and recover container handles across restarts.
 //! - Public IDs are opaque strings (e.g. `sbx_a1b2c3d4`) so callers never

@@ -57,7 +57,7 @@ pub const PROVIDER_NAME: &str = "microsandbox";
 /// matching release; the SDK refuses a mismatched pair.
 ///
 /// Must equal the exact `microsandbox` version pinned in
-/// `crates/temps-agents/Cargo.toml`. A test in `sdk.rs` compares it with the
+/// `crates/temps-ai-agents/Cargo.toml`. A test in `sdk.rs` compares it with the
 /// SDK's own default runtime version so a dependency bump that forgets this
 /// constant fails CI instead of shipping a backend that installs a runtime
 /// the SDK then rejects.

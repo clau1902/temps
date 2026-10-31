@@ -641,9 +641,9 @@ fn combined_snapshot_digest(image_digest: &str, workspace_digest: &str) -> Strin
 /// env vars the scrubber strips. Adding a new secret kind to the sandbox API
 /// must be accompanied by adding its pattern here. Keep this in sync with
 /// every env var injected at sandbox creation time in:
-///   - `crates/temps-agents/src/services/executor.rs`  (CLAUDE_CODE_OAUTH_TOKEN)
-///   - `crates/temps-agents/src/handlers/trigger.rs`   (CLAUDE_CODE_OAUTH_TOKEN)
-///   - `crates/temps-agents/src/services/sandbox_injector.rs`
+///   - `crates/temps-ai-agents/src/services/executor.rs`  (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-ai-agents/src/handlers/trigger.rs`   (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-ai-agents/src/services/sandbox_injector.rs`
 pub(crate) const SENSITIVE_ENV_PATTERNS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "OPENAI_API_KEY",
@@ -11279,8 +11279,8 @@ const expectDenied = async (host, port, reason) => {{
 
     /// Regression: all env var names that are known to be injected into sandboxes
     /// at create time must be classified as sensitive. Keep this list in sync with:
-    ///   - crates/temps-agents/src/services/executor.rs  (CLAUDE_CODE_OAUTH_TOKEN)
-    ///   - crates/temps-agents/src/handlers/trigger.rs   (CLAUDE_CODE_OAUTH_TOKEN)
+    ///   - crates/temps-ai-agents/src/services/executor.rs  (CLAUDE_CODE_OAUTH_TOKEN)
+    ///   - crates/temps-ai-agents/src/handlers/trigger.rs   (CLAUDE_CODE_OAUTH_TOKEN)
     ///
     /// If a new credential injection site is added without updating
     /// SENSITIVE_ENV_PATTERNS, this test fails and blocks the merge.

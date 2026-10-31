@@ -227,7 +227,7 @@ pub fn install_tracing_with_otel(
              temps_ai_gateway={level},\
              temps_ai_chat={level},\
              temps_ai_api_tools={level},\
-             temps_agents={level},\
+             temps_ai_agents={level},\
              temps_sandbox={level},\
              temps_network_policy={level},\
              temps_workload={level},\

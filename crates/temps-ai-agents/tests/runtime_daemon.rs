@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! Opt-in real-provider test: build the three :*-dev-4 images before running.
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use temps_agents::sandbox::{
+use temps_ai_agents::sandbox::{
     docker::{DockerSandboxConfig, DockerSandboxProvider},
     SandboxCreateConfig, SandboxProvider,
 };

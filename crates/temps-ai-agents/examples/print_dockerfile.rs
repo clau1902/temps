@@ -10,11 +10,11 @@
 //! teaching an extra Rust example to speak buildx.
 //!
 //! Usage:
-//!     cargo run -p temps-agents --example print_dockerfile -- <runtime>
+//!     cargo run -p temps-ai-agents --example print_dockerfile -- <runtime>
 //!
 //! Valid runtimes: node, bun, python, rust, go, full.
 
-use temps_agents::sandbox::docker::dockerfile_for_runtime;
+use temps_ai_agents::sandbox::docker::dockerfile_for_runtime;
 
 const VALID_RUNTIMES: &[&str] = &["node", "bun", "python", "rust", "go", "full"];
 
