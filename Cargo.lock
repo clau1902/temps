@@ -13042,11 +13042,11 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
- "temps-dns-resolver",
  "temps-docker-capture",
  "temps-entities",
  "temps-file-store",
  "temps-network",
+ "temps-node-dns",
  "temps-presets",
  "temps-routes",
  "temps-runtime-health",
@@ -13206,9 +13206,9 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-database",
- "temps-dns-resolver",
  "temps-entities",
  "temps-migrations",
+ "temps-node-dns",
  "temps-projects",
  "temps-workload",
  "temps-workload-netpol",
@@ -13220,28 +13220,6 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "temps-dns-resolver"
-version = "0.1.0-beta.57"
-dependencies = [
- "arc-swap",
- "async-trait",
- "hickory-proto",
- "hickory-resolver",
- "hickory-server",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "tempfile",
- "temps-core",
- "temps-workload",
- "temps-workload-netpol",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
  "wiremock",
 ]
 
@@ -14243,7 +14221,7 @@ dependencies = [
  "hickory-server",
  "serde",
  "serde_json",
- "temps-dns-resolver",
+ "temps-node-dns",
  "temps-workload",
  "temps-workload-netpol",
  "thiserror 2.0.21",
@@ -14348,12 +14326,12 @@ dependencies = [
  "temps-auth",
  "temps-core",
  "temps-deployer",
- "temps-dns-resolver",
  "temps-docker-capture",
  "temps-entities",
  "temps-external-plugins",
  "temps-metrics",
  "temps-network",
+ "temps-node-dns",
  "temps-providers",
  "temps-runtime-health",
  "temps-shield",
@@ -14373,6 +14351,28 @@ dependencies = [
  "uuid",
  "x25519-dalek",
  "x509-parser",
+]
+
+[[package]]
+name = "temps-node-dns"
+version = "0.1.0-beta.57"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "hickory-proto",
+ "hickory-resolver",
+ "hickory-server",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-core",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -14666,13 +14666,13 @@ dependencies = [
  "temps-database",
  "temps-deployment-logs",
  "temps-dns",
- "temps-dns-resolver",
  "temps-docker-capture",
  "temps-entities",
  "temps-metrics",
  "temps-migrations",
  "temps-monitoring",
  "temps-network",
+ "temps-node-dns",
  "temps-query",
  "temps-query-mongodb",
  "temps-query-postgres",

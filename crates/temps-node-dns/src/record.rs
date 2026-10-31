@@ -4,7 +4,7 @@
 //! Wire-format records consumed from the sync API and the on-disk snapshot.
 //!
 //! Mirrors `temps-dns::handlers::dns_sync::EndpointDto` but is defined here
-//! to keep `temps-dns-resolver` free of any dependency on `temps-dns`. The
+//! to keep `temps-node-dns` free of any dependency on `temps-dns`. The
 //! types serialise identically — the sync client deserialises the same JSON
 //! the control plane emits.
 

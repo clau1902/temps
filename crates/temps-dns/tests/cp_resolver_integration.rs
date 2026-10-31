@@ -40,7 +40,7 @@ use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
 const TEST_FQDN: &str = "itest-app.temps.local";
 const TEST_IP: &str = "10.123.45.67";
 /// A hickory stub resolver pointed straight at our resolver's UDP socket —
-/// the same shape as `temps-dns-resolver`'s own end-to-end client.
+/// the same shape as `temps-node-dns`'s own end-to-end client.
 fn dns_client(resolver_addr: SocketAddr) -> TokioResolver {
     let mut cfg = ClientResolverConfig::default();
     let mut name_server = NameServerConfig::udp(resolver_addr.ip());
@@ -101,7 +101,7 @@ async fn cp_resolver_serves_zone_from_real_db() {
     let snapshot_dir =
         std::env::temp_dir().join(format!("temps-cp-dns-itest-{}", uuid::Uuid::new_v4()));
     let mut config =
-        temps_dns_resolver::ResolverConfig::new_local_feed(0, resolver_addr.ip(), snapshot_dir);
+        temps_node_dns::ResolverConfig::new_local_feed(0, resolver_addr.ip(), snapshot_dir);
     config.listen_addrs = vec![resolver_addr];
     config.upstream_resolvers.clear();
     let resolver = temps_dns::start_control_plane_resolver_with_config(db.clone(), config)

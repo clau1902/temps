@@ -4,7 +4,7 @@
 //! Long-poll client that mirrors the CP's internal-zone route table
 //! into [`RouteStore`].
 //!
-//! Same shape as `temps-dns-resolver::sync_client`: one tokio task,
+//! Same shape as `temps-node-dns::sync_client`: one tokio task,
 //! `since=current_generation`, the CP holds the request open until a
 //! reload happens or its long-poll deadline fires, the client
 //! `apply_snapshot`s the result and then ACKs. Restart-resilient via

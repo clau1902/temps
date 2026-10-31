@@ -130,9 +130,6 @@
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 2
     },
-    "temps-dns-resolver": {
-      "lazy_error_variants": 1
-    },
     "temps-domains": {
       "lazy_error_variants": 27,
       "ignore_with_reason": 3,
@@ -268,6 +265,9 @@
     "temps-node-agent": {
       "lazy_error_variants": 25,
       "functions_over_300_lines": 4
+    },
+    "temps-node-dns": {
+      "lazy_error_variants": 1
     },
     "temps-notifications": {
       "lazy_error_variants": 1,

@@ -1244,7 +1244,7 @@ mod tests {
             .unwrap()
             .status()
             .is_success());
-        let mut dns = temps_dns_resolver::ResolverConfig::new(
+        let mut dns = temps_node_dns::ResolverConfig::new(
             1,
             "token".into(),
             legacy_url.clone(),
@@ -1252,15 +1252,11 @@ mod tests {
             dir.path().join("dns"),
         );
         crate::network_sync::apply_dns_control_plane_trust(&config, &mut dns).await;
-        let sync = temps_dns_resolver::SyncClient::new(
+        let sync = temps_node_dns::SyncClient::new(
             dns,
-            std::sync::Arc::new(temps_dns_resolver::ZoneStore::new(
-                dir.path().join("zone.json"),
-            )),
+            std::sync::Arc::new(temps_node_dns::ZoneStore::new(dir.path().join("zone.json"))),
             std::sync::Arc::new(tokio::sync::Notify::new()),
-            std::sync::Arc::new(std::sync::RwLock::new(
-                temps_dns_resolver::SyncStatus::default(),
-            )),
+            std::sync::Arc::new(std::sync::RwLock::new(temps_node_dns::SyncStatus::default())),
         )
         .unwrap();
         sync.tick_once().await.unwrap();
@@ -1308,7 +1304,7 @@ mod tests {
                 .unwrap()
                 .status()
                 .is_success());
-            let mut dns = temps_dns_resolver::ResolverConfig::new(
+            let mut dns = temps_node_dns::ResolverConfig::new(
                 1,
                 "token".into(),
                 url.clone(),
@@ -1316,15 +1312,11 @@ mod tests {
                 dir.path().join("dns"),
             );
             crate::network_sync::apply_dns_control_plane_trust(&config, &mut dns).await;
-            let sync = temps_dns_resolver::SyncClient::new(
+            let sync = temps_node_dns::SyncClient::new(
                 dns,
-                std::sync::Arc::new(temps_dns_resolver::ZoneStore::new(
-                    dir.path().join("zone.json"),
-                )),
+                std::sync::Arc::new(temps_node_dns::ZoneStore::new(dir.path().join("zone.json"))),
                 std::sync::Arc::new(tokio::sync::Notify::new()),
-                std::sync::Arc::new(std::sync::RwLock::new(
-                    temps_dns_resolver::SyncStatus::default(),
-                )),
+                std::sync::Arc::new(std::sync::RwLock::new(temps_node_dns::SyncStatus::default())),
             )
             .unwrap();
             sync.tick_once().await.unwrap();

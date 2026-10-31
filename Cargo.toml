@@ -84,7 +84,7 @@ members = [
     "crates/temps-email",
     "crates/temps-email-tracking",
     "crates/temps-dns",
-    "crates/temps-dns-resolver",
+    "crates/temps-node-dns",
     "crates/temps-vulnerability-scanner",
     "crates/temps-kv",
     "crates/temps-flags",

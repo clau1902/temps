@@ -26,10 +26,10 @@ use chrono::{DateTime, Utc};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use temps_deployer::{ContainerDeployer, ContainerInfo};
-use temps_dns_resolver::{
+use temps_network::{overlay_name, NetworkConfig, NetworkManager, NodeAlloc, OverlayNames, Peer};
+use temps_node_dns::{
     DnsPolicySlot, ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
 };
-use temps_network::{overlay_name, NetworkConfig, NetworkManager, NodeAlloc, OverlayNames, Peer};
 use temps_wireguard::mesh::{MeshInterface, MeshKey, MeshPeer};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -2333,7 +2333,7 @@ async fn reconcile_resolver(
 
 /// Whether the resolver on `bridge_address` answers its readiness marker.
 async fn resolver_answers(bridge_address: IpAddr) -> bool {
-    temps_dns_resolver::probe::probe_resolver(std::net::SocketAddr::new(bridge_address, 53)).await
+    temps_node_dns::probe::probe_resolver(std::net::SocketAddr::new(bridge_address, 53)).await
 }
 
 /// Set (or clear) the resolver address handed to new containers.
@@ -2359,7 +2359,7 @@ fn publish_resolver_address(
 fn publish_dns_health(
     dns_health: &SharedDnsHealth,
     running: bool,
-    status: Option<&temps_dns_resolver::ResolverStatus>,
+    status: Option<&temps_node_dns::ResolverStatus>,
     start_error: Option<String>,
 ) {
     let snapshot = match status {
@@ -3006,9 +3006,9 @@ mod tests {
     fn publish_dns_health_running_healthy_mirrors_resolver_status() {
         let slot = empty_dns_health();
         let now = std::time::SystemTime::now();
-        let status = temps_dns_resolver::ResolverStatus {
+        let status = temps_node_dns::ResolverStatus {
             tasks_alive: true,
-            sync: temps_dns_resolver::SyncStatus {
+            sync: temps_node_dns::SyncStatus {
                 last_success_at: Some(now),
                 consecutive_failures: 0,
                 last_error: None,
@@ -3031,9 +3031,9 @@ mod tests {
     #[test]
     fn publish_dns_health_dead_task_reports_tasks_alive_false() {
         let slot = empty_dns_health();
-        let status = temps_dns_resolver::ResolverStatus {
+        let status = temps_node_dns::ResolverStatus {
             tasks_alive: false,
-            sync: temps_dns_resolver::SyncStatus {
+            sync: temps_node_dns::SyncStatus {
                 last_success_at: None,
                 consecutive_failures: 3,
                 last_error: Some("sync tick failed: connection refused".into()),

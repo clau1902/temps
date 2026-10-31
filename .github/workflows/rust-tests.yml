@@ -1111,9 +1111,9 @@ jobs:
             # This list is deliberately short. Every candidate was run
             # locally first, and two were dropped because they FAIL today —
             # they are not in scope here and each needs its own fix:
-            #   temps-dns-resolver  both end_to_end tests time out
+            #   temps-node-dns      both end_to_end tests time out
             #                       ("first sync converged: Elapsed(())")
-            #   temps-ai-agents        sandbox_credential_smoke_test builds a
+            #   temps-ai-agents     sandbox_credential_smoke_test builds a
             #                       Docker image; `cargo build --release
             #                       --bin temps-pty-agent` exits 101
             # Also excluded, needing infrastructure CI does not have:

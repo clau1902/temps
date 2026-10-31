@@ -266,7 +266,7 @@ pub fn spawn_worker_enforcer(
     node_id: i32,
     token: String,
     docker: Docker,
-    dns: temps_dns_resolver::DnsPolicySlot,
+    dns: temps_node_dns::DnsPolicySlot,
     data_dir: &std::path::Path,
 ) -> Result<tokio::task::JoinHandle<()>, EnforcerError> {
     let node = format!("node-{node_id}");

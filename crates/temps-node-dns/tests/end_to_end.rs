@@ -30,7 +30,7 @@ use hickory_resolver::config::{
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use tempfile::tempdir;
-use temps_dns_resolver::{ResolverConfig, ResolverHandle};
+use temps_node_dns::{ResolverConfig, ResolverHandle};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 

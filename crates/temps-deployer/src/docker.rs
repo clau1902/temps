@@ -969,9 +969,9 @@ fn extract_bounded_static_archive(
 /// Appends the host's own DNS servers to the cluster resolver, so it is never
 /// a container's only nameserver. Shared by the app-container path
 /// ([`DockerRuntime::dns_for_container`]), the workload plane and managed
-/// services; lives in `temps-dns-resolver` next to the resolver's own
+/// services; lives in `temps-node-dns` next to the resolver's own
 /// upstream selection.
-pub use temps_dns_resolver::host_dns::dns_with_fallback;
+pub use temps_node_dns::host_dns::dns_with_fallback;
 
 /// The one bind a project granted host Docker access receives, or `None`.
 ///
@@ -5795,7 +5795,7 @@ mod docker_tests {
     /// against the local Docker daemon — no mocks — because the bug lived
     /// in what Docker actually writes to `/etc/resolv.conf`, not in our
     /// in-memory list-building logic (already covered by the pure
-    /// `dns_for_container` tests above and `temps_dns_resolver::host_dns`).
+    /// `dns_for_container` tests above and `temps_node_dns::host_dns`).
     /// The worker side of static extraction: a path is streamed out of a
     /// local image as a container-archive tar the control plane can unpack.
     #[tokio::test]
@@ -5924,7 +5924,7 @@ mod docker_tests {
             lookup.contains("Address") && !lookup.contains("TIMED OUT"),
             "external DNS resolution did not fail over to the host's own \
              default DNS servers when the primary resolver was unreachable \
-             — temps-dns-resolver is still a SPOF: {lookup}"
+             — temps-node-dns is still a SPOF: {lookup}"
         );
     }
 

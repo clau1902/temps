@@ -44,7 +44,7 @@ temps-deployer = { path = "../temps-deployer" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-network = { path = "../temps-network" }
 temps-wireguard = { path = "../temps-wireguard" }
-temps-dns-resolver = { path = "../temps-dns-resolver" }
+temps-node-dns = { path = "../temps-node-dns" }
 chrono = { workspace = true }
 temps-providers = { path = "../temps-providers" }
 # The node runtime (ADR-055 §7).

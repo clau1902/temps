@@ -29,7 +29,7 @@ use hickory_resolver::config::{
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::TokioResolver;
 use hickory_server::server::Server;
-use temps_dns_resolver::{ZoneAuthority, ZoneRecord, ZoneStore};
+use temps_node_dns::{ZoneAuthority, ZoneRecord, ZoneStore};
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_netpol::dns::{group_short_name, Alias, NamedWorkload};
 use temps_workload_netpol::{

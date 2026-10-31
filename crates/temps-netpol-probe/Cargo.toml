@@ -19,7 +19,7 @@ path = "src/main.rs"
 [dependencies]
 temps-workload = { path = "../temps-workload" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
-temps-dns-resolver = { path = "../temps-dns-resolver", default-features = false }
+temps-node-dns = { path = "../temps-node-dns", default-features = false }
 hickory-server = { workspace = true }
 hickory-proto = { workspace = true, features = ["std"] }
 arc-swap = { workspace = true }

@@ -52,7 +52,7 @@ pub struct SharedNetwork {
     /// The network policy enforcer's DNS view, which the node resolver
     /// answers restricted workloads from. The same slot must be given to
     /// [`crate::network_policy::spawn_worker_enforcer`].
-    pub dns_policy: temps_dns_resolver::DnsPolicySlot,
+    pub dns_policy: temps_node_dns::DnsPolicySlot,
 }
 
 /// Build the agent Axum router with authentication middleware.
@@ -1735,7 +1735,7 @@ pub(crate) mod tests {
                 overlay_bridge_address: Default::default(),
                 overlay_peers: Default::default(),
                 host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
-                dns_policy: temps_dns_resolver::open_dns_policy_slot(),
+                dns_policy: temps_node_dns::open_dns_policy_slot(),
             },
             Default::default(),
         );
