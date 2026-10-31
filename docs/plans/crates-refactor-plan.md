@@ -306,7 +306,7 @@ Each line is one PR, small, low-risk and independently reviewable.
 
 ## 9. Execution and progress
 
-**Model.** `refactor/crates-refactor-30-oct` is the integration branch, with one draft PR into `main` so the full CI runs on the combined state. Each lane runs as an agent in its own worktree and opens a PR into the integration branch. The orchestrator verifies each lane and merges it, and the next wave starts from the merged result. Lanes are assigned by **file ownership**, not by priority, so parallel lanes never edit the same files. At most 3 lanes run at once, because of disk use by per-worktree build targets.
+**Model.** `refactor/crates-refactor-30-oct` is the integration branch, with one draft PR into `main` so the full CI runs on the combined state. Each lane runs as an agent in its own worktree and opens a PR into the integration branch. The orchestrator verifies each lane and merges it, and the next wave starts from the merged result. Lanes are assigned by **file ownership**, not by priority, so parallel lanes never edit the same files. At most 3 lanes run at once.
 
 | Wave | Lane | Content | Status |
 |---|---|---|---|
