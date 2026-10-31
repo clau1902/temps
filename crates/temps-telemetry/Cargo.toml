@@ -32,3 +32,6 @@ chrono = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 temps-entities = { path = "../temps-entities" }
+
+[lints]
+workspace = true

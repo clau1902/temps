@@ -49,3 +49,6 @@ reqwest = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 tokio-test = "0.4"
 walkdir = { workspace = true }
+
+[lints]
+workspace = true

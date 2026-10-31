@@ -88,3 +88,6 @@ hickory-resolver = "0.26"
 arc-swap = { workspace = true }
 temps-workload = { path = "../temps-workload" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
+
+[lints]
+workspace = true

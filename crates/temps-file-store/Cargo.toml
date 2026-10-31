@@ -26,3 +26,6 @@ uuid = { workspace = true }
 tokio-test = "0.4"
 tempfile = { workspace = true }
 serial_test = "4.0"
+
+[lints]
+workspace = true

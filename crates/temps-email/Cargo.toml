@@ -78,3 +78,6 @@ temps-migrations = { path = "../temps-migrations" }
 tower = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }
+
+[lints]
+workspace = true

@@ -66,3 +66,6 @@ tar = { workspace = true }
 tower.workspace = true
 wiremock = "0.6"
 serial_test = "4.0"
+
+[lints]
+workspace = true

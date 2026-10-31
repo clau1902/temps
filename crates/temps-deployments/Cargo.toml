@@ -115,3 +115,6 @@ rsa = { version = "0.9", features = ["pem"] }
 [features]
 default = []
 integration-tests = []
+
+[lints]
+workspace = true

@@ -29,3 +29,6 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 yaml_serde = { workspace = true }
 url = { workspace = true }
+
+[lints]
+workspace = true

@@ -65,3 +65,6 @@ sysinfo = { workspace = true }
 temps-database = { path = "../temps-database" }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 tempfile = { workspace = true }
+
+[lints]
+workspace = true

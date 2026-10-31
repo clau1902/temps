@@ -41,3 +41,6 @@ openapi = ["utoipa"]
 tempfile = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

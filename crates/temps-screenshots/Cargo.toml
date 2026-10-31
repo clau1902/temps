@@ -47,3 +47,6 @@ temps-database = { path = "../temps-database" }
 sea-orm = { workspace = true }
 temps-entities = { path = "../temps-entities" }
 chrono = { workspace = true }
+
+[lints]
+workspace = true

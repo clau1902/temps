@@ -55,3 +55,6 @@ subtle = "2.6"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

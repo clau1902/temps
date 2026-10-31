@@ -62,3 +62,6 @@ base64 = { workspace = true }
 
 # Fetches Cloudflare Access signing keys (ADR 065 D9).
 reqwest = { workspace = true }
+
+[lints]
+workspace = true

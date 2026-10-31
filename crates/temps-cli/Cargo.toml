@@ -180,3 +180,6 @@ temps-plugin-sdk = { path = "../temps-plugin-sdk" }
 
 [build-dependencies]
 chrono = { workspace = true }
+
+[lints]
+workspace = true

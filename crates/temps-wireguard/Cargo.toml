@@ -34,3 +34,6 @@ nix = { version = "0.31", features = ["net"] }
 [features]
 # Real-kernel tests (tests/it_mesh_kernel.rs); never part of a plain `cargo test`.
 integration_kernel = []
+
+[lints]
+workspace = true

@@ -67,3 +67,6 @@ integration_kernel = []
 # (`temps-cli serve`) but NOT by workers, who only need the data-plane
 # surface. Keeps worker build trees lean.
 control_plane = ["dep:sea-orm", "dep:temps-entities", "dep:chrono", "dep:sha2", "dep:hex"]
+
+[lints]
+workspace = true

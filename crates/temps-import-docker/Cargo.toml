@@ -34,3 +34,6 @@ sea-orm = { workspace = true }
 temps-database = { path = "../temps-database" }
 temps-git = { path = "../temps-git" }
 temps-deployments = { path = "../temps-deployments" }
+
+[lints]
+workspace = true

@@ -73,3 +73,6 @@ temps-routes = { path = "../temps-routes" }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true

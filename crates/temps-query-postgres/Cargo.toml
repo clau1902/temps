@@ -26,3 +26,6 @@ futures-util = "0.3"
 
 [dev-dependencies]
 testcontainers = { workspace = true }
+
+[lints]
+workspace = true

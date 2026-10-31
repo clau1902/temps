@@ -32,3 +32,6 @@ validator = { version = "0.21", optional = true, features = ["derive"] }
 [features]
 default = []
 validation = ["validator"]
+
+[lints]
+workspace = true

@@ -49,3 +49,6 @@ rcgen = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
+
+[lints]
+workspace = true

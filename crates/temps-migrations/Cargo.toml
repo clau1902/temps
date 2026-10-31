@@ -24,3 +24,6 @@ tokio = { workspace = true }
 anyhow = { workspace = true }
 # LISTEN for the NOTIFYs route triggers send.
 sqlx = { workspace = true }
+
+[lints]
+workspace = true

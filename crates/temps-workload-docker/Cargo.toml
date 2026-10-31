@@ -28,3 +28,6 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 temps-docker-capture = { path = "../temps-docker-capture" }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

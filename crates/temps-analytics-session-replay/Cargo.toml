@@ -63,3 +63,6 @@ tokio = { version = "1", features = ["full", "test-util"] }
 axum-test = "21.0.0"
 # Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
 tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

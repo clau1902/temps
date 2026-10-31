@@ -54,3 +54,6 @@ tower = { version = "0.5", features = ["util"] }
 tokio-test = "0.4"
 testcontainers = { workspace = true }
 bollard = { workspace = true }
+
+[lints]
+workspace = true

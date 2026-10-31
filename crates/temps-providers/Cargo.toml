@@ -79,3 +79,6 @@ tokio-test = "0.4"
 testcontainers = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 temps-migrations = { path = "../temps-migrations" }
+
+[lints]
+workspace = true

@@ -42,3 +42,6 @@ testcontainers = { workspace = true, features = ["http_wait_plain"] }
 sea-orm-migration = { workspace = true }
 uuid = { workspace = true }
 anyhow = { workspace = true }
+
+[lints]
+workspace = true

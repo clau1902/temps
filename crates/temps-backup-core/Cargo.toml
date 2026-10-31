@@ -37,3 +37,6 @@ tracing = { workspace = true }
 temps-database = { path = "../temps-database" }
 sea-orm = { workspace = true, features = ["mock"] }
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true

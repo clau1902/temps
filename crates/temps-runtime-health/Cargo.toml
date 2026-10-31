@@ -27,3 +27,6 @@ tempfile = { workspace = true }
 bollard = { workspace = true }
 testcontainers = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

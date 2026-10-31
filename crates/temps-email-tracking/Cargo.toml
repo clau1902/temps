@@ -70,3 +70,6 @@ x509-parser = "0.18"
 [dev-dependencies]
 tokio-test = "0.4"
 temps-migrations = { path = "../temps-migrations" }
+
+[lints]
+workspace = true
