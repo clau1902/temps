@@ -546,7 +546,7 @@ export function Account() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Two-Factor Authentication</CardTitle>
+          <CardTitle>Two-factor authentication</CardTitle>
           <CardDescription>
             Add an extra layer of security to your account by enabling
             two-factor authentication
@@ -580,7 +580,7 @@ export function Account() {
               {isSettingUpMfa && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
-              Setup 2FA
+              Set up 2FA
             </Button>
           )}
         </CardContent>
@@ -656,7 +656,7 @@ export function Account() {
       <Dialog open={showMfaDialog} onOpenChange={setShowMfaDialog}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Setup Two-Factor Authentication</DialogTitle>
+            <DialogTitle>Set up two-factor authentication</DialogTitle>
             <DialogDescription>
               Scan the QR code with your authenticator app and enter the
               verification code below.
@@ -741,7 +741,7 @@ export function Account() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Disable Two-Factor Authentication</DialogTitle>
+            <DialogTitle>Disable two-factor authentication</DialogTitle>
             <DialogDescription>
               Enter a code from your authenticator app, or one of your
               recovery codes, to confirm disabling two-factor

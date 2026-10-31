@@ -712,7 +712,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
 
         <Card>
           <CardHeader>
-            <CardTitle>Setup analytics to track performance</CardTitle>
+            <CardTitle>Set up analytics to track performance</CardTitle>
             <CardDescription>
               The Temps analytics SDK automatically tracks Core Web Vitals
               alongside page views and events
