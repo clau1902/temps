@@ -13696,6 +13696,7 @@ name = "temps-edge"
 version = "0.1.0-beta.57"
 dependencies = [
  "aes-gcm",
+ "arc-swap",
  "async-trait",
  "axum",
  "base64 0.23.1",
