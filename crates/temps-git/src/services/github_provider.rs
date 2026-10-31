@@ -332,10 +332,6 @@ impl ScopedTokenRequest {
 #[derive(Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
-    #[allow(dead_code)]
-    token_type: Option<String>,
-    #[allow(dead_code)]
-    scope: Option<String>,
 }
 
 /// Token refresh response (for GitHub Apps with refresh tokens)
@@ -376,8 +372,6 @@ struct GitHubOwner {
 #[derive(Deserialize)]
 struct InstallationRepositoriesResponse {
     repositories: Vec<GitHubRepo>,
-    #[allow(dead_code)]
-    total_count: i32,
 }
 
 #[derive(Deserialize)]

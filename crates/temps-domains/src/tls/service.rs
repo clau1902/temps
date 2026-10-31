@@ -2712,7 +2712,6 @@ mod tests {
     use crate::tls::providers::CertificateProvider;
     use crate::tls::repository::test_utils::MockCertificateRepository;
     use crate::tls::repository::DefaultCertificateRepository;
-    use temps_core::{Job, JobQueue};
     use temps_database::test_utils::TestDatabase;
 
     #[tokio::test]
@@ -2732,29 +2731,6 @@ mod tests {
     }
 
     // Mock implementations for testing
-    #[allow(dead_code)]
-    struct MockJobQueue;
-
-    #[allow(dead_code)]
-    impl MockJobQueue {
-        fn new() -> Self {
-            Self
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl JobQueue for MockJobQueue {
-        async fn send(&self, _job: Job) -> Result<(), temps_core::QueueError> {
-            // Mock implementation - just return Ok
-            Ok(())
-        }
-
-        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
-            // Mock implementation - not used in tests
-            unimplemented!("subscribe not implemented in mock")
-        }
-    }
-
     struct MockCertificateProvider;
 
     impl MockCertificateProvider {

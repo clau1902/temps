@@ -1166,33 +1166,6 @@ echo '[restore] complete'"#;
         Ok(())
     }
 
-    #[allow(dead_code)]
-    async fn delete_bucket(&self, config: ServiceConfig, name: &str) -> Result<()> {
-        // Initialize client if not already initialized
-        let client = self.initialize_client(config).await?;
-
-        let sanitized_name = name.replace("_", "-").to_lowercase();
-
-        // Check if bucket exists before attempting to delete
-        match client.head_bucket().bucket(&sanitized_name).send().await {
-            Ok(_) => {
-                // Bucket exists, proceed with deletion
-                client
-                    .delete_bucket()
-                    .bucket(&sanitized_name)
-                    .send()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to delete bucket: {}", e))?;
-
-                info!("Deleted bucket {}", sanitized_name);
-                Ok(())
-            }
-            Err(err) => {
-                debug!("Bucket {} does not exist: {}", sanitized_name, err);
-                Ok(()) // Return Ok since the end state (bucket doesn't exist) is what we want
-            }
-        }
-    }
     fn get_s3_config(&self, service_config: ServiceConfig) -> Result<S3Config> {
         // Parse input config and transform to runtime config
         let input_config: S3InputConfig = serde_json::from_value(service_config.parameters)
@@ -1203,7 +1176,6 @@ echo '[restore] complete'"#;
 
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
-    #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
         info!("Attempting to pull Docker image: {}", image);
 

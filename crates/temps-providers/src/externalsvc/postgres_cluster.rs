@@ -29,7 +29,7 @@ pub(crate) const DEFAULT_CLUSTER_IMAGE: &str = "gotempsh/postgres-ha:18-bookworm
 /// pg_autoctl handles replication setup, health monitoring, and automatic failover.
 pub struct PostgresClusterService {
     name: String,
-    #[allow(dead_code)]
+    #[allow(dead_code)] // injected but not used yet
     docker: Arc<Docker>,
 }
 

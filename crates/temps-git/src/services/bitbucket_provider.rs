@@ -244,9 +244,6 @@ struct BitbucketCloneLink {
 struct BitbucketOwner {
     #[serde(rename = "nickname", default)]
     nickname: Option<String>,
-    #[allow(dead_code)]
-    #[serde(rename = "account_id", default)]
-    account_id: Option<String>,
 }
 
 impl BitbucketRepo {
@@ -365,8 +362,6 @@ struct BitbucketCommit {
 #[derive(Deserialize)]
 struct BitbucketCommitAuthor {
     raw: String,
-    #[allow(dead_code)]
-    user: Option<BitbucketUser>,
 }
 
 /// Bitbucket cursor-based paginated response.

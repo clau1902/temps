@@ -10161,7 +10161,6 @@ mod tests {
             self
         }
 
-        #[allow(dead_code)]
         fn unavailable() -> Self {
             Self {
                 available: false,

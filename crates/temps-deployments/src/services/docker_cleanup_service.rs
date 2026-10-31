@@ -1525,7 +1525,6 @@ mod tests {
     use super::*;
 
     #[derive(Clone)]
-    #[allow(dead_code)]
     struct MockDockerClient {
         prune_images_result: Result<PruneStats, String>,
         prune_cache_result: Result<String, String>,

@@ -502,7 +502,6 @@ async fn create_dns_provider(
 
 /// Result of git provider creation
 pub struct GitProviderCreationResult {
-    #[allow(dead_code)] // Provider is available for future use (e.g., repository sync)
     pub provider: git_providers::Model,
     pub connection: git_provider_connections::Model,
 }
@@ -867,7 +866,6 @@ fn print_warning(message: &str) {
     println!("{} {}", "⚠️ ".bright_yellow(), message.bright_yellow());
 }
 
-#[allow(dead_code)]
 fn print_error(message: &str) {
     println!("{} {}", "❌".bright_red(), message.bright_red());
 }
