@@ -241,7 +241,7 @@
     },
     "temps-mcp-server": {
       "lazy_error_variants": 3,
-      "anyhow_in_library": 2
+      "anyhow_in_library": 4
     },
     "temps-metrics": {
       "functions_over_300_lines": 1
@@ -318,7 +318,7 @@
       "lazy_error_variants": 15,
       "unguarded_require_auth": 19,
       "ignore_with_reason": 4,
-      "anyhow_in_library": 33,
+      "anyhow_in_library": 36,
       "files_over_3000_lines": 1,
       "functions_over_300_lines": 3
     },

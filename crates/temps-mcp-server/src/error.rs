@@ -47,6 +47,11 @@ pub enum McpError {
     #[error("Access to project {project_id} is denied for this token")]
     ProjectAccessDenied { project_id: i32 },
 
+    /// The caller may access the project, but their role on it (e.g. a team
+    /// viewer) does not include the permission the operation needs.
+    #[error("Your role on project {project_id} does not include the {permission} permission")]
+    ProjectPermissionDenied { project_id: i32, permission: String },
+
     /// The `jsonrpc` field in the request was not the required value `"2.0"`.
     #[error("Invalid JSON-RPC version '{received}'; this server requires jsonrpc == \"2.0\"")]
     InvalidJsonRpcVersion { received: String },
@@ -71,6 +76,27 @@ pub enum McpError {
     #[error("Deployment service error: {0}")]
     DeploymentService(String),
 
+    /// The edge rule does not exist in the project.
+    #[error("Edge rule {rule_id} not found in project {project_id}")]
+    EdgeRuleNotFound { project_id: i32, rule_id: i32 },
+
+    /// The edge rule change was refused: invalid rule, stale revision, the
+    /// 100-rule limit, an unknown environment or an incomplete order.
+    #[error("Edge rule change refused: {reason}")]
+    EdgeRuleRejected { reason: String },
+
+    /// The edge rule service could not read or store a project's rules.
+    #[error("Edge rule service failed: {source}")]
+    EdgeRuleService {
+        #[source]
+        source: temps_proxy::service::edge_rule_service::EdgeRuleServiceError,
+    },
+
+    /// The edge rule service is not registered on this server, so the edge
+    /// rule tools cannot run.
+    #[error("Edge rules are not initialised on this server")]
+    EdgeRulesUnavailable,
+
     /// The ConfigService failed to load settings.
     #[error("Config error: {0}")]
     Config(String),
@@ -85,18 +111,22 @@ impl McpError {
     pub fn rpc_code(&self) -> i32 {
         match self {
             Self::FeatureDisabled => -32001,
-            Self::ProjectNotFound { .. } | Self::DeploymentNotFound { .. } => -32002,
+            Self::ProjectNotFound { .. }
+            | Self::DeploymentNotFound { .. }
+            | Self::EdgeRuleNotFound { .. } => -32002,
             Self::ProposalNotFound | Self::ProposalExpired => -32003,
             Self::WriteNotEnabled => -32004,
-            Self::ProjectAccessDenied { .. } => -32005,
+            Self::ProjectAccessDenied { .. } | Self::ProjectPermissionDenied { .. } => -32005,
             Self::InsufficientPermission { .. } => -32006,
             Self::InvalidJsonRpcVersion { .. } => crate::protocol::INVALID_REQUEST,
             Self::UnknownTool { .. } => crate::protocol::METHOD_NOT_FOUND,
-            Self::MissingArgument { .. } | Self::InvalidArgument { .. } => {
-                crate::protocol::INVALID_PARAMS
-            }
+            Self::MissingArgument { .. }
+            | Self::InvalidArgument { .. }
+            | Self::EdgeRuleRejected { .. } => crate::protocol::INVALID_PARAMS,
             Self::ProjectService(_)
             | Self::DeploymentService(_)
+            | Self::EdgeRuleService { .. }
+            | Self::EdgeRulesUnavailable
             | Self::Config(_)
             | Self::Serialization(_) => crate::protocol::INTERNAL_ERROR,
         }
@@ -110,11 +140,11 @@ impl From<McpError> for Problem {
                 .with_title("MCP Server Disabled")
                 .with_detail(error.to_string()),
 
-            McpError::ProjectNotFound { .. } | McpError::DeploymentNotFound { .. } => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Resource Not Found")
-                    .with_detail(error.to_string())
-            }
+            McpError::ProjectNotFound { .. }
+            | McpError::DeploymentNotFound { .. }
+            | McpError::EdgeRuleNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Resource Not Found")
+                .with_detail(error.to_string()),
 
             McpError::ProposalNotFound | McpError::ProposalExpired => {
                 problemdetails::new(StatusCode::GONE)
@@ -134,6 +164,10 @@ impl From<McpError> for Problem {
                 .with_title("Project Access Denied")
                 .with_detail(error.to_string()),
 
+            McpError::ProjectPermissionDenied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Project Permission Denied")
+                .with_detail(error.to_string()),
+
             McpError::InvalidJsonRpcVersion { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Invalid JSON-RPC Version")
                 .with_detail(error.to_string()),
@@ -148,8 +182,14 @@ impl From<McpError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            McpError::EdgeRuleRejected { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Edge Rule Change Refused")
+                .with_detail(error.to_string()),
+
             McpError::ProjectService(_)
             | McpError::DeploymentService(_)
+            | McpError::EdgeRuleService { .. }
+            | McpError::EdgeRulesUnavailable
             | McpError::Config(_)
             | McpError::Serialization(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")

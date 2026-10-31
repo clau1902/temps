@@ -5,6 +5,7 @@ pub mod acme_challenge_cache;
 pub mod cert_host_cache;
 pub mod connection_filter_service;
 pub mod cookie_codec;
+pub mod edge_rule_service;
 pub mod ip_access_control_service;
 pub mod lb_service;
 pub mod metrics_sampler;

@@ -112,6 +112,7 @@ LAYERS: dict[str, str] = {
     "temps-workload-volumes": "runtime",
     # traffic
     "temps-edge": "traffic",
+    "temps-edge-rules": "traffic",
     "temps-proxy": "traffic",
     "temps-routes": "traffic",
     "temps-shield": "traffic",
