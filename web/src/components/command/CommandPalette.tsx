@@ -1112,8 +1112,19 @@ export const projectNavItems: NavigationItem[] = [
       'tasks',
       '.temps.yaml',
       'temps.yaml',
+    ],
+  },
+  {
+    title: 'Check-ins',
+    url: 'check-ins',
+    icon: Activity,
+    keywords: [
       'check-in',
-      'monitor',
+      'cron monitor',
+      'heartbeat',
+      'missed job',
+      'sentry',
+      'withMonitor',
     ],
   },
   {

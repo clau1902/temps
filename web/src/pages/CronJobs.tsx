@@ -3,8 +3,16 @@
 
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { FileCode } from 'lucide-react'
-import { Button, Callout, DataTable, RecordLink } from '@temps-sdk/ds'
+import { Link, useLocation } from 'react-router'
+import { CalendarClock, FileCode } from 'lucide-react'
+import {
+  Button,
+  Callout,
+  DataTable,
+  PageContainer,
+  PageHeader,
+  RecordLink,
+} from '@temps-sdk/ds'
 import type { CronInfo, ProjectResponse } from '@/api/client'
 import { getEnvironmentCronsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { CodeBlock } from '@/components/ui/code-block'
@@ -15,6 +23,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import { RedirectWithQuery } from '@/components/routing/RedirectWithQuery'
 import { useProjectEnvironment } from '@/components/project-frame/project-environment-context'
 import { readFailureServerDetail } from '@/lib/read-failure'
 
@@ -24,7 +33,10 @@ function InlineCode({ children }: { children: string }) {
   )
 }
 
-/** How to declare a job in `.temps.yaml`; shown in the "How to add" dialog. */
+/**
+ * How to declare a job in `.temps.yaml`: the empty page itself, and the
+ * "How to add a job" dialog once there are jobs.
+ */
 function Instructions() {
   return (
     <div className="space-y-4">
@@ -64,32 +76,8 @@ function formatRun(value: string | null | undefined) {
   return value ? new Date(value).toLocaleString() : 'Not scheduled'
 }
 
-/**
- * The `cron:` entries of `.temps.yaml` for the environment chosen in the
- * project bar. Shared by the section and the cron page, which needs to know
- * whether there is anything at all before it decides how to lay itself out.
- */
-export function useScheduledCronJobs(project: ProjectResponse) {
-  const bar = useProjectEnvironment()
-  const environment = bar.selection.environment
-  const crons = useQuery({
-    ...getEnvironmentCronsOptions({
-      path: { project_id: project.id, env_id: environment?.id ?? 0 },
-    }),
-    enabled: environment !== undefined,
-  })
-  return {
-    bar,
-    environment,
-    crons,
-    rows: crons.data ?? [],
-    loading: bar.isPending || (environment !== undefined && crons.isPending),
-    failed: bar.isError || crons.isError,
-  }
-}
-
-/** How to declare a job in `.temps.yaml`. */
-export function ScheduleJobDialog({
+/** How to declare a job in `.temps.yaml`, once the page lists some. */
+function HowToAddDialog({
   open,
   onOpenChange,
 }: {
@@ -100,7 +88,7 @@ export function ScheduleJobDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[500px]">
         <DialogHeader>
-          <DialogTitle>Schedule a job</DialogTitle>
+          <DialogTitle>Add a cron job</DialogTitle>
           <DialogDescription>
             Temps calls your endpoint on the schedule you set.
           </DialogDescription>
@@ -112,39 +100,51 @@ export function ScheduleJobDialog({
 }
 
 /**
- * Jobs Temps runs itself: the `cron:` entries of `.temps.yaml`, registered
- * per environment on deploy, for the environment chosen in the project bar.
+ * Monitoring › Cron jobs: the jobs Temps runs itself, the `cron:` entries of
+ * `.temps.yaml` registered per environment on deploy, for the environment
+ * chosen in the project bar. Jobs scheduled anywhere else are watched from
+ * Check-ins, a different feature with its own tab.
  */
-export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
-  const { bar, environment, crons, rows, loading } =
-    useScheduledCronJobs(project)
+export function CronJobs({ project }: { project: ProjectResponse }) {
+  const bar = useProjectEnvironment()
+  const environment = bar.selection.environment
+  const crons = useQuery({
+    ...getEnvironmentCronsOptions({
+      path: { project_id: project.id, env_id: environment?.id ?? 0 },
+    }),
+    enabled: environment !== undefined,
+  })
+  const rows = crons.data ?? []
+  const loading =
+    bar.isPending || (environment !== undefined && crons.isPending)
+  const empty = !loading && !bar.isError && !crons.isError && rows.length === 0
   const [showInstructions, setShowInstructions] = useState(false)
 
   return (
-    <section aria-labelledby="scheduled-cron-jobs" className="space-y-4">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <h2 id="scheduled-cron-jobs" className="text-base font-semibold">
-            Scheduled by Temps
-          </h2>
-          <p className="text-sm text-muted-foreground">
+    <PageContainer>
+      <PageHeader
+        title="Cron jobs"
+        description={
+          <>
             Endpoints of your app that Temps calls on a schedule, from{' '}
             <InlineCode>cron:</InlineCode> in{' '}
             <InlineCode>.temps.yaml</InlineCode>
             {environment ? ` (${environment.name})` : ''}.
-          </p>
-        </div>
-        <div className="flex flex-col gap-2 sm:flex-row">
-          <Button variant="outline" onClick={() => setShowInstructions(true)}>
-            <FileCode className="size-4" />
-            How to add a job
-          </Button>
-        </div>
-      </div>
+          </>
+        }
+        actions={
+          empty ? undefined : (
+            <Button variant="outline" onClick={() => setShowInstructions(true)}>
+              <FileCode className="size-4" />
+              How to add a job
+            </Button>
+          )
+        }
+      />
 
       {bar.isError ? (
         <Callout tone="error" title="Could not load environments">
-          The scheduled jobs are listed per environment, and this service&apos;s
+          The cron jobs are listed per environment, and this service&apos;s
           environments did not load.{' '}
           <button
             type="button"
@@ -155,9 +155,9 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
           </button>
         </Callout>
       ) : crons.isError ? (
-        <Callout tone="error" title="Could not load scheduled jobs">
+        <Callout tone="error" title="Could not load cron jobs">
           {readFailureServerDetail(crons.error) ??
-            `The scheduled jobs of ${environment?.name ?? 'this environment'} did not load.`}{' '}
+            `The cron jobs of ${environment?.name ?? 'this environment'} did not load.`}{' '}
           <button
             type="button"
             className="underline underline-offset-4"
@@ -166,14 +166,33 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
             Retry
           </button>
         </Callout>
-      ) : !loading && rows.length === 0 ? (
-        // The header already offers "How to add a job"; one quiet line is
-        // enough while the page has check-in monitors to show.
-        <p className="text-sm text-muted-foreground">
-          {environment
-            ? `No scheduled jobs in ${environment.name} as of its last deployment.`
-            : 'This service has no environments yet.'}
-        </p>
+      ) : empty ? (
+        // Nothing to list: the page is the guide to adding the first job.
+        <section
+          aria-labelledby="cron-jobs-empty"
+          className="space-y-4 rounded-lg border p-4 sm:p-6"
+        >
+          <div className="flex items-start gap-3">
+            <CalendarClock
+              aria-hidden="true"
+              className="mt-0.5 size-5 shrink-0 text-muted-foreground"
+            />
+            <div className="min-w-0 space-y-1">
+              <h2 id="cron-jobs-empty" className="text-base font-semibold">
+                {environment
+                  ? `No cron jobs in ${environment.name}`
+                  : 'No cron jobs yet'}
+              </h2>
+              {!environment && (
+                <p className="text-sm text-muted-foreground">
+                  This service has no environments yet; the jobs start running
+                  once it is deployed.
+                </p>
+              )}
+            </div>
+          </div>
+          <Instructions />
+        </section>
       ) : (
         <DataTable<CronInfo>
           rows={rows}
@@ -208,10 +227,33 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
         />
       )}
 
-      <ScheduleJobDialog
+      <p className="text-sm text-muted-foreground">
+        Scheduling the job somewhere else?{' '}
+        <Link
+          className="underline underline-offset-4"
+          to={`/projects/${project.slug}/check-ins`}
+        >
+          Set up a check-in
+        </Link>{' '}
+        to be alerted when it fails or does not run.
+      </p>
+
+      <HowToAddDialog
         open={showInstructions}
         onOpenChange={setShowInstructions}
       />
-    </section>
+    </PageContainer>
   )
+}
+
+/**
+ * Check-in monitors used to live under `cron-jobs/`; their old links
+ * (a monitor, its edit page, "new") land on the same page under `check-ins/`.
+ */
+export function MovedToCheckIns({ project }: { project: ProjectResponse }) {
+  const { pathname } = useLocation()
+  const rest = pathname.slice(
+    pathname.indexOf('/cron-jobs') + '/cron-jobs'.length
+  )
+  return <RedirectWithQuery to={`/projects/${project.slug}/check-ins${rest}`} />
 }

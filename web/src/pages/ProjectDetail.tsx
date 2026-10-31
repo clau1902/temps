@@ -56,6 +56,7 @@ import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import CronMonitors from './CronMonitors'
+import { CronJobs, MovedToCheckIns } from './CronJobs'
 import ProjectFeedback from './ProjectFeedback'
 import TelemetryReleases from './TelemetryReleases'
 import ClientOutcomes from './ClientOutcomes'
@@ -627,8 +628,15 @@ export function ProjectDetail() {
                     path="errors/feedback/*"
                     element={<ProjectFeedback project={project} />}
                   />
+                  {/* An external service runs no jobs of its own, so there
+                      is no Cron jobs page; its old monitor links (under
+                      cron-jobs/) moved to Check-ins. */}
                   <Route
-                    path="cron-jobs/*"
+                    path="cron-jobs/:monitorId/*"
+                    element={<MovedToCheckIns project={project} />}
+                  />
+                  <Route
+                    path="check-ins/*"
                     element={<CronMonitors project={project} />}
                   />
                   <Route
@@ -915,7 +923,15 @@ export function ProjectDetail() {
                   element={<ProjectFeedback project={project} />}
                 />
                 <Route
+                  path="cron-jobs"
+                  element={<CronJobs project={project} />}
+                />
+                <Route
                   path="cron-jobs/*"
+                  element={<MovedToCheckIns project={project} />}
+                />
+                <Route
+                  path="check-ins/*"
                   element={<CronMonitors project={project} />}
                 />
                 <Route

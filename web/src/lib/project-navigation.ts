@@ -27,6 +27,7 @@ import {
   BarChart3,
   BellRing,
   Bot,
+  CalendarCheck,
   CalendarRange,
   CircleDollarSign,
   CirclePlay,
@@ -323,6 +324,9 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
             url: 'cron-jobs',
             aliases: ['settings/cron-jobs'],
           },
+          // Jobs scheduled elsewhere, reporting through the Sentry SDK: a
+          // different feature from the jobs Temps runs, so its own tab.
+          { title: 'Check-ins', icon: CalendarCheck, url: 'check-ins' },
         ],
       },
     ],
@@ -544,7 +548,7 @@ const EXTERNAL_PROJECT_PAGES = [
   'client-outcomes',
   'metrics',
   'monitors',
-  'cron-jobs',
+  'check-ins',
   'status-pages',
   'settings/general',
   'settings/telemetry',

@@ -92,7 +92,9 @@ describe('projectNavGroupsFor', () => {
     // A section keeps the tabs a monitoring project has.
     const monitoring = menu.find((entry) => entry.startsWith('Monitoring'))
     expect(monitoring).toContain('Uptime')
-    expect(monitoring).toContain('Cron jobs')
+    expect(monitoring).toContain('Check-ins')
+    // An external project runs no jobs of its own; it only reports check-ins.
+    expect(monitoring).not.toContain('Cron jobs')
   })
 
   test("a monitoring-only project's integrations page highlights Overview", () => {
