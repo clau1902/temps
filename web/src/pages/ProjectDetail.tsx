@@ -336,7 +336,7 @@ export function ProjectDetail() {
       },
       ...(isVariableRoute
         ? [
-            { label: 'Environment Variables', href: variablesPath },
+            { label: 'Environment variables', href: variablesPath },
             ...(breadcrumbVariableId
               ? [
                   {

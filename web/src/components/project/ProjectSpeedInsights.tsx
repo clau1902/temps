@@ -684,7 +684,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                 <Info className="h-5 w-5 text-primary" />
               </div>
               <div className="space-y-1">
-                <CardTitle>Performance Metrics Setup Required</CardTitle>
+                <CardTitle>Performance metrics setup required</CardTitle>
                 <CardDescription>
                   Performance metrics are automatically collected when you set
                   up analytics
@@ -712,7 +712,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
 
         <Card>
           <CardHeader>
-            <CardTitle>Setup Analytics to Track Performance</CardTitle>
+            <CardTitle>Setup analytics to track performance</CardTitle>
             <CardDescription>
               The Temps analytics SDK automatically tracks Core Web Vitals
               alongside page views and events
@@ -725,7 +725,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                   <CheckCircle2 className="h-5 w-5 text-green-600 mt-0.5 flex-shrink-0" />
                   <div>
                     <h4 className="font-medium mb-1">
-                      Automatic Web Vitals Tracking
+                      Automatic Web Vitals tracking
                     </h4>
                     <p className="text-sm text-muted-foreground">
                       When you install the Temps analytics SDK, it automatically
@@ -736,7 +736,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                 <div className="flex items-start gap-3">
                   <Zap className="h-5 w-5 text-blue-600 mt-0.5 flex-shrink-0" />
                   <div>
-                    <h4 className="font-medium mb-1">Real User Monitoring</h4>
+                    <h4 className="font-medium mb-1">Real user monitoring</h4>
                     <p className="text-sm text-muted-foreground">
                       Performance data is collected from real users, giving you
                       accurate insights into how your application performs in
@@ -751,7 +751,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               <Link to={`/projects/${project.slug}/analytics/setup`}>
                 <Button className="w-full sm:w-auto">
                   <Code2 className="mr-2 h-4 w-4" />
-                  Go to Analytics Setup
+                  Go to analytics setup
                 </Button>
               </Link>
               <p className="text-sm text-muted-foreground">

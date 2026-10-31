@@ -161,7 +161,7 @@ test('legacy build links and the mobile project menu stay usable', async ({
   await expect(page).toHaveURL(/settings\/delivery\?section=previews$/)
   await expect(page.locator('#settings-section-previews')).toBeInViewport()
 
-  await page.getByRole('button', { name: 'Toggle Sidebar' }).first().click()
+  await page.getByRole('button', { name: 'Toggle sidebar' }).first().click()
   const menu = page.getByRole('dialog')
   await menu
     .getByRole('link', { name: 'Automation & integrations', exact: true })

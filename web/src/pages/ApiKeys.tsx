@@ -101,7 +101,7 @@ export default function ApiKeys() {
         actions={
           <CreateActionButton
             onClick={handleCreateClick}
-            label="Create API Key"
+            label="Create API key"
           />
         }
       />
@@ -111,7 +111,7 @@ export default function ApiKeys() {
         <div className="grid gap-3 grid-cols-1 sm:grid-cols-3 sm:gap-4">
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="text-sm font-medium">Total Keys</CardTitle>
+              <CardTitle className="text-sm font-medium">Total keys</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">{apiKeys.length}</div>
@@ -120,7 +120,7 @@ export default function ApiKeys() {
           </Card>
           <Card>
             <CardHeader className="pb-3">
-              <CardTitle className="text-sm font-medium">Active Keys</CardTitle>
+              <CardTitle className="text-sm font-medium">Active keys</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="text-2xl font-bold">
@@ -132,7 +132,7 @@ export default function ApiKeys() {
           <Card>
             <CardHeader className="pb-3">
               <CardTitle className="text-sm font-medium">
-                Expiring Soon
+                Expiring soon
               </CardTitle>
             </CardHeader>
             <CardContent>

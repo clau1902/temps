@@ -72,7 +72,7 @@ export function CreateEnvironmentDialog({
             className="space-y-4"
           >
             <DialogHeader>
-              <DialogTitle>Create Environment</DialogTitle>
+              <DialogTitle>Create environment</DialogTitle>
               <DialogDescription>
                 Add a new environment to your service for different deployment
                 stages.

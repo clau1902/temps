@@ -109,5 +109,5 @@ test('an environment without its own list says it follows the project', () => {
 test('a load failure is reported with a retry', () => {
   const markup = render({ failed: true })
   expect(markup).toContain('Could not load the IP access list')
-  expect(markup).toContain('Try Again')
+  expect(markup).toContain('Try again')
 })

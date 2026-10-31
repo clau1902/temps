@@ -54,7 +54,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
       { label: 'Projects', href: '/projects' },
       { label: project.slug, href: `/projects/${project.slug}` },
       { label: 'Analytics', href: `/projects/${project.slug}/analytics` },
-      { label: 'Edit Funnel' },
+      { label: 'Edit funnel' },
     ])
   }, [project, setBreadcrumbs])
 
@@ -207,7 +207,7 @@ export function EditFunnel({ project, funnelId }: EditFunnelProps) {
         onSubmit={handleSubmit}
         onCancel={handleCancel}
         submitLabel="Update Funnel"
-        title="Edit Funnel"
+        title="Edit funnel"
         description="Update your funnel name and description"
       />
     </div>

@@ -43,7 +43,7 @@ test.describe('project creation', () => {
     // The shared source switcher exposes the active source as an ARIA tab.
     await page.getByRole('tab', { name: 'Git URL', exact: true }).click()
 
-    const urlField = page.getByLabel('Public Repository URL')
+    const urlField = page.getByLabel('Public repository URL')
     await expect(urlField).toBeVisible()
     await urlField.fill(PUBLIC_REPO_URL)
 
@@ -121,7 +121,7 @@ test.describe('project creation', () => {
     await page.getByRole('tab', { name: 'Git URL', exact: true }).click()
 
     await page
-      .getByLabel('Public Repository URL')
+      .getByLabel('Public repository URL')
       .fill(
         'https://github.com/gotempsh/this-repository-does-not-exist-e2e.git'
       )

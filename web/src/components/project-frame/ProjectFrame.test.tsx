@@ -129,7 +129,7 @@ test('page titles inside a project are one level below the project name', () => 
       <MemoryRouter initialEntries={['/projects/first/storage']}>
         <ProjectFrame project={{ id: 1, slug: 'first' } as ProjectResponse}>
           <PageHeader title="Databases" description="Synthetic page." />
-          <PageTitle>KV Store</PageTitle>
+          <PageTitle>KV store</PageTitle>
         </ProjectFrame>
       </MemoryRouter>
     </QueryClientProvider>
@@ -138,6 +138,6 @@ test('page titles inside a project are one level below the project name', () => 
   expect(
     view.getByRole('heading', { level: 2, name: 'Databases' })
   ).toBeTruthy()
-  expect(view.getByRole('heading', { level: 2, name: 'KV Store' })).toBeTruthy()
+  expect(view.getByRole('heading', { level: 2, name: 'KV store' })).toBeTruthy()
   expect(view.queryByRole('heading', { level: 1 })).toBeNull()
 })

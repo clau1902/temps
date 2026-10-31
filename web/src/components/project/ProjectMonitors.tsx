@@ -308,7 +308,7 @@ function MonitorCard({
               <DropdownMenuItem asChild>
                 <Link to={`/projects/${projectSlug}/monitors/${monitor.id}`}>
                   <ExternalLink className="mr-2 h-4 w-4" />
-                  View Details
+                  View details
                 </Link>
               </DropdownMenuItem>
               <DropdownMenuItem
@@ -466,7 +466,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             {externalMonitors.length > 0 && (
               <CreateActionButton
                 onClick={() => setIsCreateDialogOpen(true)}
-                label="Create Monitor"
+                label="Create monitor"
               />
             )}
           </>
@@ -475,7 +475,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
       <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Create Monitor</DialogTitle>
+            <DialogTitle>Create monitor</DialogTitle>
             <DialogDescription>
               Set up a new monitor to track your service&apos;s uptime and
               performance.
@@ -491,7 +491,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
                 name="name"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Monitor Name</FormLabel>
+                    <FormLabel>Monitor name</FormLabel>
                     <FormControl>
                       <Input placeholder="Production API" {...field} />
                     </FormControl>
@@ -505,7 +505,7 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
                 name="monitor_type"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Monitor Type</FormLabel>
+                    <FormLabel>Monitor type</FormLabel>
                     <Select
                       onValueChange={field.onChange}
                       defaultValue={field.value}

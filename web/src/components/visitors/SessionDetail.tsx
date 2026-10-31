@@ -267,7 +267,7 @@ export function SessionDetail({
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div className="flex-1">
-          <h2 className="text-2xl font-semibold">Session Details</h2>
+          <h2 className="text-2xl font-semibold">Session details</h2>
           <p className="text-muted-foreground">Session ID: {sessionId}</p>
         </div>
         <DateRangePicker
@@ -387,7 +387,7 @@ export function SessionDetail({
                 ) : (
                   <UserIcon className="h-5 w-5" />
                 )}
-                Visitor Information
+                Visitor information
               </CardTitle>
             </CardHeader>
             <CardContent>
@@ -425,7 +425,7 @@ export function SessionDetail({
                 </div>
                 <div>
                   <div className="text-sm text-muted-foreground">
-                    Total Sessions
+                    Total sessions
                   </div>
                   <div className="text-sm font-medium mt-1">
                     {visitorStats?.total_sessions}
@@ -433,7 +433,7 @@ export function SessionDetail({
                 </div>
                 <div>
                   <div className="text-sm text-muted-foreground">
-                    Total Page Views
+                    Total page views
                   </div>
                   <div className="text-sm font-medium mt-1">
                     {visitorStats?.total_page_views}
@@ -446,13 +446,13 @@ export function SessionDetail({
           {/* Path Information */}
           <Card>
             <CardHeader>
-              <CardTitle>Session Path</CardTitle>
+              <CardTitle>Session path</CardTitle>
             </CardHeader>
             <CardContent>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div>
                   <div className="text-sm text-muted-foreground mb-1">
-                    Entry Page
+                    Entry page
                   </div>
                   <div className="font-mono text-sm bg-muted p-2 rounded">
                     {sessionDetails?.entry_path || '-'}
@@ -460,7 +460,7 @@ export function SessionDetail({
                 </div>
                 <div>
                   <div className="text-sm text-muted-foreground mb-1">
-                    Exit Page
+                    Exit page
                   </div>
                   <div className="font-mono text-sm bg-muted p-2 rounded">
                     {sessionDetails?.exit_path || '-'}
@@ -486,7 +486,7 @@ export function SessionDetail({
                 <CardHeader>
                   <div className="flex items-center justify-between">
                     <div>
-                      <CardTitle>Request Logs</CardTitle>
+                      <CardTitle>Request logs</CardTitle>
                       <CardDescription>
                         All HTTP requests made during this session
                       </CardDescription>
@@ -528,7 +528,7 @@ export function SessionDetail({
                             <TableHead className="w-[80px]">Status</TableHead>
                             <TableHead>Path</TableHead>
                             <TableHead className="w-[100px]">
-                              Response Time
+                              Response time
                             </TableHead>
                             <TableHead>Referrer</TableHead>
                           </TableRow>
@@ -698,10 +698,10 @@ export function SessionDetail({
                         <TableHeader>
                           <TableRow>
                             <TableHead className="w-[100px]">Time</TableHead>
-                            <TableHead>Event Name</TableHead>
+                            <TableHead>Event name</TableHead>
                             <TableHead>Path</TableHead>
                             <TableHead>Query</TableHead>
-                            <TableHead>Event Data</TableHead>
+                            <TableHead>Event data</TableHead>
                           </TableRow>
                         </TableHeader>
                         <TableBody>

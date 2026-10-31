@@ -227,7 +227,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
                           )
                         }
                       >
-                        View Details
+                        View details
                       </DropdownMenuItem>
                       <DropdownMenuItem
                         onClick={() =>
@@ -278,7 +278,7 @@ export function WebhooksSettings({ project }: WebhooksSettingsProps) {
               }
             >
               <Plus className="h-4 w-4 mr-2" />
-              Create Your First Webhook
+              Create your first webhook
             </Button>
           </CardContent>
         </Card>

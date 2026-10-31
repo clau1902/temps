@@ -217,7 +217,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           description="Add a domain to get started."
           action={
             <Button onClick={() => setIsAddDialogOpen(true)}>
-              Add Domain
+              Add domain
               <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
             </Button>
           }

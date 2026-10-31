@@ -384,7 +384,7 @@ export default function TraceOperations({ project }: TraceOperationsProps) {
                     size="sm"
                     onClick={() => navigate(`/projects/${project.slug}/traces`)}
                   >
-                    Go to Traces
+                    Go to traces
                   </Button>
                 }
               />

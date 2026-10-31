@@ -917,7 +917,7 @@ function EnvironmentVariableRow({
                     htmlFor="edit-include-preview"
                     className="text-sm font-medium"
                   >
-                    Include in Preview Environments
+                    Include in preview environments
                   </Label>
                   <p className="text-sm text-muted-foreground">
                     Automatically add this variable to preview environments
@@ -965,7 +965,7 @@ function EnvironmentVariableRow({
               >
                 Cancel
               </Button>
-              <Button type="submit">Save Changes</Button>
+              <Button type="submit">Save</Button>
             </DialogFooter>
           </form>
         </DialogContent>
@@ -1230,7 +1230,7 @@ function AddEnvironmentVariableDialog({
     <Dialog open={isOpen} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add Environment Variable</DialogTitle>
+          <DialogTitle>Add environment variable</DialogTitle>
           <DialogDescription>
             Add a new environment variable to your service.
           </DialogDescription>
@@ -1303,7 +1303,7 @@ function AddEnvironmentVariableDialog({
                   htmlFor="include-preview"
                   className="text-sm font-medium"
                 >
-                  Include in Preview Environments
+                  Include in preview environments
                 </Label>
                 <p className="text-sm text-muted-foreground">
                   Also apply this variable to current and future preview
@@ -1369,7 +1369,7 @@ function AddEnvironmentVariableDialog({
               </p>
             )}
             <Button type="submit" disabled={Boolean(disabledReason)}>
-              Save Variable
+              Save variable
             </Button>
           </DialogFooter>
         </form>
@@ -2108,7 +2108,7 @@ export function EnvironmentVariablesSettings({
                 className="flex-1 sm:flex-initial"
               >
                 <Plus className="h-4 w-4 mr-2" />
-                Add Variable
+                Add variable
                 <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
               </Button>
             </div>
@@ -2229,7 +2229,7 @@ export function EnvironmentVariablesSettings({
                   onClick={() => setIsAddDialogOpen(true)}
                 >
                   <Plus className="h-4 w-4 mr-2" />
-                  Add Variable
+                  Add variable
                   <KbdBadge keys={['N']} className="ml-2" />
                 </Button>
               </div>

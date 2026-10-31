@@ -55,7 +55,7 @@ export function KvService({ project }: KvServiceProps) {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Databases', href: `../storage` },
-      { label: 'KV Store' },
+      { label: 'KV store' },
     ])
   }, [setBreadcrumbs])
 
@@ -71,7 +71,7 @@ export function KvService({ project }: KvServiceProps) {
             </div>
             <div>
               <PageTitle className="text-xl font-semibold sm:text-2xl">
-                KV Store
+                KV store
               </PageTitle>
               <p className="text-muted-foreground text-sm">
                 Serverless key-value store backed by Redis
@@ -103,7 +103,7 @@ export function KvService({ project }: KvServiceProps) {
           </div>
           <div className="min-w-0">
             <PageTitle className="text-xl font-semibold sm:text-2xl">
-              KV Store
+              KV store
             </PageTitle>
             <p className="text-muted-foreground text-sm">
               Serverless key-value store backed by Redis — no infrastructure to
@@ -153,7 +153,7 @@ export function KvService({ project }: KvServiceProps) {
         <TabsContent value="overview" className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Service Status</CardTitle>
+              <CardTitle>Service status</CardTitle>
               <CardDescription>
                 Cluster-wide status of the KV service. Once enabled, every
                 service on this instance can use it through the SDK below.
@@ -187,7 +187,7 @@ export function KvService({ project }: KvServiceProps) {
                     </div>
                     <div className="p-4 rounded-lg border bg-muted/30">
                       <p className="text-sm text-muted-foreground">
-                        Docker Image
+                        Docker image
                       </p>
                       <p className="font-medium mt-1 font-mono text-xs break-all">
                         {status?.docker_image || 'Not reported'}
@@ -197,7 +197,7 @@ export function KvService({ project }: KvServiceProps) {
                   <Button variant="outline" asChild>
                     <Link to="/storage?tab=platform" className="gap-2">
                       <ExternalLink className="h-4 w-4" />
-                      Manage in Storage Settings
+                      Manage in storage settings
                     </Link>
                   </Button>
                 </div>
@@ -205,7 +205,7 @@ export function KvService({ project }: KvServiceProps) {
                 <div className="space-y-4">
                   <Alert>
                     <Info className="h-4 w-4" />
-                    <AlertTitle>KV Store is not enabled</AlertTitle>
+                    <AlertTitle>KV store is not enabled</AlertTitle>
                     <AlertDescription>
                       An administrator must enable the KV service from{' '}
                       <strong>Storage Settings → Platform Services</strong>.
@@ -216,7 +216,7 @@ export function KvService({ project }: KvServiceProps) {
                   <Button asChild>
                     <Link to="/storage?tab=platform" className="gap-2">
                       <ExternalLink className="h-4 w-4" />
-                      Enable in Storage Settings
+                      Enable in storage settings
                     </Link>
                   </Button>
                 </div>
@@ -332,7 +332,7 @@ const kv = createClient({
               </div>
 
               <div className="space-y-4">
-                <h3 className="font-medium">API Reference</h3>
+                <h3 className="font-medium">API reference</h3>
 
                 <ApiMethod
                   name="get"
@@ -458,7 +458,7 @@ try {
         <TabsContent value="examples" className="space-y-6">
           <Card>
             <CardHeader>
-              <CardTitle>Usage Patterns</CardTitle>
+              <CardTitle>Usage patterns</CardTitle>
               <CardDescription>
                 Battle-tested recipes for the most common KV use cases.
               </CardDescription>

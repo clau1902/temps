@@ -838,7 +838,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to Traces
+          Back to traces
         </Button>
         <Card>
           <CardContent className="flex items-center gap-3 p-6 text-destructive">

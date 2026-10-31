@@ -45,7 +45,7 @@ export function ProjectRuntime({ project }: ProjectRuntimeProps) {
             <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-lg bg-muted">
               <FileText className="h-6 w-6 text-muted-foreground" />
             </div>
-            <CardTitle>No Runtime Logs Available</CardTitle>
+            <CardTitle>No runtime logs available</CardTitle>
             <CardDescription>
               Runtime logs will appear here after your first deployment.
             </CardDescription>
@@ -56,7 +56,7 @@ export function ProjectRuntime({ project }: ProjectRuntimeProps) {
               className="w-full"
             >
               <Rocket className="mr-2 h-4 w-4" />
-              Go to Deployments
+              Go to deployments
             </Button>
           </CardContent>
         </Card>

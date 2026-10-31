@@ -200,7 +200,7 @@ export function EmailAnalytics() {
   return (
     <div className="space-y-6">
       <div>
-        <h2 className="text-2xl font-bold tracking-tight">Email Analytics</h2>
+        <h2 className="text-2xl font-bold tracking-tight">Email analytics</h2>
         <p className="text-muted-foreground">
           Track delivery, engagement, and bounce rates across all emails.
         </p>
@@ -253,7 +253,7 @@ export function EmailAnalytics() {
           <div className="flex items-center justify-between flex-wrap gap-2">
             <CardTitle className="text-base flex items-center gap-2">
               <BarChart3 className="h-4 w-4" />
-              Event Log
+              Event log
               {events && events.total > 0 && (
                 <Badge variant="secondary" className="text-xs font-normal">
                   {events.total.toLocaleString()}

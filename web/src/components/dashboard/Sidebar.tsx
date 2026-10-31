@@ -160,7 +160,7 @@ const aiNavItems: PlatformNavItem[] = [
     icon: Wand2,
     featureKey: 'ai-foundation-api-tools',
   },
-  { title: 'MCP Servers', url: '/mcp-servers', icon: Server },
+  { title: 'MCP servers', url: '/mcp-servers', icon: Server },
 ]
 
 function NavPlugins({

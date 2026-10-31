@@ -184,7 +184,7 @@ function GenerateTokenFirst({ missing }: { missing: MissingJoinToken }) {
         ) : (
           <Key className="mr-1 h-4 w-4" />
         )}
-        Generate Join Token
+        Generate join token
       </Button>
     </div>
   )

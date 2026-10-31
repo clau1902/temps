@@ -408,7 +408,7 @@ export function ProjectSecuritySettings({
       {/* AI Assistance Card */}
       <SettingsSection
         id="ai-assistance"
-        title="AI Assistance"
+        title="AI assistance"
         description="Configure AI summaries and assistance for this service"
         icon={Bot}
       >
@@ -456,7 +456,7 @@ export function ProjectSecuritySettings({
         </div>
         <div className="mt-6">
           <Button type="submit" disabled={!isDirty || isSubmitting}>
-            Save AI Settings
+            Save AI settings
           </Button>
         </div>
       </SettingsSection>
@@ -493,7 +493,7 @@ export function ProjectSecuritySettings({
         </div>
         <div className="mt-6">
           <Button type="submit" disabled={!isDirty || isSubmitting}>
-            Save Vulnerability Scanning Settings
+            Save vulnerability scanning settings
           </Button>
         </div>
       </SettingsSection>
@@ -618,7 +618,7 @@ export function ProjectSecuritySettings({
               !isDirty || isSubmitting || updateDeploymentConfig.isPending
             }
           >
-            Save Security Configuration
+            Save security configuration
           </Button>
         </div>
       </SettingsSection>
@@ -727,7 +727,7 @@ export function ProjectSecuritySettings({
                       size="sm"
                       onClick={handleAddWhitelistIp}
                     >
-                      Add Whitelist IP
+                      Add whitelist IP
                     </Button>
                   </div>
                 </div>
@@ -766,7 +766,7 @@ export function ProjectSecuritySettings({
                       size="sm"
                       onClick={handleAddBlacklistIp}
                     >
-                      Add Blacklist IP
+                      Add blacklist IP
                     </Button>
                   </div>
                 </div>

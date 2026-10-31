@@ -119,7 +119,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
           <ArrowLeft className="size-4" />
         </Button>
         <div>
-          <h2 className="text-lg font-medium">Cron Job Details</h2>
+          <h2 className="text-lg font-medium">Cron job details</h2>
           <p className="text-sm text-muted-foreground">
             View cron job configuration and execution history
           </p>
@@ -210,7 +210,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
 
       <Card>
         <CardHeader>
-          <CardTitle>Recent Executions</CardTitle>
+          <CardTitle>Recent executions</CardTitle>
           <CardDescription>Last 10 executions of this cron job</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

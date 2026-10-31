@@ -585,10 +585,10 @@ export function Settings() {
                       </SelectTrigger>
                       <SelectContent>
                         <SelectItem value="local">
-                          Local Screenshot Service
+                          Local screenshot service
                         </SelectItem>
                         <SelectItem value="external">
-                          External Screenshot API
+                          External screenshot API
                         </SelectItem>
                       </SelectContent>
                     </Select>

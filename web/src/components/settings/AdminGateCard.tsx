@@ -150,7 +150,7 @@ export function AdminGateCard() {
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="admin-gate-hosts">Allowed Host headers</Label>
+          <Label htmlFor="admin-gate-hosts">Allowed host headers</Label>
           <Textarea
             id="admin-gate-hosts"
             placeholder={'admin.example.com\nconsole.internal'}

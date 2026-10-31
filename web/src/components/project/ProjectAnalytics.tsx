@@ -1398,7 +1398,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                     navigate(`/projects/${project.slug}/analytics/setup`)
                   }
                 >
-                  View Setup Instructions
+                  View setup instructions
                 </Button>
               </div>
             </CardHeader>
@@ -2208,7 +2208,7 @@ import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
 import type { Metadata } from "next";
 
 export const metadata: Metadata = {
-  title: "Your App",
+  title: "Your app",
   description: "Your app description",
 };
 

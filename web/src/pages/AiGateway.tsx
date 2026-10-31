@@ -1161,7 +1161,7 @@ export function UsageAnalytics() {
     <div className="space-y-4">
       {/* Time range selector */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Usage Analytics</h3>
+        <h3 className="text-lg font-semibold">Usage analytics</h3>
         <div className="flex gap-1">
           <AiTimeRange
             range={timeRange}
@@ -1194,7 +1194,7 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Zap className="h-4 w-4 text-muted-foreground" />
-              Total Tokens
+              Total tokens
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -1211,7 +1211,7 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <Clock className="h-4 w-4 text-muted-foreground" />
-              Avg Latency
+              Avg latency
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -1228,7 +1228,7 @@ export function UsageAnalytics() {
           <CardHeader className="pb-2">
             <CardTitle className="text-sm font-medium flex items-center gap-2">
               <TrendingUp className="h-4 w-4 text-muted-foreground" />
-              Error Rate
+              Error rate
             </CardTitle>
           </CardHeader>
           <CardContent>
@@ -1265,7 +1265,7 @@ export function UsageAnalytics() {
       {/* Requests over time chart */}
       <Card>
         <CardHeader>
-          <CardTitle className="text-base">Requests Over Time</CardTitle>
+          <CardTitle className="text-base">Requests over time</CardTitle>
         </CardHeader>
         <CardContent>
           {timeseriesLoading ? (
@@ -1306,7 +1306,7 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Token Usage</CardTitle>
+            <CardTitle className="text-base">Token usage</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
@@ -1357,7 +1357,7 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Avg Latency</CardTitle>
+            <CardTitle className="text-base">Avg latency</CardTitle>
           </CardHeader>
           <CardContent>
             {timeseriesLoading ? (
@@ -1404,7 +1404,7 @@ export function UsageAnalytics() {
       <div className="grid gap-4 md:grid-cols-2">
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">By Provider</CardTitle>
+            <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
             {!byProvider || byProvider.length === 0 ? (
@@ -1453,7 +1453,7 @@ export function UsageAnalytics() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Top Models</CardTitle>
+            <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
             {!topModels || topModels.length === 0 ? (
@@ -1505,7 +1505,7 @@ export function UsageAnalytics() {
       <Card>
         <CardHeader className="gap-3">
           <div className="flex items-center justify-between gap-2">
-            <CardTitle className="text-base">Recent Requests</CardTitle>
+            <CardTitle className="text-base">Recent requests</CardTitle>
             <Button
               type="button"
               variant={recentFiltersOpen ? 'secondary' : 'outline'}
@@ -2513,7 +2513,7 @@ function SpanDetailSheet({
           {/* Identification */}
           <DetailSection title="Identification">
             <DetailRow label="Span ID" value={span.span_id} mono />
-            <DetailRow label="Parent Span" value={span.parent_span_id} mono />
+            <DetailRow label="Parent span" value={span.parent_span_id} mono />
             <DetailRow label="Kind" value={span.kind} />
             <DetailRow
               label="Duration"
@@ -2527,15 +2527,15 @@ function SpanDetailSheet({
 
           {/* Model */}
           <DetailSection title="Model">
-            <DetailRow label="Requested Model" value={span.gen_ai_model} mono />
+            <DetailRow label="Requested model" value={span.gen_ai_model} mono />
             <DetailRow
-              label="Response Model"
+              label="Response model"
               value={span.gen_ai_response_model}
               mono
             />
             <DetailRow label="Response ID" value={span.response_id} mono />
             <DetailRow
-              label="Finish Reasons"
+              label="Finish reasons"
               value={span.response_finish_reasons?.join(', ')}
             />
             <DetailRow
@@ -2546,32 +2546,32 @@ function SpanDetailSheet({
           </DetailSection>
 
           {/* Request Parameters */}
-          <DetailSection title="Request Parameters">
+          <DetailSection title="Request parameters">
             <DetailRow
               label="Temperature"
               value={span.request_temperature?.toString()}
             />
             <DetailRow
-              label="Max Tokens"
+              label="Max tokens"
               value={span.request_max_tokens?.toString()}
             />
             <DetailRow label="Top P" value={span.request_top_p?.toString()} />
             <DetailRow label="Top K" value={span.request_top_k?.toString()} />
             <DetailRow
-              label="Frequency Penalty"
+              label="Frequency penalty"
               value={span.request_frequency_penalty?.toString()}
             />
             <DetailRow
-              label="Presence Penalty"
+              label="Presence penalty"
               value={span.request_presence_penalty?.toString()}
             />
             <DetailRow
-              label="Stop Sequences"
+              label="Stop sequences"
               value={span.request_stop_sequences?.join(', ')}
             />
             <DetailRow label="Seed" value={span.request_seed?.toString()} />
             <DetailRow
-              label="Choice Count"
+              label="Choice count"
               value={span.request_choice_count?.toString()}
             />
           </DetailSection>
@@ -2588,8 +2588,8 @@ function SpanDetailSheet({
 
           {/* Tool */}
           {(span.tool_name || span.tool_call_id) && (
-            <DetailSection title="Tool Execution">
-              <DetailRow label="Tool Name" value={span.tool_name} />
+            <DetailSection title="Tool execution">
+              <DetailRow label="Tool name" value={span.tool_name} />
               <DetailRow label="Call ID" value={span.tool_call_id} mono />
               <DetailRow label="Type" value={span.tool_type} />
               <DetailRow label="Description" value={span.tool_description} />
@@ -2604,7 +2604,7 @@ function SpanDetailSheet({
                 value={span.embeddings_dimension_count.toString()}
               />
               <DetailRow
-                label="Encoding Formats"
+                label="Encoding formats"
                 value={span.request_encoding_formats?.join(', ')}
               />
             </DetailSection>
@@ -2613,7 +2613,7 @@ function SpanDetailSheet({
           {/* Retrieval */}
           {span.data_source_id && (
             <DetailSection title="Retrieval">
-              <DetailRow label="Data Source" value={span.data_source_id} mono />
+              <DetailRow label="Data source" value={span.data_source_id} mono />
             </DetailSection>
           )}
 
@@ -2630,18 +2630,18 @@ function SpanDetailSheet({
             span.openai_system_fingerprint ||
             span.aws_bedrock_guardrail_id ||
             span.azure_resource_provider_namespace) && (
-            <DetailSection title="Provider Specific">
-              <DetailRow label="OpenAI API Type" value={span.openai_api_type} />
+            <DetailSection title="Provider specific">
+              <DetailRow label="OpenAI API type" value={span.openai_api_type} />
               <DetailRow
-                label="Request Service Tier"
+                label="Request service tier"
                 value={span.openai_request_service_tier}
               />
               <DetailRow
-                label="Response Service Tier"
+                label="Response service tier"
                 value={span.openai_response_service_tier}
               />
               <DetailRow
-                label="System Fingerprint"
+                label="System fingerprint"
                 value={span.openai_system_fingerprint}
                 mono
               />
@@ -2656,7 +2656,7 @@ function SpanDetailSheet({
                 mono
               />
               <DetailRow
-                label="Azure Namespace"
+                label="Azure namespace"
                 value={span.azure_resource_provider_namespace}
               />
             </DetailSection>
@@ -2690,7 +2690,7 @@ function SpanDetailSheet({
               <Separator />
               <div>
                 <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-1">
-                  Tool Content
+                  Tool content
                 </h4>
                 <JsonBlock
                   label="Arguments"
@@ -3194,7 +3194,7 @@ function TraceDetailView({
             <div className="grid gap-3 grid-cols-2 md:grid-cols-4 lg:grid-cols-6">
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Total Spans
+                  Total spans
                 </div>
                 <div className="text-xl font-bold">
                   {traceDetail.span_count}
@@ -3215,7 +3215,7 @@ function TraceDetailView({
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Input Tokens
+                  Input tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalInput)}
@@ -3228,7 +3228,7 @@ function TraceDetailView({
               </Card>
               <Card className="p-3">
                 <div className="text-[10px] text-muted-foreground uppercase">
-                  Output Tokens
+                  Output tokens
                 </div>
                 <div className="text-xl font-bold tabular-nums">
                   {formatTokenCount(stats.totalOutput)}
@@ -3237,7 +3237,7 @@ function TraceDetailView({
               {stats.tools.length > 0 && (
                 <Card className="p-3">
                   <div className="text-[10px] text-muted-foreground uppercase">
-                    Tool Calls
+                    Tool calls
                   </div>
                   <div className="text-xl font-bold">{stats.tools.length}</div>
                 </Card>
@@ -3450,7 +3450,7 @@ export function AgentActivity() {
     <div className="space-y-4">
       {/* Filters */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">Agent Activity</h3>
+        <h3 className="text-lg font-semibold">Agent activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           {projects.length > 0 && (
             <Select
@@ -3799,7 +3799,7 @@ export function ProjectAgentActivity({
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <h3 className="text-lg font-semibold">AI Activity</h3>
+        <h3 className="text-lg font-semibold">AI activity</h3>
         <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
           <AiProviderSelect
             value={systemFilter || 'all'}
@@ -4421,7 +4421,7 @@ console.log(response.choices[0].message.content);`,
         </div>
         <Button onClick={openAddKeyDialog} className="w-full sm:w-auto">
           <Plus className="mr-2 h-4 w-4" />
-          Add Provider Key
+          Add provider key
         </Button>
       </div>
 
@@ -4850,7 +4850,7 @@ console.log(response.choices[0].message.content);`,
               <DialogTitle>
                 {newProvider
                   ? `Configure ${providerName(newProvider)}`
-                  : 'Add Provider Key'}
+                  : 'Add provider key'}
               </DialogTitle>
               <DialogDescription>
                 Your key is encrypted at rest and used only to route requests
@@ -4903,7 +4903,7 @@ console.log(response.choices[0].message.content);`,
                   its discovery state mounted. */}
               <div className={newProvider ? 'grid gap-4' : 'hidden'}>
                 <div className="grid gap-2">
-                  <Label htmlFor="displayName">Display Name</Label>
+                  <Label htmlFor="displayName">Display name</Label>
                   <Input
                     id="displayName"
                     placeholder="Production API Key"
@@ -4919,7 +4919,7 @@ console.log(response.choices[0].message.content);`,
                 </div>
                 <div className="grid gap-2">
                   <Label htmlFor="apiKey">
-                    API Key
+                    API key
                     {newProviderIsSelfHosted && (
                       <>
                         {' '}

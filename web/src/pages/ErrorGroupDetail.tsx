@@ -170,7 +170,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
       setBreadcrumbs([
         { label: 'Projects', href: '/projects' },
         { label: projectSlug, href: `/projects/${projectSlug}` },
-        { label: 'Error Tracking', href: `/projects/${projectSlug}/errors` },
+        { label: 'Error tracking', href: `/projects/${projectSlug}/errors` },
         { label: errorGroup.title || 'Error Details' },
       ])
     }
@@ -255,7 +255,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             onClick={() => navigate(`/projects/${project.slug}/errors`)}
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Error Tracking
+            Back to error tracking
           </Button>
         </div>
       </div>
@@ -452,7 +452,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
           ) : latestEvent ? (
             <Card>
               <CardHeader>
-                <CardTitle>Latest Event</CardTitle>
+                <CardTitle>Latest event</CardTitle>
                 <CardDescription>
                   {format(new Date(latestEvent.timestamp), 'PPpp')}
                 </CardDescription>

@@ -53,7 +53,7 @@ export function MonitoringSettings({
         <CardHeader className="border-b px-5 py-4">
           <CardTitle className="flex items-center gap-2 text-base">
             <HardDrive className="h-5 w-5" />
-            Disk Space Alerts
+            Disk space alerts
           </CardTitle>
           <CardDescription>
             Configure alerts for low disk space on your server

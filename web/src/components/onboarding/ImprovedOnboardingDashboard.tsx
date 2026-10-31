@@ -430,10 +430,10 @@ export function ImprovedOnboardingDashboard() {
               </p>
               <div className="flex gap-3 justify-center pt-4">
                 <Button onClick={() => navigate('/projects')}>
-                  Go to Projects
+                  Go to projects
                 </Button>
                 <Button variant="outline" onClick={resetOnboarding}>
-                  Reset Onboarding
+                  Reset onboarding
                 </Button>
               </div>
             </div>

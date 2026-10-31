@@ -491,7 +491,7 @@ function JoinTokenSection() {
             ) : (
               <Trash2 className="h-4 w-4 mr-1" />
             )}
-            Revoke Token
+            Revoke token
           </Button>
         </div>
         {confirmTokenDialog}
@@ -526,7 +526,7 @@ function JoinTokenSection() {
             ) : (
               <RefreshCw className="h-4 w-4 mr-1" />
             )}
-            Regenerate Token
+            Regenerate token
           </Button>
           <Button
             variant="destructive"
@@ -539,7 +539,7 @@ function JoinTokenSection() {
             ) : (
               <Trash2 className="h-4 w-4 mr-1" />
             )}
-            Revoke Token
+            Revoke token
           </Button>
         </div>
         {confirmTokenDialog}
@@ -566,7 +566,7 @@ function JoinTokenSection() {
         ) : (
           <Key className="h-4 w-4 mr-1" />
         )}
-        Generate Join Token
+        Generate join token
       </Button>
 
       <WorkerJoinGuide
@@ -640,7 +640,7 @@ function NodeTable({
             <TableHead className="hidden sm:table-cell">Ingress</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
             {showOverlay && <TableHead>Cross-node</TableHead>}
-            <TableHead>Last Heartbeat</TableHead>
+            <TableHead>Last heartbeat</TableHead>
             <TableHead className="text-right">
               <span className="sr-only">Actions</span>
             </TableHead>
@@ -854,7 +854,7 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
       <CardHeader className="py-3 px-4">
         <CardTitle className="text-sm flex items-center gap-2">
           <Globe className="h-4 w-4" />
-          Edge Analytics
+          Edge analytics
         </CardTitle>
         <CardDescription>
           Cache performance and traffic overview
@@ -875,16 +875,16 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
             {/* Cache metrics */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <MiniStat
-                label="Total Requests"
+                label="Total requests"
                 value={overview.total_requests.toLocaleString()}
               />
               <MiniStat
-                label="Cache Hits"
+                label="Cache hits"
                 value={overview.cache_hits.toLocaleString()}
                 accent="green"
               />
               <MiniStat
-                label="Cache Misses"
+                label="Cache misses"
                 value={overview.cache_misses.toLocaleString()}
                 accent="yellow"
               />
@@ -915,16 +915,16 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
             {/* Bandwidth */}
             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
               <MiniStat
-                label="Served from Cache"
+                label="Served from cache"
                 value={formatBytes(overview.bytes_from_cache)}
                 accent="green"
               />
               <MiniStat
-                label="From Origin"
+                label="From origin"
                 value={formatBytes(overview.bytes_from_origin)}
               />
               <MiniStat
-                label="Avg Origin Latency"
+                label="Avg origin latency"
                 value={`${overview.avg_origin_latency_ms.toFixed(1)}ms`}
               />
             </div>
@@ -1374,7 +1374,7 @@ function NodeDetail({
               {undrainPending && (
                 <Loader2 className="h-4 w-4 animate-spin mr-1" />
               )}
-              Reactivate Node
+              Reactivate node
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

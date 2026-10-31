@@ -936,12 +936,12 @@ export function ProjectDeployments({
                 }}
               >
                 <PlusIcon className="h-4 w-4 mr-2" />
-                New Deployment
+                New deployment
               </Button>
             ) : (
               <Button onClick={handleOpenNewDeployment}>
                 <PlusIcon className="h-4 w-4 mr-2" />
-                New Deployment
+                New deployment
                 <KeyboardShortcut
                   shortcut="N"
                   onTrigger={handleOpenNewDeployment}
@@ -1136,7 +1136,7 @@ export function ProjectDeployments({
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <ArrowUpRight className="h-5 w-5" />
-              Promote Deployment
+              Promote deployment
             </DialogTitle>
             <DialogDescription>
               Deploy the same image to another environment. This is useful for
@@ -1145,7 +1145,7 @@ export function ProjectDeployments({
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <Label>Target Environment</Label>
+              <Label>Target environment</Label>
               <Select
                 value={promoteTargetEnv}
                 onValueChange={setPromoteTargetEnv}

@@ -150,7 +150,7 @@ function HtmlPreview({ html }: { html: string }) {
     <div className="border rounded-lg overflow-hidden bg-white">
       <iframe
         ref={iframeRef}
-        title="Email HTML Preview"
+        title="Email HTML preview"
         className="w-full border-0"
         style={{ height: `${iframeHeight}px` }}
         sandbox="allow-same-origin"
@@ -419,13 +419,13 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
                 {hasHtml && (
                   <TabsTrigger value="html-source" className="gap-2">
                     <Code className="h-4 w-4" />
-                    HTML Source
+                    HTML source
                   </TabsTrigger>
                 )}
                 {hasText && (
                   <TabsTrigger value="text" className="gap-2">
                     <FileText className="h-4 w-4" />
-                    Plain Text
+                    Plain text
                   </TabsTrigger>
                 )}
               </TabsList>
@@ -554,7 +554,7 @@ export function EmailDetail() {
     <Button variant="ghost" size="sm" asChild>
       <Link to="/email?tab=emails">
         <ArrowLeft className="h-4 w-4 mr-2" />
-        Back to Emails
+        Back to emails
       </Link>
     </Button>
   )

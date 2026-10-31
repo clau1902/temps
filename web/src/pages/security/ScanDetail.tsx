@@ -491,7 +491,7 @@ function ScanDetailContent() {
     <Button variant="outline" size="sm" asChild>
       <Link to={`/projects/${slug}/security`}>
         <ArrowLeft className="mr-2 h-4 w-4" />
-        Back to Security
+        Back to security
       </Link>
     </Button>
   )
@@ -528,7 +528,7 @@ function ScanDetailContent() {
 
   return (
     <Detail
-      title="Vulnerability Scan"
+      title="Vulnerability scan"
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={
         <>
@@ -564,7 +564,7 @@ function ScanDetailContent() {
               <PopoverTrigger asChild>
                 <Button variant="outline" size="sm">
                   <Sparkles className="h-4 w-4 mr-2" />
-                  Copy AI Prompt
+                  Copy AI prompt
                 </Button>
               </PopoverTrigger>
               <PopoverContent

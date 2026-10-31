@@ -42,7 +42,7 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
         <CardHeader>
           <div className="flex items-center justify-between">
             <div>
-              <CardTitle>Live Visitors</CardTitle>
+              <CardTitle>Live visitors</CardTitle>
               <CardDescription>
                 {data
                   ? `${data.visitors.length} visitor${data.visitors.length !== 1 ? 's' : ''} online now`
@@ -229,7 +229,7 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground font-medium mb-1">
-                          Last Seen
+                          Last seen
                         </p>
                         <p className="text-sm font-medium">
                           {formatRelativeTime(visitor.last_seen)}

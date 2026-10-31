@@ -386,7 +386,7 @@ test('environment failure keeps manual variable management and preserves an expl
   )
   await page
     .getByRole('dialog')
-    .getByRole('button', { name: 'Save Changes', exact: true })
+    .getByRole('button', { name: 'Save', exact: true })
     .click()
   await expect.poll(() => saved.length).toBe(1)
   expect(saved[0].environment_ids).toEqual([1, 2])
@@ -567,7 +567,7 @@ for (const mode of ['Add', 'Import'] as const) {
         .getByRole('textbox')
         .fill('NEW_KEY=example-value')
       await page
-        .getByRole('button', { name: 'Parse Content', exact: true })
+        .getByRole('button', { name: 'Parse content', exact: true })
         .click()
     }
     await page.route('**/api/projects/1/environments', (route) =>
@@ -586,7 +586,7 @@ for (const mode of ['Add', 'Import'] as const) {
     )
     await expect(
       dialog.getByRole('button', {
-        name: mode === 'Add' ? 'Save Variable' : 'Import 1 Variable',
+        name: mode === 'Add' ? 'Save variable' : 'Import 1 Variable',
         exact: true,
       })
     ).toBeDisabled()

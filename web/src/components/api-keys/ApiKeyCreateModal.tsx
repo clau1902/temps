@@ -174,7 +174,7 @@ export function ApiKeyCreateModal({
         {newKeySecret ? (
           <>
             <DialogHeader>
-              <DialogTitle>API Key Created Successfully</DialogTitle>
+              <DialogTitle>API key created</DialogTitle>
               <DialogDescription>
                 Copy your API key now. You won&apos;t be able to see it again!
               </DialogDescription>
@@ -188,10 +188,10 @@ export function ApiKeyCreateModal({
                 </AlertDescription>
               </Alert>
               <div className="space-y-2">
-                <FormLabel>Your API Key</FormLabel>
+                <FormLabel>Your API key</FormLabel>
                 <div className="flex gap-2">
                   <Input
-                    aria-label="Your API Key"
+                    aria-label="Your API key"
                     value={newKeySecret}
                     readOnly
                     className="font-mono text-sm"
@@ -218,7 +218,7 @@ export function ApiKeyCreateModal({
         ) : (
           <>
             <DialogHeader>
-              <DialogTitle>Create API Key</DialogTitle>
+              <DialogTitle>Create API key</DialogTitle>
               <DialogDescription>
                 Create a new API key with specific roles and permissions.
               </DialogDescription>
@@ -233,7 +233,7 @@ export function ApiKeyCreateModal({
                       <FormItem>
                         <FormLabel>Name</FormLabel>
                         <FormControl>
-                          <Input placeholder="Production API Key" {...field} />
+                          <Input placeholder="Production API key" {...field} />
                         </FormControl>
                         <FormMessage />
                       </FormItem>

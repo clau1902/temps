@@ -79,12 +79,12 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
       setBreadcrumbs([
         { label: 'Projects', href: '/projects' },
         { label: projectSlug, href: `/projects/${projectSlug}` },
-        { label: 'Error Tracking', href: `/projects/${projectSlug}/errors` },
+        { label: 'Error tracking', href: `/projects/${projectSlug}/errors` },
         {
-          label: 'Error Group',
+          label: 'Error group',
           href: `/projects/${projectSlug}/errors/${errorGroupId}`,
         },
-        { label: 'Event Details' },
+        { label: 'Event details' },
       ])
     }
   }, [setBreadcrumbs, event, projectSlug, errorGroupId])
@@ -152,7 +152,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
             }
           >
             <ArrowLeft className="mr-2 h-4 w-4" />
-            Back to Error Group
+            Back to error group
           </Button>
         </div>
       </div>
@@ -230,7 +230,7 @@ export function ErrorEventDetail({ project }: { project: ProjectResponse }) {
       ) : (
         <Card>
           <CardHeader>
-            <CardTitle>Event Data</CardTitle>
+            <CardTitle>Event data</CardTitle>
             <CardDescription>
               {format(new Date(event.timestamp), 'PPpp')}
             </CardDescription>

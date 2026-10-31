@@ -46,6 +46,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Check, Circle, Loader2, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
+import { SaveRow } from '@temps-sdk/ds'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { MfaSetupResponse } from '@/api/client'
@@ -158,6 +159,8 @@ export function Account() {
     },
     onSuccess: () => {
       toast.success('Account updated successfully')
+      // What was sent is now what is saved, so Save goes quiet again.
+      form.reset(form.getValues())
       refetch()
     },
     onError: (error, variables) => {
@@ -325,7 +328,7 @@ export function Account() {
       {verificationDialog}
       <Card>
         <CardHeader>
-          <CardTitle>Account Settings</CardTitle>
+          <CardTitle>Account settings</CardTitle>
           <CardDescription>Manage your account information</CardDescription>
         </CardHeader>
         <CardContent>
@@ -376,14 +379,7 @@ export function Account() {
                   </div>
                 </div>
               )}
-              <div className="flex justify-end">
-                <Button type="submit" disabled={isPending}>
-                  {isPending && (
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  )}
-                  Save Changes
-                </Button>
-              </div>
+              <SaveRow dirty={form.formState.isDirty} saving={isPending} />
             </form>
           </Form>
         </CardContent>
@@ -391,7 +387,7 @@ export function Account() {
 
       <Card>
         <CardHeader>
-          <CardTitle>Change Password</CardTitle>
+          <CardTitle>Change password</CardTitle>
           <CardDescription>
             Update your account password. You&apos;ll need your current password
             to confirm the change.
@@ -604,7 +600,7 @@ export function Account() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Confirm Identity to Setup 2FA</DialogTitle>
+            <DialogTitle>Confirm identity to setup 2FA</DialogTitle>
             <DialogDescription>
               Enter your current password to begin two-factor authentication
               setup. If your account uses SSO and has no local password, leave
@@ -621,7 +617,7 @@ export function Account() {
                 name="current_password"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>Current Password</FormLabel>
+                    <FormLabel>Current password</FormLabel>
                     <FormControl>
                       <Input
                         {...field}
@@ -730,7 +726,7 @@ export function Account() {
                     {isVerifyingMfa && (
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                     )}
-                    Verify and Enable
+                    Verify and enable
                   </Button>
                 </div>
               </form>

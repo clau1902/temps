@@ -329,7 +329,7 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
                       scanningEnabled={scanningEnabled}
                     >
                       <Play className="h-4 w-4 mr-2" />
-                      Create Scan
+                      Create scan
                     </TriggerScanButton>
                   </CardContent>
                 </Card>
@@ -369,7 +369,7 @@ export function SecurityOverview({ project }: SecurityOverviewProps) {
                       variant="outline"
                     >
                       <Play className="h-4 w-4 mr-2" />
-                      Run New Scan
+                      Run new scan
                     </TriggerScanButton>
                   </div>
 

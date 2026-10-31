@@ -19,7 +19,7 @@ async function openProviderDialog(page: Page) {
     .getByRole('button', { name: 'Configure', exact: true })
     .click()
   const dialog = page.getByRole('dialog', { name: 'Configure OpenAI' })
-  await dialog.getByLabel('Display Name', { exact: true }).fill(displayName)
+  await dialog.getByLabel('Display name', { exact: true }).fill(displayName)
   await dialog.getByLabel('API Key', { exact: true }).fill(apiKey)
   await dialog.getByLabel('Custom Base URL').fill(baseUrl)
   return dialog
@@ -71,7 +71,7 @@ test('a rejected gateway key keeps its inputs and can be corrected and retried',
   await dialog.getByRole('button', { name: 'Add key', exact: true }).click()
   await expect(dialog).toBeVisible()
   await expect(dialog.getByRole('alert')).toHaveText(rejection)
-  await expect(dialog.getByLabel('Display Name', { exact: true })).toHaveValue(
+  await expect(dialog.getByLabel('Display name', { exact: true })).toHaveValue(
     displayName
   )
   await expect(dialog.getByLabel('API Key', { exact: true })).toHaveValue(
@@ -126,7 +126,7 @@ test('closing a failed gateway setup clears its error for the next attempt', asy
     .click()
   await expect(dialog).toBeVisible()
   await expect(dialog.getByRole('alert')).toHaveCount(0)
-  await expect(dialog.getByLabel('Display Name', { exact: true })).toHaveValue(
+  await expect(dialog.getByLabel('Display name', { exact: true })).toHaveValue(
     'OpenAI'
   )
   await expect(dialog.getByLabel('API Key', { exact: true })).toHaveValue('')
@@ -221,14 +221,14 @@ for (const outcome of ['saved', 'rejected'] as const) {
       await expect(dialog).toBeVisible()
       await expect(pendingButton).toBeDisabled()
       await expect(
-        dialog.getByLabel('Display Name', { exact: true })
+        dialog.getByLabel('Display name', { exact: true })
       ).toHaveValue(displayName)
       await expect(dialog.getByLabel('API Key', { exact: true })).toHaveValue(
         apiKey
       )
       await expect(dialog.getByLabel('Custom Base URL')).toHaveValue(baseUrl)
       await expect(
-        dialog.getByLabel('Display Name', { exact: true })
+        dialog.getByLabel('Display name', { exact: true })
       ).toBeDisabled()
       await expect(dialog.getByLabel('API Key', { exact: true })).toBeDisabled()
       await expect(dialog.getByLabel('Custom Base URL')).toBeDisabled()
@@ -261,10 +261,10 @@ for (const outcome of ['saved', 'rejected'] as const) {
         ''
       )
       await dialog
-        .getByLabel('Display Name', { exact: true })
+        .getByLabel('Display name', { exact: true })
         .fill('Next setup')
       await expect(
-        dialog.getByLabel('Display Name', { exact: true })
+        dialog.getByLabel('Display name', { exact: true })
       ).toHaveValue('Next setup')
       await expect(
         dialog.getByRole('button', { name: 'Add key' })

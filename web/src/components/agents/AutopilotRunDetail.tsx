@@ -1365,7 +1365,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
               ) && (
                 <Button variant="outline" size="sm" onClick={onStartOver}>
                   <RefreshCw className="h-4 w-4 mr-2" />
-                  Start Over
+                  Start over
                 </Button>
               )}
               {(phase === 'analyzing' || phase === 'analyzed') && (
@@ -1391,7 +1391,7 @@ export function AutopilotRunDetail({ project }: AutopilotRunDetailProps) {
                   ) : (
                     <Sparkles className="h-4 w-4 mr-2" />
                   )}
-                  Generate Fix
+                  Generate fix
                 </Button>
               )}
               {phase === 'fix_ready' && (
