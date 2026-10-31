@@ -3,14 +3,8 @@
 
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { CalendarClock, FileCode } from 'lucide-react'
-import {
-  Button,
-  Callout,
-  DataTable,
-  PageState,
-  RecordLink,
-} from '@temps-sdk/ds'
+import { FileCode } from 'lucide-react'
+import { Button, Callout, DataTable, RecordLink } from '@temps-sdk/ds'
 import type { CronInfo, ProjectResponse } from '@/api/client'
 import { getEnvironmentCronsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { CodeBlock } from '@/components/ui/code-block'
@@ -71,23 +65,60 @@ function formatRun(value: string | null | undefined) {
 }
 
 /**
- * Jobs Temps runs itself: the `cron:` entries of `.temps.yaml`, registered
- * per environment on deploy, for the environment chosen in the project bar.
+ * The `cron:` entries of `.temps.yaml` for the environment chosen in the
+ * project bar. Shared by the section and the cron page, which needs to know
+ * whether there is anything at all before it decides how to lay itself out.
  */
-export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
+export function useScheduledCronJobs(project: ProjectResponse) {
   const bar = useProjectEnvironment()
-  const [showInstructions, setShowInstructions] = useState(false)
   const environment = bar.selection.environment
-
   const crons = useQuery({
     ...getEnvironmentCronsOptions({
       path: { project_id: project.id, env_id: environment?.id ?? 0 },
     }),
     enabled: environment !== undefined,
   })
-  const loading =
-    bar.isPending || (environment !== undefined && crons.isPending)
-  const rows = crons.data ?? []
+  return {
+    bar,
+    environment,
+    crons,
+    rows: crons.data ?? [],
+    loading: bar.isPending || (environment !== undefined && crons.isPending),
+    failed: bar.isError || crons.isError,
+  }
+}
+
+/** How to declare a job in `.temps.yaml`. */
+export function ScheduleJobDialog({
+  open,
+  onOpenChange,
+}: {
+  open: boolean
+  onOpenChange: (open: boolean) => void
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="sm:max-w-[500px]">
+        <DialogHeader>
+          <DialogTitle>Schedule a job</DialogTitle>
+          <DialogDescription>
+            Temps calls your endpoint on the schedule you set.
+          </DialogDescription>
+        </DialogHeader>
+        <Instructions />
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+/**
+ * Jobs Temps runs itself: the `cron:` entries of `.temps.yaml`, registered
+ * per environment on deploy, for the environment chosen in the project bar.
+ */
+export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
+  const { bar, environment, crons, rows, loading } =
+    useScheduledCronJobs(project)
+  const [showInstructions, setShowInstructions] = useState(false)
 
   return (
     <section aria-labelledby="scheduled-cron-jobs" className="space-y-4">
@@ -136,22 +167,13 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
           </button>
         </Callout>
       ) : !loading && rows.length === 0 ? (
-        <PageState
-          variant="empty"
-          size="compact"
-          icon={CalendarClock}
-          title="No scheduled jobs"
-          description={
-            environment
-              ? `${environment.name} has no cron: entries in .temps.yaml as of its last deployment.`
-              : 'This service has no environments yet.'
-          }
-          action={
-            <Button variant="outline" onClick={() => setShowInstructions(true)}>
-              How to add a job
-            </Button>
-          }
-        />
+        // The header already offers "How to add a job"; one quiet line is
+        // enough while the page has check-in monitors to show.
+        <p className="text-sm text-muted-foreground">
+          {environment
+            ? `No scheduled jobs in ${environment.name} as of its last deployment.`
+            : 'This service has no environments yet.'}
+        </p>
       ) : (
         <DataTable<CronInfo>
           rows={rows}
@@ -186,17 +208,10 @@ export function ScheduledCronJobs({ project }: { project: ProjectResponse }) {
         />
       )}
 
-      <Dialog open={showInstructions} onOpenChange={setShowInstructions}>
-        <DialogContent className="sm:max-w-[500px]">
-          <DialogHeader>
-            <DialogTitle>Schedule a job</DialogTitle>
-            <DialogDescription>
-              Temps calls your endpoint on the schedule you set.
-            </DialogDescription>
-          </DialogHeader>
-          <Instructions />
-        </DialogContent>
-      </Dialog>
+      <ScheduleJobDialog
+        open={showInstructions}
+        onOpenChange={setShowInstructions}
+      />
     </section>
   )
 }

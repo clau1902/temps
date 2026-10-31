@@ -14,7 +14,7 @@ import {
   useSearchParams,
 } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Clock3, RefreshCw } from 'lucide-react'
+import { CalendarClock, Clock3, RefreshCw } from 'lucide-react'
 import {
   Button,
   Callout,
@@ -56,7 +56,11 @@ import {
   listCronMonitorRunsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { CodeBlock } from '@/components/ui/code-block'
-import { ScheduledCronJobs } from '@/components/project/ScheduledCronJobs'
+import {
+  ScheduleJobDialog,
+  ScheduledCronJobs,
+  useScheduledCronJobs,
+} from '@/components/project/ScheduledCronJobs'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { readFailureServerDetail } from '@/lib/read-failure'
 
@@ -189,139 +193,184 @@ function CronList({ project }: { project: ProjectResponse }) {
     refetchInterval: 15000,
   })
   const rows = query.data?.items ?? []
+  const scheduled = useScheduledCronJobs(project)
+  const [scheduling, setScheduling] = useState(false)
+  // Nothing scheduled and nothing monitored: one empty state with both ways
+  // in, rather than two empty sections and a check-in guide for a monitor
+  // that does not exist yet (each monitor's page has that guide).
+  const nothingYet =
+    page === 1 &&
+    !query.isPending &&
+    !query.isError &&
+    rows.length === 0 &&
+    !scheduled.loading &&
+    !scheduled.failed &&
+    scheduled.rows.length === 0
   return (
     <PageContainer>
       <PageHeader
         title="Cron jobs"
         description="Jobs Temps runs for you, and check-ins from jobs you schedule elsewhere."
       />
-      <ScheduledCronJobs project={project} />
-      <section aria-labelledby="cron-check-in-monitors" className="space-y-4">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-          <div className="min-w-0">
-            <h2 id="cron-check-in-monitors" className="text-base font-semibold">
-              Check-in monitors
-            </h2>
-            <p className="text-sm text-muted-foreground">
-              Detect scheduled jobs that fail, start late, or run too long.
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <Button
-              variant="outline"
-              busy={query.isFetching}
-              busyLabel="Refreshing…"
-              onClick={() => void query.refetch()}
-            >
-              <RefreshCw className="size-4" />
-              Refresh
-            </Button>
-            <Button asChild>
-              <Link to={`${basePath(project)}/new`}>Create monitor</Link>
-            </Button>
-          </div>
-        </div>
-        {query.isError && (
-          <Callout tone="error" title="Could not load cron monitors">
-            {failure(query.error)}
-          </Callout>
-        )}
-        {!query.isPending && rows.length === 0 ? (
-          query.isError ? (
-            <PageState
-              variant="failed"
-              size="compact"
-              icon={Clock3}
-              title="Cron jobs unavailable"
-              description={failure(query.error)}
-              action={
-                <Button onClick={() => void query.refetch()}>Retry</Button>
-              }
-            />
-          ) : page > 1 ? (
-            <PageState
-              variant="empty"
-              size="compact"
-              icon={Clock3}
-              title="No jobs on this page"
-              action={<Button onClick={() => setPage(1)}>First page</Button>}
-            />
-          ) : (
-            <>
-              <PageState
-                variant="not-set-up"
-                size="compact"
-                icon={Clock3}
-                title="Monitor your scheduled jobs"
-                requirement="No cron monitors are configured for this project."
-                example="Alert when a daily summary never starts, fails, or runs longer than 30 minutes."
-                settingsHref={`${basePath(project)}/new`}
-                settingsLabel="Create monitor"
-              />
-              <Setup project={project} />
-            </>
-          )
-        ) : (
-          <DataTable<CronMonitorView>
-            rows={rows}
-            rowKey={(m) => m.id}
-            isLoading={query.isPending}
-            columns={[
-              {
-                key: 'slug',
-                header: 'Job',
-                render: (m) => (
-                  <RecordLink to={`${basePath(project)}/${m.id}`}>
-                    {m.slug}
-                  </RecordLink>
-                ),
-              },
-              {
-                key: 'status',
-                header: 'Health',
-                render: (m) => <Health value={m.status} />,
-              },
-              {
-                key: 'scope',
-                header: 'Scope',
-                render: (m) =>
-                  m.environment_id
-                    ? `Environment #${m.environment_id}`
-                    : 'Project',
-              },
-              {
-                key: 'schedule',
-                header: 'Schedule',
-                render: (m) => schedule(m.config),
-              },
-              {
-                key: 'last',
-                header: 'Last check-in',
-                render: (m) =>
-                  m.last_check_in_at
-                    ? stamp(m.last_check_in_at)
-                    : 'Never received',
-              },
-              {
-                key: 'next',
-                header: 'Next expected',
-                render: (m) => stamp(m.next_expected_at),
-              },
-            ]}
-            pagination={
-              query.data
-                ? {
-                    page,
-                    pageSize: 20,
-                    total: query.data.total,
-                    totalPages: Math.max(1, Math.ceil(query.data.total / 20)),
-                    onPageChange: setPage,
+      {nothingYet ? (
+        <PageState
+          variant="empty"
+          size="compact"
+          icon={CalendarClock}
+          title={
+            scheduled.environment
+              ? `No cron jobs in ${scheduled.environment.name}`
+              : 'No cron jobs yet'
+          }
+          description="Have Temps call an endpoint of your app on a schedule, or get alerted when a job you run elsewhere fails, starts late or runs too long."
+          action={
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button variant="outline" onClick={() => setScheduling(true)}>
+                Schedule a job
+              </Button>
+              <Button asChild>
+                <Link to={`${basePath(project)}/new`}>Create monitor</Link>
+              </Button>
+            </div>
+          }
+        />
+      ) : (
+        <>
+          <ScheduledCronJobs project={project} />
+          <section
+            aria-labelledby="cron-check-in-monitors"
+            className="space-y-4"
+          >
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                <h2
+                  id="cron-check-in-monitors"
+                  className="text-base font-semibold"
+                >
+                  Check-in monitors
+                </h2>
+                <p className="text-sm text-muted-foreground">
+                  Detect scheduled jobs that fail, start late, or run too long.
+                </p>
+              </div>
+              <div className="flex gap-2">
+                {rows.length > 0 && (
+                  <Button
+                    variant="outline"
+                    busy={query.isFetching}
+                    busyLabel="Refreshing…"
+                    onClick={() => void query.refetch()}
+                  >
+                    <RefreshCw className="size-4" />
+                    Refresh
+                  </Button>
+                )}
+                <Button asChild>
+                  <Link to={`${basePath(project)}/new`}>Create monitor</Link>
+                </Button>
+              </div>
+            </div>
+            {query.isError && (
+              <Callout tone="error" title="Could not load cron monitors">
+                {failure(query.error)}
+              </Callout>
+            )}
+            {!query.isPending && rows.length === 0 ? (
+              query.isError ? (
+                <PageState
+                  variant="failed"
+                  size="compact"
+                  icon={Clock3}
+                  title="Cron jobs unavailable"
+                  description={failure(query.error)}
+                  action={
+                    <Button onClick={() => void query.refetch()}>Retry</Button>
                   }
-                : undefined
-            }
-          />
-        )}
-      </section>
+                />
+              ) : page > 1 ? (
+                <PageState
+                  variant="empty"
+                  size="compact"
+                  icon={Clock3}
+                  title="No jobs on this page"
+                  action={
+                    <Button onClick={() => setPage(1)}>First page</Button>
+                  }
+                />
+              ) : (
+                // The header already offers "Create monitor".
+                <p className="text-sm text-muted-foreground">
+                  No check-in monitors. Create one to be alerted when a job you
+                  run elsewhere fails, starts late or runs too long.
+                </p>
+              )
+            ) : (
+              <DataTable<CronMonitorView>
+                rows={rows}
+                rowKey={(m) => m.id}
+                isLoading={query.isPending}
+                columns={[
+                  {
+                    key: 'slug',
+                    header: 'Job',
+                    render: (m) => (
+                      <RecordLink to={`${basePath(project)}/${m.id}`}>
+                        {m.slug}
+                      </RecordLink>
+                    ),
+                  },
+                  {
+                    key: 'status',
+                    header: 'Health',
+                    render: (m) => <Health value={m.status} />,
+                  },
+                  {
+                    key: 'scope',
+                    header: 'Scope',
+                    render: (m) =>
+                      m.environment_id
+                        ? `Environment #${m.environment_id}`
+                        : 'Project',
+                  },
+                  {
+                    key: 'schedule',
+                    header: 'Schedule',
+                    render: (m) => schedule(m.config),
+                  },
+                  {
+                    key: 'last',
+                    header: 'Last check-in',
+                    render: (m) =>
+                      m.last_check_in_at
+                        ? stamp(m.last_check_in_at)
+                        : 'Never received',
+                  },
+                  {
+                    key: 'next',
+                    header: 'Next expected',
+                    render: (m) => stamp(m.next_expected_at),
+                  },
+                ]}
+                pagination={
+                  query.data
+                    ? {
+                        page,
+                        pageSize: 20,
+                        total: query.data.total,
+                        totalPages: Math.max(
+                          1,
+                          Math.ceil(query.data.total / 20)
+                        ),
+                        onPageChange: setPage,
+                      }
+                    : undefined
+                }
+              />
+            )}
+          </section>
+        </>
+      )}
+      <ScheduleJobDialog open={scheduling} onOpenChange={setScheduling} />
     </PageContainer>
   )
 }

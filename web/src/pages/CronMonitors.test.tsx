@@ -123,7 +123,7 @@ test('cron limits validate before transport; a native API error preserves inputs
 })
 
 /** Serves the cron list page's reads; records every path requested. */
-function serveCronList(paths: string[]) {
+function serveCronList(paths: string[], { jobs = true } = {}) {
   apiClient.setConfig({
     baseUrl: 'https://console.example.test/api',
     fetch: Object.assign(
@@ -133,6 +133,7 @@ function serveCronList(paths: string[]) {
         const path = new URL(request.url).pathname.replace(/^\/api/, '')
         paths.push(path)
         const crons = path.match(/^\/projects\/17\/environments\/(\d+)\/crons$/)
+        if (crons && !jobs) return Response.json([])
         if (crons)
           return Response.json([
             {
@@ -231,4 +232,39 @@ test('a failed environments read is reported with a retry, not as "no environmen
   expect(view.queryByText('This service has no environments yet.')).toBeNull()
   fireEvent.click(view.getByRole('button', { name: 'Retry' }))
   expect(retries).toBe(1)
+})
+
+test('with nothing scheduled or monitored, the page is one empty state with both ways in', async () => {
+  serveCronList([], { jobs: false })
+  const view = renderCronList({ id: 3, name: 'production', slug: 'production' })
+
+  expect(
+    await view.findByRole('heading', { name: 'No cron jobs in production' })
+  ).toBeTruthy()
+  // No empty sections, refresh or check-in guide around it.
+  expect(view.queryByRole('heading', { name: 'Scheduled by Temps' })).toBeNull()
+  expect(view.queryByRole('heading', { name: 'Check-in monitors' })).toBeNull()
+  expect(view.queryByText('Send check-ins from your job')).toBeNull()
+  expect(view.queryByRole('button', { name: /Refresh/ })).toBeNull()
+  const create = view.getAllByRole('link', { name: 'Create monitor' })
+  expect(create.map((link) => link.getAttribute('href'))).toEqual([
+    '/projects/synthetic/cron-jobs/new',
+  ])
+
+  fireEvent.click(view.getByRole('button', { name: 'Schedule a job' }))
+  expect(
+    await view.findByRole('dialog', { name: 'Schedule a job' })
+  ).toBeTruthy()
+})
+
+test('with jobs but no monitors, the empty section is one line under its header', async () => {
+  serveCronList([])
+  const view = renderCronList({ id: 3, name: 'production', slug: 'production' })
+
+  await view.findByRole('link', { name: /\/api\/tick-3/ })
+  expect(view.getByRole('heading', { name: 'Check-in monitors' })).toBeTruthy()
+  expect(await view.findByText(/^No check-in monitors\./)).toBeTruthy()
+  // Only the header's Create monitor, and nothing to refresh.
+  expect(view.getAllByRole('link', { name: 'Create monitor' })).toHaveLength(1)
+  expect(view.queryByRole('button', { name: /Refresh/ })).toBeNull()
 })
