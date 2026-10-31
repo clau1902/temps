@@ -16,7 +16,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
-temps-proxy = { path = "../temps-proxy" }
+temps-routes = { path = "../temps-routes" }
 temps-geo = { path = "../temps-geo" }
 temps-analytics = { path = "../temps-analytics" }
 temps-analytics-backend = { path = "../temps-analytics-backend" }
@@ -68,8 +68,6 @@ woothee = { workspace = true }
 tokio = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 temps-migrations = { path = "../temps-migrations" }
-# `RouteInfo`/`BackendType` for `insert_route_for_test` in the ingest tests.
-temps-routes = { path = "../temps-routes" }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v4"] }
