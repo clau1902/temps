@@ -27,7 +27,7 @@ sea-orm = { workspace = true }
 tokio = { workspace = true, features = ["process", "fs"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
-async-stream = "0.3"
+async-stream = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -37,7 +37,7 @@ utoipa = { workspace = true }
 chrono = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
-cron = "0.17"
+cron = { workspace = true }
 temps-error-tracking = { path = "../temps-error-tracking" }
 temps-agents-mcp-proxy = { path = "../temps-agents-mcp-proxy" }
 anyhow = { workspace = true }
@@ -48,14 +48,14 @@ reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 base64 = { workspace = true }
 http-body-util = { workspace = true }
-tar = "0.4"
+tar = { workspace = true }
 flate2 = { workspace = true }
 walkdir = { workspace = true }
-pulldown-cmark = "0.13"
+pulldown-cmark = { workspace = true }
 libc = { workspace = true }
 rand = { workspace = true }
 regex = { workspace = true }
-hex = "0.4"
+hex = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 
@@ -68,7 +68,7 @@ tempfile = { workspace = true }
 # instead. The same predicate gates every use of the SDK in this crate and in
 # `temps-cli`'s `microsandbox` command — keep them in step.
 [target.'cfg(not(any(target_env = "musl", all(target_os = "macos", target_arch = "x86_64"))))'.dependencies]
-microsandbox = { version = "=0.7.8", default-features = false, features = ["local", "net"] }
+microsandbox = { workspace = true }
 
 [dev-dependencies]
 # ADR-055 golden captures of the container-create request.

@@ -23,23 +23,23 @@ utoipa = { workspace = true }
 # Screenshot dependencies
 # No `fetch` feature: its zip 8 dependency has no patched release, so
 # chromium_installer.rs downloads the same Chromium build instead.
-headless_chrome = { version = "1.0.18", features = ["offline"] }
+headless_chrome = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"] }
 zip = { workspace = true }
-directories = "6.0"
+directories = { workspace = true }
 url = { workspace = true }
-base64 = "0.23"
+base64 = { workspace = true }
 bytes = { workspace = true }
 # Decodes captured screenshots to prove they are readable images before storing them
-image = { version = "0.25.6", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { workspace = true, features = ["png", "jpeg", "webp"] }
 
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-file-store = { path = "../temps-file-store" }
 
 [dev-dependencies]
-mockito = "1.5"
-tempfile = "3.8"
+mockito = { workspace = true }
+tempfile = { workspace = true }
 sea-orm = { workspace = true }
 temps-entities = { path = "../temps-entities" }
 chrono = { workspace = true }

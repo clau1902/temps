@@ -19,4 +19,4 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-utoipa = "6.0"
+utoipa = { workspace = true }

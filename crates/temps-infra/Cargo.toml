@@ -24,9 +24,9 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Crate-specific dependencies
-if-addrs = "0.15"
-parking_lot = "0.12"
-hickory-resolver = "0.26"
+if-addrs = { workspace = true }
+parking_lot = { workspace = true }
+hickory-resolver = { workspace = true }
 
 # Plugin system dependencies
 temps-core = { path = "../temps-core" }

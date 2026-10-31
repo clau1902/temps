@@ -11,10 +11,10 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-nix = { version = "0.31", features = ["fs", "user"] }
+nix = { workspace = true, features = ["fs", "user"] }
 async-trait = { workspace = true }
 futures = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

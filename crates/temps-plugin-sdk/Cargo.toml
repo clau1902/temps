@@ -30,9 +30,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Unix socket support
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "http2"] }
-tower = { version = "0.5", features = ["util"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["default", "http1", "http2"] }
+tower = { workspace = true }
 
 # WebSocket support for the platform channel
 tokio-tungstenite = "0.30"
@@ -45,7 +45,7 @@ utoipa = { workspace = true }
 temps-core = { path = "../temps-core" }
 
 # UUID for request IDs
-subtle = "2.6"
+subtle = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

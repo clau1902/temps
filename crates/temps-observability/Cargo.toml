@@ -34,6 +34,6 @@ base64 = { workspace = true }
 temps-geo = { path = "../temps-geo" }
 # Real-ClickHouse regression test (clickhouse_observe_test.rs) — same pinned
 # client/testcontainers pattern as temps-otel's clickhouse_storage_test.rs.
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 uuid = { workspace = true }

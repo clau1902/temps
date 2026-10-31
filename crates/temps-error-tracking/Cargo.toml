@@ -36,30 +36,30 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
 sha2 = { workspace = true }
-sha1_smol = "1.0.1"
+sha1_smol = { workspace = true }
 zip = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 url = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true }
 uuid = { workspace = true }
 async-trait = { workspace = true }
 tower-http = { workspace = true }
 regex = { workspace = true }
 
 # Relay dependencies for Sentry SDK compatibility
-relay-event-schema = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
-relay-protocol = { git = "https://github.com/getsentry/relay", rev = "ca7e20d" }
+relay-event-schema = { workspace = true }
+relay-protocol = { workspace = true }
 
 # Source map symbolication
-sourcemap = "9"
+sourcemap = { workspace = true }
 
 # Additional dependencies for Sentry integration
-flate2 = "1.0"  # For gzip decompression
+flate2 = { workspace = true }  # For gzip decompression
 
 [dev-dependencies]
 temps-migrations = { path = "../temps-migrations" }
-axum-test = "21.0.0"
-serial_test = "4.0"
+axum-test = { workspace = true }
+serial_test = { workspace = true }
 semver = { workspace = true }

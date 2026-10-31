@@ -26,7 +26,7 @@ temps-clickhouse = { path = "../temps-clickhouse" }
 # ClickHouse Rust client. Always linked. The actual ClickHouse backend is
 # only constructed at runtime when ServerConfig::is_clickhouse_enabled()
 # returns true (i.e. operator set TEMPS_CLICKHOUSE_* env vars).
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 
 # Web framework
 axum = { workspace = true }
@@ -54,8 +54,8 @@ anyhow = { workspace = true }
 chrono = { workspace = true }
 
 # Bounded TTL cache for per-project traffic settings read on ingest
-moka = { version = "0.12", features = ["future"] }
-ipnet = "2.10"
+moka = { workspace = true }
+ipnet = { workspace = true }
 
 # User agent parsing
 woothee = { workspace = true }
@@ -63,6 +63,6 @@ woothee = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true }
 tracing-subscriber = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+uuid = { workspace = true }

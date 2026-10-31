@@ -31,11 +31,11 @@ anyhow = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 totp-rs = { workspace = true }
-base32 = "0.5.1"
+base32 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-qrcode = "0.14.1"
-image = "0.25.6"
+qrcode = { workspace = true }
+image = { workspace = true, features = ["default"] }
 base64 = { workspace = true }
 urlencoding = { workspace = true }
 tracing = { workspace = true }

@@ -47,10 +47,10 @@ base64 = { workspace = true }
 url = { workspace = true }
 
 # HMAC for click tracking signatures
-hmac = "0.13"
+hmac = { workspace = true }
 
 # Streaming HTML rewriter for pixel injection + link rewriting
-lol_html = "3"
+lol_html = { workspace = true }
 
 # HTTP client for SNS cert fetching + subscription confirmation
 reqwest = { workspace = true }
@@ -60,10 +60,10 @@ reqwest = { workspace = true }
 # workspace's sha2 (0.11, used above for HMAC click-tracking signatures,
 # unrelated) because `rsa` 0.9's Pkcs1v15Sign requires digest 0.10's
 # AssociatedOid trait.
-rsa = "0.9"
+rsa = { workspace = true }
 sha1 = { version = "0.10", features = ["oid"] }
-sha2-rsa = { package = "sha2", version = "0.10", features = ["oid"] }
-x509-parser = "0.18"
+sha2-rsa = { workspace = true }
+x509-parser = { workspace = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
+tokio-test = { workspace = true }

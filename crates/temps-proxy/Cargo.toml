@@ -33,37 +33,37 @@ bytes = { workspace = true }
 cookie = { workspace = true }
 sea-orm = { workspace = true }
 tracing = { workspace = true }
-htmd = "0.5"
-scraper = "0.27"
-pingora = { version = "0.9.0", features = ["lb"] }
-pingora-core = { version = "0.9.0", features = ["openssl", "connection_filter"] }
-pingora-http = "0.9.0"
-pingora-proxy = "0.9.0"
-pingora-openssl = "0.9.0"
+htmd = { workspace = true }
+scraper = { workspace = true }
+pingora = { workspace = true, features = ["lb"] }
+pingora-core = { workspace = true }
+pingora-http = { workspace = true }
+pingora-proxy = { workspace = true }
+pingora-openssl = { workspace = true }
 rand = { workspace = true }
-hex = "0.4"
-sha2 = "0.11"
-hmac = "0.13"
+hex = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }
 argon2 = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 utoipa = { workspace = true }
-dashmap = "6"
+dashmap = { workspace = true }
 futures = { workspace = true }
-parking_lot = "0.12"
-arc-swap = "1"
-moka = { version = "0.12", features = ["future"] }
-ipnetwork = "0.21"
+parking_lot = { workspace = true }
+arc-swap = { workspace = true }
+moka = { workspace = true }
+ipnetwork = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
 once_cell = { workspace = true }
-woothee = "0.13"
-rustls = "0.23"
-rustls-pemfile = "2.0"
+woothee = { workspace = true }
+rustls = { workspace = true, features = ["default"] }
+rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 url = { workspace = true }
 
@@ -73,9 +73,9 @@ integration = []
 
 [dev-dependencies]
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
-temp-dir = "0.2"
-hyper = { version = "1.0", features = ["full"] }
+temp-dir = { workspace = true }
+hyper = { workspace = true }
 http-body-util = { workspace = true }
-tower = "0.5"
-anyhow = "1.0"
+tower = { workspace = true }
+anyhow = { workspace = true }
 temps-presets = { path = "../temps-presets" }
