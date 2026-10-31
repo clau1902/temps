@@ -13,6 +13,7 @@ import { ShieldEntriesPanel } from '@/components/shield/ShieldEntriesPanel'
 import { ShieldWouldHaveCounts } from './ShieldWouldHaveCounts'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
+import { SaveRow } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -275,6 +276,8 @@ export function ProjectSecuritySettings({
         }
       )
 
+      // What was just saved is the new baseline: Save goes back to disabled.
+      reset(data)
       refetch()
     } catch (error) {
       // Error already handled by toast.promise
@@ -378,22 +381,9 @@ export function ProjectSecuritySettings({
             projectSlug={project.slug}
           />
         </div>
-        <div className="mt-6">
-          <Button
-            type="submit"
-            disabled={
-              !isDirty ||
-              isSubmitting ||
-              updateDeploymentConfig.isPending ||
-              updateProjectSettings.isPending
-            }
-          >
-            Save Shield settings
-          </Button>
-        </div>
       </SettingsSection>
 
-      {/* Saved as they change, apart from the form's Save buttons. */}
+      {/* Saved as they change, apart from the form's Save row. */}
       <SettingsSection
         id="shield-entries"
         title="Shield entries"
@@ -454,11 +444,6 @@ export function ProjectSecuritySettings({
             />
           </div>
         </div>
-        <div className="mt-6">
-          <Button type="submit" disabled={!isDirty || isSubmitting}>
-            Save AI settings
-          </Button>
-        </div>
       </SettingsSection>
 
       {/* Vulnerability Scanning Card */}
@@ -490,11 +475,6 @@ export function ProjectSecuritySettings({
               }
             />
           </div>
-        </div>
-        <div className="mt-6">
-          <Button type="submit" disabled={!isDirty || isSubmitting}>
-            Save vulnerability scanning settings
-          </Button>
         </div>
       </SettingsSection>
 
@@ -610,16 +590,6 @@ export function ProjectSecuritySettings({
               )}
             </>
           )}
-        </div>
-        <div className="mt-6">
-          <Button
-            type="submit"
-            disabled={
-              !isDirty || isSubmitting || updateDeploymentConfig.isPending
-            }
-          >
-            Save security configuration
-          </Button>
         </div>
       </SettingsSection>
 
@@ -775,6 +745,16 @@ export function ProjectSecuritySettings({
           )}
         </div>
       </SettingsSection>
+
+      <SaveRow
+        sticky
+        dirty={isDirty}
+        saving={
+          isSubmitting ||
+          updateDeploymentConfig.isPending ||
+          updateProjectSettings.isPending
+        }
+      />
     </form>
   )
 }
