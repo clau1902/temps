@@ -213,11 +213,20 @@ impl EdgeCache {
     /// against a future accounting mistake wrapping the counter to ~2^64 (which
     /// would make the next eviction pass empty the whole cache).
     fn sub_bytes(&self, bytes: u64) {
-        let _ = self
-            .total_bytes
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                Some(current.saturating_sub(bytes))
-            });
+        // An explicit CAS loop rather than `fetch_update`, which newer
+        // toolchains deprecate in favour of `try_update` (absent on older ones).
+        let mut current = self.total_bytes.load(Ordering::Relaxed);
+        loop {
+            match self.total_bytes.compare_exchange_weak(
+                current,
+                current.saturating_sub(bytes),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Attempt to get a cached asset. Returns `None` on miss or TTL expiry.
