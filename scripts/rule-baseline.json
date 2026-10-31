@@ -111,7 +111,6 @@
     },
     "temps-deployer": {
       "lazy_error_variants": 20,
-      "files_over_3000_lines": 2,
       "functions_over_300_lines": 3
     },
     "temps-deployments": {
