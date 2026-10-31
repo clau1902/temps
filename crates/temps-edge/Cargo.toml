@@ -15,6 +15,7 @@ temps-core = { path = "../temps-core" }
 temps-file-store = { path = "../temps-file-store" }
 
 aes-gcm = { workspace = true }
+arc-swap = { workspace = true }
 axum = { workspace = true }
 async-trait = { workspace = true }
 base64 = { workspace = true }
