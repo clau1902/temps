@@ -118,7 +118,7 @@
       "lazy_error_variants": 41,
       "unguarded_require_auth": 1,
       "anyhow_in_library": 37,
-      "files_over_3000_lines": 6,
+      "files_over_3000_lines": 5,
       "functions_over_300_lines": 26
     },
     "temps-dns": {
