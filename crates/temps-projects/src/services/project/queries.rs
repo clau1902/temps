@@ -5,7 +5,7 @@
 
 use super::*;
 
-pub(super) async fn has_ready_deployment(
+async fn has_ready_deployment(
     db: &temps_database::DbConnection,
     hidden: &[i32],
 ) -> Result<bool, ProjectError> {
@@ -581,5 +581,39 @@ impl ProjectService {
             log_ingest_lines_per_sec: db_project.log_ingest_lines_per_sec,
             log_ingest_kib_per_sec: db_project.log_ingest_kib_per_sec,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn first_deploy_signal_requires_ready_and_excludes_hidden_projects() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+        let row = std::collections::BTreeMap::from([("id", Value::Int(Some(42)))]);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![row]])
+            .into_connection();
+        assert!(has_ready_deployment(&db, &[7, 9]).await.unwrap());
+        let log = db.into_transaction_log();
+        let statements = &log[0].statements()[0].sql;
+        assert!(
+            statements.contains("ready_at\" IS NOT NULL"),
+            "{statements}"
+        );
+        assert!(statements.contains("project_id\" NOT IN"), "{statements}");
+        assert!(statements.contains("state\" IN"), "{statements}");
+        assert!(statements.contains("LIMIT"), "{statements}");
+        assert!(!statements.contains("last_deployment"), "{statements}");
+    }
+
+    #[tokio::test]
+    async fn first_deploy_signal_is_false_without_a_ready_deployment() {
+        use sea_orm::{DatabaseBackend, MockDatabase, Value};
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<std::collections::BTreeMap<&str, Value>>::new()])
+            .into_connection();
+        assert!(!has_ready_deployment(&db, &[]).await.unwrap());
     }
 }

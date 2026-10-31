@@ -574,3 +574,76 @@ impl ProjectService {
         Ok(self.map_written_project(updated_project).await)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── git_url / repo identity consistency ─────────────────────────────
+
+    /// The failure this guards: the repo identity was changed through
+    /// `/settings`, the clone URL was left behind, and the next deploy
+    /// resolved a commit from the new repo while cloning the old one.
+    #[test]
+    fn test_repo_change_that_strands_git_url_is_detected() {
+        let url = Some("https://github.com/acme/old-repo.git".to_string());
+        let desync = would_desync_git_url(&url, ("acme", "old-repo"), (None, Some("new-repo")));
+
+        let (old, new) = desync.expect("changing the name strands the URL");
+        assert_eq!(old, "acme/old-repo");
+        assert_eq!(new, "acme/new-repo");
+    }
+
+    /// Changing the owner counts too.
+    #[test]
+    fn test_owner_change_is_detected() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (Some("other"), None)).is_some());
+    }
+
+    /// No repo change means nothing to desync, whatever the URL looks like.
+    #[test]
+    fn test_no_repo_change_is_allowed() {
+        let url = Some("https://github.com/acme/app.git".to_string());
+        assert!(would_desync_git_url(&url, ("acme", "app"), (None, None)).is_none());
+        assert!(
+            would_desync_git_url(&url, ("acme", "app"), (Some("acme"), Some("app"))).is_none(),
+            "restating the same values is not a change"
+        );
+    }
+
+    /// A URL that doesn't identify the current repo can't be proven stale, so
+    /// the operator isn't blocked — self-hosted layouts and unusual remotes
+    /// must keep working.
+    #[test]
+    fn test_unrelated_or_unparsable_url_does_not_block() {
+        // Points somewhere that isn't the current repo: not our call to make.
+        let other = Some("https://git.internal/mirrors/vendored.git".to_string());
+        assert!(would_desync_git_url(&other, ("acme", "app"), (None, Some("app2"))).is_none());
+
+        // No URL at all.
+        assert!(would_desync_git_url(&None, ("acme", "app"), (None, Some("app2"))).is_none());
+    }
+
+    /// ssh remotes and missing `.git` must match the same way https does,
+    /// or the guard would fire on projects it shouldn't.
+    #[test]
+    fn test_matching_is_scheme_and_suffix_insensitive() {
+        for url in [
+            "git@github.com:acme/app.git",
+            "https://github.com/acme/app",
+            "https://github.com/acme/app/",
+            "https://github.com/ACME/App.git",
+        ] {
+            assert!(
+                would_desync_git_url(
+                    &Some(url.to_string()),
+                    ("acme", "app"),
+                    (None, Some("app2"))
+                )
+                .is_some(),
+                "should recognise {url} as the current repo"
+            );
+        }
+    }
+}

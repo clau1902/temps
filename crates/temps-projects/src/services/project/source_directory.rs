@@ -78,7 +78,7 @@ pub(super) fn normalized_stored_directory(directory: &str) -> String {
 /// Only GitHub: its contents API answers unauthenticated requests for public
 /// repositories. Deliberately unauthenticated, so the check can never reveal
 /// anything about a private repository a shared credential could see.
-pub(super) fn public_directory_provider(git_url: Option<&str>) -> Option<&'static str> {
+fn public_directory_provider(git_url: Option<&str>) -> Option<&'static str> {
     let url = url::Url::parse(git_url?.trim()).ok()?;
     if !matches!(url.scheme(), "https" | "http") {
         return None;
@@ -213,5 +213,70 @@ impl ProjectService {
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_public_github_https_urls_are_listed_without_a_connection() {
+        for (url, expected) in [
+            ("https://github.com/example/monorepo", Some("github")),
+            ("https://github.com/example/monorepo.git", Some("github")),
+            ("https://WWW.GitHub.com/example/monorepo", Some("github")),
+            ("https://gitlab.com/example/monorepo", None),
+            ("https://github.com.example.net/example/monorepo", None),
+            ("git@github.com:example/monorepo.git", None),
+            ("ssh://git@github.com/example/monorepo", None),
+            ("not a url", None),
+        ] {
+            assert_eq!(public_directory_provider(Some(url)), expected, "{url}");
+        }
+        assert_eq!(public_directory_provider(None), None);
+    }
+
+    #[test]
+    fn pull_only_root_directory_is_forced_off_at_repository_root() {
+        assert!(!pull_only_root_directory_value(".", Some(true), true));
+        assert!(!pull_only_root_directory_value(".", None, true));
+    }
+
+    #[test]
+    fn pull_only_root_directory_keeps_existing_when_omitted() {
+        assert!(pull_only_root_directory_value("apps/web", None, true));
+        assert!(!pull_only_root_directory_value("apps/web", None, false));
+        assert!(pull_only_root_directory_value(
+            "apps/web",
+            Some(true),
+            false
+        ));
+        assert!(!pull_only_root_directory_value(
+            "apps/web",
+            Some(false),
+            true
+        ));
+    }
+
+    #[test]
+    fn project_directory_must_remain_inside_source_root() {
+        assert_eq!(normalize_project_directory("").unwrap(), ".");
+        assert_eq!(
+            normalize_project_directory("./apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("../secrets"),
+            Err(ProjectError::InvalidInput(_))
+        ));
+        assert_eq!(
+            normalize_project_directory("/apps/web").unwrap(),
+            "apps/web"
+        );
+        assert!(matches!(
+            normalize_project_directory("apps/../../etc"),
+            Err(ProjectError::InvalidInput(_))
+        ));
     }
 }

@@ -28,7 +28,7 @@ pub struct TemplateGithubResponse {
     pub ref_: Option<String>,
 }
 
-pub(super) fn apply_new_template_default_when_unmodified<T: Clone + PartialEq>(
+fn apply_new_template_default_when_unmodified<T: Clone + PartialEq>(
     current: T,
     applied_default: T,
     target_default: T,
@@ -64,7 +64,7 @@ fn missing_required_service_types(required: &[String], linked: &HashSet<String>)
 /// aliases, so an upgrade may add aliases but cannot remove or remap aliases
 /// used by an older release. That keeps a rollback's database credentials
 /// compatible without guessing from the live catalog.
-pub(super) fn validate_service_binding_compatibility(
+fn validate_service_binding_compatibility(
     applied: &temps_core::templates::TemplateServiceSpec,
     target: &temps_core::templates::TemplateServiceSpec,
 ) -> Result<(), ProjectError> {
@@ -108,7 +108,7 @@ pub(super) fn validate_service_binding_compatibility(
 }
 
 #[cfg(test)]
-pub(super) fn production_configured_variable_keys(
+fn production_configured_variable_keys(
     variables: &[env_vars::Model],
     links: &[env_var_environments::Model],
     production_environment_id: i32,
@@ -810,5 +810,124 @@ impl ProjectService {
         }
 
         Ok(self.map_written_project(updated_project).await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_upgrade_replaces_only_an_unmodified_template_default() {
+        assert_eq!(
+            apply_new_template_default_when_unmodified(
+                "image:v1".to_string(),
+                "image:v1".to_string(),
+                "image:v2".to_string(),
+            ),
+            "image:v2"
+        );
+        assert_eq!(
+            apply_new_template_default_when_unmodified(
+                "registry.example/custom@sha256:123".to_string(),
+                "image:v1".to_string(),
+                "image:v2".to_string(),
+            ),
+            "registry.example/custom@sha256:123"
+        );
+    }
+
+    #[test]
+    fn production_template_upgrade_preserves_global_and_production_variables() {
+        let now = chrono::Utc::now();
+        let variable = |id: i32, key: &str, environment_id: Option<i32>| env_vars::Model {
+            id,
+            project_id: 7,
+            environment_id,
+            key: key.to_string(),
+            value: "encrypted".to_string(),
+            created_at: now,
+            updated_at: now,
+            include_in_preview: false,
+            is_encrypted: true,
+            is_secret: false,
+        };
+        let variables = vec![
+            variable(1, "GLOBAL", None),
+            variable(2, "PRODUCTION_JOIN", None),
+            variable(3, "PREVIEW_JOIN", None),
+            variable(4, "PRODUCTION_LEGACY", Some(20)),
+        ];
+        let links = vec![
+            env_var_environments::Model {
+                id: 1,
+                env_var_id: 2,
+                environment_id: 20,
+                created_at: now,
+            },
+            env_var_environments::Model {
+                id: 2,
+                env_var_id: 3,
+                environment_id: 21,
+                created_at: now,
+            },
+        ];
+
+        let keys = production_configured_variable_keys(&variables, &links, 20);
+
+        assert_eq!(
+            keys,
+            ["GLOBAL", "PRODUCTION_JOIN", "PRODUCTION_LEGACY"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn service_upgrade_may_add_but_not_remap_managed_service_bindings() {
+        let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("bundled Keycloak release")
+            .primary()
+            .clone();
+        let mut target = applied.clone();
+        target
+            .database_bindings
+            .entry("postgres".to_string())
+            .or_default()
+            .insert("NEW_ALIAS".to_string(), "POSTGRES_HOST".to_string());
+        validate_service_binding_compatibility(&applied, &target)
+            .expect("adding a managed-service alias is rollback-safe");
+
+        let existing_alias = applied
+            .database_bindings
+            .get_mut("postgres")
+            .and_then(|bindings| bindings.keys().next().cloned())
+            .expect("Keycloak declares a PostgreSQL binding");
+        target
+            .database_bindings
+            .get_mut("postgres")
+            .expect("target PostgreSQL bindings")
+            .insert(existing_alias, "REMAPPED_SOURCE".to_string());
+        assert!(matches!(
+            validate_service_binding_compatibility(&applied, &target),
+            Err(ProjectError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
+    fn service_upgrade_cannot_remove_required_service_without_custom_bindings() {
+        let mut applied = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("bundled Keycloak release")
+            .primary()
+            .clone();
+        applied.database_bindings.clear();
+        let mut target = applied.clone();
+        target.databases.clear();
+
+        assert!(matches!(
+            validate_service_binding_compatibility(&applied, &target),
+            Err(ProjectError::InvalidInput(_))
+        ));
     }
 }

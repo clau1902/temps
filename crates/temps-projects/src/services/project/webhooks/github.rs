@@ -11,10 +11,7 @@ use super::*;
 /// so each project's hook needs a URL of its own for two projects to deploy
 /// from one repository. The receiver ignores the query: it identifies the
 /// project by the secret that signed the delivery.
-pub(in crate::services::project) fn github_repo_webhook_url(
-    base_url: &str,
-    project_id: i32,
-) -> String {
+fn github_repo_webhook_url(base_url: &str, project_id: i32) -> String {
     use temps_git::handlers::github::GITHUB_REPO_WEBHOOK_PATH;
 
     format!("{base_url}/api{GITHUB_REPO_WEBHOOK_PATH}?project_id={project_id}")
@@ -23,10 +20,7 @@ pub(in crate::services::project) fn github_repo_webhook_url(
 /// Whether a provider needs Temps to register a GitHub repository webhook for
 /// its projects: a GitHub provider authenticated any way other than as a
 /// GitHub App. An App delivers pushes through its own webhook and needs none.
-pub(in crate::services::project) fn github_connection_needs_repo_webhook(
-    provider_type: &str,
-    auth_method: &str,
-) -> bool {
+fn github_connection_needs_repo_webhook(provider_type: &str, auth_method: &str) -> bool {
     provider_type == "github" && auth_method != "github_app"
 }
 
@@ -288,5 +282,58 @@ impl ProjectService {
         );
 
         Ok(hook_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #1596: a GitHub PAT/OAuth connection has no App webhook, so its
+    // projects need a repository webhook; an App connection must not get one
+    // (the push would arrive twice), and other providers have their own flow.
+    #[test]
+    fn only_non_app_github_connections_get_a_repository_webhook() {
+        assert!(github_connection_needs_repo_webhook("github", "pat"));
+        assert!(github_connection_needs_repo_webhook("github", "oauth"));
+        assert!(!github_connection_needs_repo_webhook(
+            "github",
+            "github_app"
+        ));
+        assert!(!github_connection_needs_repo_webhook("gitlab", "pat"));
+        assert!(!github_connection_needs_repo_webhook("gitea", "pat"));
+        assert!(!github_connection_needs_repo_webhook("bitbucket", "pat"));
+    }
+
+    #[test]
+    fn repository_webhook_is_replaced_only_when_the_repository_changes() {
+        let current = (Some(7), "acme", "web");
+        // A branch, preset or directory save resends the same connection.
+        assert!(!repository_target_changed(
+            current,
+            (Some(7), "acme", "web")
+        ));
+        assert!(repository_target_changed(current, (Some(8), "acme", "web")));
+        assert!(repository_target_changed(
+            current,
+            (Some(7), "other", "web")
+        ));
+        assert!(repository_target_changed(current, (Some(7), "acme", "api")));
+        // Disconnecting removes the hook.
+        assert!(repository_target_changed(current, (None, "acme", "web")));
+    }
+
+    /// GitHub refuses a second hook with the same URL and events, so two
+    /// projects on one repository each need a hook URL of their own.
+    #[test]
+    fn each_project_gets_its_own_github_webhook_url() {
+        let first = github_repo_webhook_url("https://temps.example.com", 7);
+        let second = github_repo_webhook_url("https://temps.example.com", 8);
+
+        assert_eq!(
+            first,
+            "https://temps.example.com/api/webhook/git/github/repo-events?project_id=7"
+        );
+        assert_ne!(first, second);
     }
 }

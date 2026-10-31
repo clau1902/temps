@@ -375,3 +375,77 @@ impl ProjectService {
             .map_err(|violations| ProjectError::InvalidInput(violations.join("; ")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── tenant resource ceilings ─────────────────────────────────────────
+
+    /// The default ceilings are unenforced, so a project config that uses
+    /// every `0 = unlimited` sentinel must pass unchanged — this is what
+    /// "an upgrade changes nothing" means at the service layer.
+    #[test]
+    fn enforce_tenant_ceilings_is_a_noop_with_default_settings() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(0),
+            max_concurrent_connections: Some(0),
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings::default();
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
+
+    /// A configured ceiling rejects a violating config with an
+    /// `InvalidInput` whose message names every violation, not just the
+    /// first — the caller joins them with "; " for a single round trip.
+    #[test]
+    fn enforce_tenant_ceilings_rejects_violations_with_a_joined_message() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(8192),
+            max_concurrent_connections: Some(500),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        let error = ProjectService::enforce_tenant_ceilings(&config, &app_settings)
+            .expect_err("values above the ceiling must be rejected");
+        match error {
+            ProjectError::InvalidInput(msg) => {
+                assert!(msg.contains("4096"), "got: {msg}");
+                assert!(msg.contains("200"), "got: {msg}");
+                assert!(msg.contains(';'), "expected violations joined, got: {msg}");
+            }
+            other => panic!("expected InvalidInput, got: {other:?}"),
+        }
+    }
+
+    /// A config within every configured ceiling is accepted.
+    #[test]
+    fn enforce_tenant_ceilings_accepts_values_within_the_ceiling() {
+        let config = temps_entities::deployment_config::DeploymentConfig {
+            memory_limit: Some(2048),
+            max_concurrent_connections: Some(100),
+            ..Default::default()
+        };
+        let app_settings = temps_core::AppSettings {
+            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+                max_memory_limit_mb: 4096,
+                max_concurrent_connections: 200,
+                allow_unlimited_request_timeouts: true,
+            },
+            ..Default::default()
+        };
+
+        assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
+    }
+}

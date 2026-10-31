@@ -48,7 +48,7 @@ pub(super) fn slugify(name: &str) -> String {
         .to_string()
 }
 
-pub(super) fn base_project_slug(name: &str) -> String {
+fn base_project_slug(name: &str) -> String {
     let mut slug = slugify(name);
     // Leave room for the production environment and service namespace within
     // a single DNS label. This must stay identical for planning and creation.
@@ -315,5 +315,25 @@ impl ProjectService {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planned_slug_base_matches_creation_truncation() {
+        let slug = base_project_slug(
+            "This project name is deliberately much longer than the DNS allocation permits",
+        );
+        assert!(slug.len() <= 40);
+        assert!(slug.starts_with("this-project-name-is-deliberately"));
+    }
+
+    #[test]
+    fn planned_slug_truncation_is_safe_for_unicode_names() {
+        let slug = base_project_slug(&"é".repeat(50));
+        assert_eq!(slug.chars().count(), 40);
     }
 }
