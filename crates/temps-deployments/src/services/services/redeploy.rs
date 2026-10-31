@@ -4,6 +4,7 @@
 //! Redeploys: an environment's current deployment rebuilt from its recorded
 //! source, including the node drain and failover planning.
 
+use super::cancel::confined_archive_path;
 use super::*;
 
 /// Most redeploys [`DeploymentService::plan_redeploys`] plans in one call.

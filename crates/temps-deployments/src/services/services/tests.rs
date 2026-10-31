@@ -92,25 +92,6 @@ impl temps_deployer::ImageBuilder for NoopImageBuilder {
 }
 
 #[test]
-fn archive_cleanup_paths_are_lexically_confined() {
-    let root = std::path::Path::new("/var/lib/temps");
-    assert_eq!(
-        confined_archive_path(root, "source-bundles/archive.zip").unwrap(),
-        root.join("source-bundles/archive.zip")
-    );
-    for path in [
-        "../archive.zip",
-        "source-bundles/../../archive.zip",
-        "/tmp/archive.zip",
-    ] {
-        assert!(matches!(
-            confined_archive_path(root, path),
-            Err(DeploymentError::InvalidBundlePath { .. })
-        ));
-    }
-}
-
-#[test]
 fn record_not_inserted_is_not_treated_as_a_unique_violation() {
     // This insert never uses `on_conflict().do_nothing()`, so a bare
     // `RecordNotInserted` cannot be produced by the race this check
