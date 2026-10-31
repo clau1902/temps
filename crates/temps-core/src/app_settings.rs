@@ -4777,6 +4777,10 @@ pub enum EnvSettingMigration<T> {
     SettingAlreadySet,
     /// The variable is set but unusable. Nothing is persisted.
     Invalid { reason: String },
+    /// An earlier start already acted on this variable (see
+    /// [`EnvMigrationLedger`]), so it is ignored even when the setting is
+    /// back at its default: an admin may have chosen that value.
+    AlreadyHandled,
 }
 
 impl<T> EnvSettingMigration<T> {
@@ -4814,6 +4818,12 @@ impl<T> EnvSettingMigration<T> {
                  persisted into `{setting}`. Remove {env_var} and configure `{setting}` in \
                  Settings"
             ),
+            Self::AlreadyHandled => tracing::warn!(
+                env_var,
+                setting,
+                "{env_var} is deprecated and was already migrated into the `{setting}` setting \
+                 on an earlier start; ignored. Remove {env_var} from the environment"
+            ),
         }
     }
 
@@ -4823,6 +4833,51 @@ impl<T> EnvSettingMigration<T> {
             Self::Persist(value) => Some(value),
             _ => None,
         }
+    }
+
+    /// Apply the ledger: a variable an earlier start already acted on is
+    /// ignored. `EnvUnset` and `Invalid` pass through, so their logging is
+    /// unchanged.
+    pub fn unless_handled(self, ledger: &EnvMigrationLedger, env_var: &str) -> Self {
+        match self {
+            Self::Persist(_) | Self::AlreadyPersisted | Self::SettingAlreadySet
+                if ledger.is_handled(env_var) =>
+            {
+                Self::AlreadyHandled
+            }
+            other => other,
+        }
+    }
+
+    /// Whether the shim is done with this variable without writing it: the
+    /// setting already holds its value, or an explicit value supersedes it.
+    /// Such a variable is recorded in the ledger right away; a `Persist` is
+    /// recorded only after its write succeeds.
+    pub fn is_settled_without_write(&self) -> bool {
+        matches!(self, Self::AlreadyPersisted | Self::SettingAlreadySet)
+    }
+}
+
+/// Settings-row key of the [`EnvMigrationLedger`]. It lives beside the
+/// [`AppSettings`] fields in the same JSON document but is not one of them,
+/// so it is neither returned by nor writable through the settings API;
+/// generic saves keep it because they merge into the stored document.
+pub const ENV_MIGRATION_LEDGER_KEY: &str = "env_migrations";
+
+/// The deprecated environment variables the one-release shim has already
+/// acted on. Without it, "the setting is still at its default" cannot tell
+/// "never configured" from "an admin chose the default", and every restart
+/// would re-apply a variable still left in the environment over the admin's
+/// choice.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvMigrationLedger {
+    #[serde(default)]
+    pub handled: std::collections::BTreeSet<String>,
+}
+
+impl EnvMigrationLedger {
+    pub fn is_handled(&self, env_var: &str) -> bool {
+        self.handled.contains(env_var)
     }
 }
 
@@ -4972,6 +5027,58 @@ mod env_setting_migration_tests {
     fn matching_value_is_not_written_again() {
         let outcome = decide_env_setting_migration(Some("8"), &8u32, &4u32, parse_u32);
         assert_eq!(outcome, EnvSettingMigration::AlreadyPersisted);
+    }
+
+    fn ledger_with(env_vars: &[&str]) -> EnvMigrationLedger {
+        EnvMigrationLedger {
+            handled: env_vars.iter().map(|name| (*name).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_handled_variable_is_not_reapplied_when_the_admin_chose_the_default() {
+        // The setting is back at its default because an admin chose it, not
+        // because it was never configured: the variable must stay ignored.
+        let outcome = decide_env_setting_migration(Some("8"), &4u32, &4u32, parse_u32)
+            .unless_handled(&ledger_with(&["TEMPS_X"]), "TEMPS_X");
+        assert_eq!(outcome, EnvSettingMigration::AlreadyHandled);
+        assert_eq!(outcome.into_persist(), None);
+    }
+
+    #[test]
+    fn the_ledger_only_affects_its_own_variable() {
+        let outcome = decide_env_setting_migration(Some("8"), &4u32, &4u32, parse_u32)
+            .unless_handled(&ledger_with(&["TEMPS_OTHER"]), "TEMPS_X");
+        assert_eq!(outcome, EnvSettingMigration::Persist(8));
+    }
+
+    #[test]
+    fn the_ledger_keeps_unset_and_invalid_outcomes() {
+        let ledger = ledger_with(&["TEMPS_X"]);
+        assert_eq!(
+            decide_env_setting_migration(None, &4u32, &4u32, parse_u32)
+                .unless_handled(&ledger, "TEMPS_X"),
+            EnvSettingMigration::EnvUnset
+        );
+        assert!(matches!(
+            decide_env_setting_migration(Some("x"), &4u32, &4u32, parse_u32)
+                .unless_handled(&ledger, "TEMPS_X"),
+            EnvSettingMigration::Invalid { .. }
+        ));
+    }
+
+    #[test]
+    fn only_outcomes_without_a_write_are_settled_immediately() {
+        let settled = |outcome: EnvSettingMigration<u32>| outcome.is_settled_without_write();
+        assert!(settled(EnvSettingMigration::AlreadyPersisted));
+        assert!(settled(EnvSettingMigration::SettingAlreadySet));
+        // A Persist is recorded only once its write succeeds.
+        assert!(!settled(EnvSettingMigration::Persist(8)));
+        assert!(!settled(EnvSettingMigration::EnvUnset));
+        assert!(!settled(EnvSettingMigration::AlreadyHandled));
+        assert!(!settled(EnvSettingMigration::Invalid {
+            reason: "bad".to_string()
+        }));
     }
 
     #[test]

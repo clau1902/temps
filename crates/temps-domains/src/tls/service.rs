@@ -2191,6 +2191,76 @@ mod tests {
         }
     }
 
+    /// Regression: a `LETSENCRYPT_MODE=staging` left in the environment used
+    /// to be re-applied on every start once an admin set the environment back
+    /// to `production` (the default), silently switching issuance to the
+    /// untrusted staging CA.
+    #[tokio::test]
+    async fn letsencrypt_mode_is_migrated_once_and_never_overrides_the_admin_again() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Docker unavailable; skipping LETSENCRYPT_MODE migration test: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to create test database: {error}"),
+        };
+        let config_service = temps_config::ConfigService::new(
+            Arc::new(dns_renewal_test_server_config(std::env::temp_dir().join(
+                format!("temps-letsencrypt-mode-{}", uuid::Uuid::new_v4()),
+            ))),
+            test_db.db.clone(),
+        );
+        let audit = RecordingAuditLogger::default();
+        let boot = || {
+            crate::tls::providers::migrate_letsencrypt_mode(
+                Some("staging".to_string()),
+                &config_service,
+                &audit,
+            )
+        };
+        let environment = || async {
+            config_service
+                .get_settings()
+                .await
+                .expect("settings")
+                .letsencrypt
+                .environment
+        };
+        let migration_records = || {
+            audit
+                .operations
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(operation, _)| operation == "SETTING_MIGRATED_FROM_ENV")
+                .count()
+        };
+
+        // First start: the variable is persisted once and audited.
+        boot().await;
+        assert_eq!(environment().await, "staging");
+        assert_eq!(migration_records(), 1);
+
+        // The admin switches back to production, the default value.
+        config_service
+            .update_letsencrypt_settings(|letsencrypt| {
+                letsencrypt.environment = "production".to_string()
+            })
+            .await
+            .expect("admin chooses production");
+
+        // Later starts with the variable still set keep the admin's choice.
+        boot().await;
+        boot().await;
+        assert_eq!(environment().await, "production");
+        assert_eq!(migration_records(), 1);
+    }
+
     #[tokio::test]
     #[serial_test::serial(dns_renewal_db)]
     async fn test_dns01_renewal_policy_failures_precede_provider_credential_decryption() {

@@ -377,6 +377,16 @@ pub async fn migrate_letsencrypt_mode_env(
     config_service: &temps_config::ConfigService,
     audit: &dyn temps_core::AuditLogger,
 ) {
+    migrate_letsencrypt_mode(letsencrypt_mode_env_value(), config_service, audit).await
+}
+
+/// [`migrate_letsencrypt_mode_env`] with the variable's value passed in, so
+/// tests can run it boot after boot without touching process environment.
+pub(crate) async fn migrate_letsencrypt_mode(
+    env_value: Option<String>,
+    config_service: &temps_config::ConfigService,
+    audit: &dyn temps_core::AuditLogger,
+) {
     let stored = match config_service.get_settings().await {
         Ok(settings) => settings.letsencrypt,
         Err(e) => {
@@ -387,7 +397,6 @@ pub async fn migrate_letsencrypt_mode_env(
             return;
         }
     };
-    let env_value = letsencrypt_mode_env_value();
     if env_value.is_none() && stored.environment != LETSENCRYPT_PRODUCTION {
         // Before this release the stored value was not used for issuance;
         // say so loudly now that it is.
@@ -400,8 +409,15 @@ pub async fn migrate_letsencrypt_mode_env(
             stored.environment
         );
     }
-    let plan = plan_letsencrypt_mode_env_migration(env_value.as_deref(), &stored);
+    let ledger = config_service.env_migration_ledger_or_empty().await;
+    let plan = plan_letsencrypt_mode_env_migration(env_value.as_deref(), &stored)
+        .unless_handled(&ledger, LETSENCRYPT_MODE_ENV);
     plan.log(LETSENCRYPT_MODE_ENV, LETSENCRYPT_ENVIRONMENT_SETTING);
+    if plan.is_settled_without_write() {
+        config_service
+            .mark_env_migrations_handled(&[LETSENCRYPT_MODE_ENV])
+            .await;
+    }
     let Some(environment) = plan.into_persist() else {
         return;
     };
@@ -410,6 +426,9 @@ pub async fn migrate_letsencrypt_mode_env(
         .await
     {
         Ok(_) => {
+            config_service
+                .mark_env_migrations_handled(&[LETSENCRYPT_MODE_ENV])
+                .await;
             temps_core::record_env_setting_persisted(
                 Some(audit),
                 LETSENCRYPT_MODE_ENV,

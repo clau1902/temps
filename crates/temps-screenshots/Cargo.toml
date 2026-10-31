@@ -43,6 +43,7 @@ mockito = { workspace = true }
 tempfile = { workspace = true }
 sea-orm = { workspace = true }
 temps-entities = { path = "../temps-entities" }
+temps-database = { path = "../temps-database" }
 chrono = { workspace = true }
 
 [lints]

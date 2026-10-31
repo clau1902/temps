@@ -15012,6 +15012,7 @@ dependencies = [
  "tempfile",
  "temps-config",
  "temps-core",
+ "temps-database",
  "temps-entities",
  "temps-file-store",
  "thiserror 2.0.21",

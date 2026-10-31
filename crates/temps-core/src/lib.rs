@@ -220,10 +220,10 @@ pub use app_settings::{
 // one-release shim that migrates those variables into them.
 pub use app_settings::{
     decide_env_setting_migration, decide_secret_env_migration, record_env_setting_persisted,
-    BackupExecutorSettings, EnvSecret, EnvSettingMigratedAudit, EnvSettingMigration,
-    OtelIngestSettings, OtelIngestSettingsError, OtelS3ArchiveSettings, OtelS3Credentials,
-    DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT, DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
-    DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS, DEFAULT_OTEL_S3_ARCHIVE_PREFIX,
+    BackupExecutorSettings, EnvMigrationLedger, EnvSecret, EnvSettingMigratedAudit,
+    EnvSettingMigration, OtelIngestSettings, OtelIngestSettingsError, OtelS3ArchiveSettings,
+    OtelS3Credentials, DEFAULT_BACKUP_EXECUTOR_MAX_CONCURRENT, DEFAULT_OTEL_RATE_LIMIT_REQUESTS,
+    DEFAULT_OTEL_RATE_LIMIT_WINDOW_SECS, DEFAULT_OTEL_S3_ARCHIVE_PREFIX, ENV_MIGRATION_LEDGER_KEY,
     MAX_BACKUP_EXECUTOR_MAX_CONCURRENT,
 };
 pub use async_trait;

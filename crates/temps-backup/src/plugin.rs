@@ -152,11 +152,18 @@ async fn migrate_backup_executor_env(
     };
 
     let env_value = backup_executor_env_value();
-    let plan = plan_backup_executor_env_migration(env_value.as_deref(), &stored);
+    let ledger = config_service.env_migration_ledger_or_empty().await;
+    let plan = plan_backup_executor_env_migration(env_value.as_deref(), &stored)
+        .unless_handled(&ledger, BACKUP_EXECUTOR_MAX_CONCURRENT_ENV);
     plan.log(
         BACKUP_EXECUTOR_MAX_CONCURRENT_ENV,
         BACKUP_EXECUTOR_MAX_CONCURRENT_SETTING,
     );
+    if plan.is_settled_without_write() {
+        config_service
+            .mark_env_migrations_handled(&[BACKUP_EXECUTOR_MAX_CONCURRENT_ENV])
+            .await;
+    }
     let Some(value) = plan.into_persist() else {
         return stored;
     };
@@ -166,6 +173,9 @@ async fn migrate_backup_executor_env(
         .await
     {
         Ok(saved) => {
+            config_service
+                .mark_env_migrations_handled(&[BACKUP_EXECUTOR_MAX_CONCURRENT_ENV])
+                .await;
             temps_core::record_env_setting_persisted(
                 Some(audit),
                 BACKUP_EXECUTOR_MAX_CONCURRENT_ENV,

@@ -2243,6 +2243,78 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         self.update_settings_section("letsencrypt", update_fn).await
     }
 
+    /// The deprecated environment variables the one-release shim already
+    /// acted on, read from the settings row. Stored beside `AppSettings`
+    /// rather than in it, like `external_tls`, so the settings API neither
+    /// shows nor resets it.
+    pub async fn env_migration_ledger(
+        &self,
+    ) -> Result<temps_core::EnvMigrationLedger, ConfigServiceError> {
+        let malformed = || ConfigServiceError::MalformedSettingsSection {
+            section: temps_core::ENV_MIGRATION_LEDGER_KEY,
+        };
+        let row = settings::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?;
+        match row
+            .as_ref()
+            .and_then(|row| row.data.get(temps_core::ENV_MIGRATION_LEDGER_KEY))
+        {
+            None | Some(serde_json::Value::Null) => Ok(temps_core::EnvMigrationLedger::default()),
+            Some(ledger) => serde_json::from_value(ledger.clone()).map_err(|_| malformed()),
+        }
+    }
+
+    /// Record deprecated environment variables as handled, so later starts
+    /// ignore them (see [`temps_core::EnvMigrationLedger`]). Runs under the
+    /// settings-row lock; a no-op for an empty list.
+    pub async fn record_env_migrations_handled(
+        &self,
+        env_vars: &[&str],
+    ) -> Result<(), ConfigServiceError> {
+        if env_vars.is_empty() {
+            return Ok(());
+        }
+        self.update_settings_section(
+            temps_core::ENV_MIGRATION_LEDGER_KEY,
+            |ledger: &mut temps_core::EnvMigrationLedger| {
+                ledger
+                    .handled
+                    .extend(env_vars.iter().map(|env_var| (*env_var).to_string()));
+            },
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// [`Self::env_migration_ledger`] for the boot-time shim, which must never
+    /// block startup: a failed read is logged and treated as an empty ledger,
+    /// the behaviour before the ledger existed.
+    pub async fn env_migration_ledger_or_empty(&self) -> temps_core::EnvMigrationLedger {
+        self.env_migration_ledger().await.unwrap_or_else(|error| {
+            warn!(
+                %error,
+                "Failed to read the environment-migration ledger; deprecated variables are \
+                 treated as not yet migrated this start"
+            );
+            temps_core::EnvMigrationLedger::default()
+        })
+    }
+
+    /// [`Self::record_env_migrations_handled`] for the boot-time shim: a
+    /// failed write is logged, and the variables are considered again on the
+    /// next start.
+    pub async fn mark_env_migrations_handled(&self, env_vars: &[&str]) {
+        if let Err(error) = self.record_env_migrations_handled(env_vars).await {
+            warn!(
+                %error,
+                ?env_vars,
+                "Failed to record deprecated environment variables as migrated; they will be \
+                 considered again on the next start"
+            );
+        }
+    }
+
     /// Change the screenshot settings under the settings-row lock. Same
     /// contract as [`Self::update_otel_ingest_settings`].
     pub async fn update_screenshot_settings<F>(
@@ -4518,6 +4590,98 @@ mod tests {
             .iter()
             .flat_map(|transaction| transaction.statements())
             .all(|statement| !statement.to_string().starts_with("UPDATE ")));
+    }
+
+    #[tokio::test]
+    async fn env_migration_ledger_survives_settings_saves_and_stays_out_of_the_api() {
+        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!("Skipping env migration ledger test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("env migration ledger test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+
+        assert!(service
+            .env_migration_ledger()
+            .await
+            .expect("fresh ledger")
+            .handled
+            .is_empty());
+        service
+            .record_env_migrations_handled(&["LETSENCRYPT_MODE"])
+            .await
+            .expect("record first variable");
+        service
+            .record_env_migrations_handled(&["TEMPS_OTEL_RATE_LIMIT", "LETSENCRYPT_MODE"])
+            .await
+            .expect("record more variables");
+        service
+            .record_env_migrations_handled(&[])
+            .await
+            .expect("an empty list is a no-op");
+
+        // An admin save of the whole settings document, built from what the
+        // API returns, must not drop the ledger.
+        let mut settings = service.get_settings().await.expect("settings");
+        settings.letsencrypt.environment = "production".to_string();
+        service
+            .update_settings(settings.clone())
+            .await
+            .expect("admin settings save");
+        assert!(
+            settings
+                .to_json()
+                .get(temps_core::ENV_MIGRATION_LEDGER_KEY)
+                .is_none(),
+            "the ledger must not be part of the settings API document"
+        );
+
+        let ledger = service.env_migration_ledger().await.expect("ledger");
+        assert_eq!(
+            ledger.handled.into_iter().collect::<Vec<_>>(),
+            vec![
+                "LETSENCRYPT_MODE".to_string(),
+                "TEMPS_OTEL_RATE_LIMIT".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_env_migration_ledger_is_reported_and_treated_as_empty_at_boot() {
+        let mut row = settings_row("preserved.example.test");
+        row.data[temps_core::ENV_MIGRATION_LEDGER_KEY] = serde_json::json!({ "handled": 7 });
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Sqlite)
+                .append_query_results([[row.clone()], [row]])
+                .into_connection(),
+        );
+        let service = ConfigService::new(test_config(), db);
+
+        let error = service
+            .env_migration_ledger()
+            .await
+            .expect_err("a malformed ledger must be an error");
+        assert!(
+            matches!(
+                error,
+                ConfigServiceError::MalformedSettingsSection {
+                    section: temps_core::ENV_MIGRATION_LEDGER_KEY
+                }
+            ),
+            "unexpected ledger error: {error:?}"
+        );
+        assert!(service
+            .env_migration_ledger_or_empty()
+            .await
+            .handled
+            .is_empty());
     }
 
     #[tokio::test]

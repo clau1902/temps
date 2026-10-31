@@ -383,6 +383,99 @@ fn plan_otel_env_migration(
 }
 
 impl OtelEnvMigrationPlan {
+    /// Ignore every variable an earlier start already acted on.
+    fn unless_handled(self, ledger: &temps_core::EnvMigrationLedger) -> Self {
+        Self {
+            s3_region: self
+                .s3_region
+                .unless_handled(ledger, "TEMPS_OTEL_S3_REGION"),
+            s3_endpoint: self
+                .s3_endpoint
+                .unless_handled(ledger, "TEMPS_OTEL_S3_ENDPOINT"),
+            s3_bucket: self
+                .s3_bucket
+                .unless_handled(ledger, "TEMPS_OTEL_S3_BUCKET"),
+            s3_prefix: self
+                .s3_prefix
+                .unless_handled(ledger, "TEMPS_OTEL_S3_PREFIX"),
+            s3_access_key: self
+                .s3_access_key
+                .unless_handled(ledger, "TEMPS_OTEL_S3_ACCESS_KEY"),
+            s3_secret_key: self
+                .s3_secret_key
+                .unless_handled(ledger, "TEMPS_OTEL_S3_SECRET_KEY"),
+            rate_limit_requests: self
+                .rate_limit_requests
+                .unless_handled(ledger, "TEMPS_OTEL_RATE_LIMIT"),
+            rate_limit_window_secs: self
+                .rate_limit_window_secs
+                .unless_handled(ledger, "TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS"),
+            quota_gb_per_project: self
+                .quota_gb_per_project
+                .unless_handled(ledger, "TEMPS_OTEL_QUOTA_GB"),
+            enable_health_compute: self
+                .enable_health_compute
+                .unless_handled(ledger, "TEMPS_OTEL_ENABLE_HEALTH_COMPUTE"),
+            enable_anomaly_detection: self
+                .enable_anomaly_detection
+                .unless_handled(ledger, "TEMPS_OTEL_ENABLE_ANOMALY_DETECTION"),
+        }
+    }
+
+    /// Variables the shim is done with without writing them, to record in
+    /// the ledger right away.
+    fn settled_without_write(&self) -> Vec<&'static str> {
+        [
+            (
+                self.s3_region.is_settled_without_write(),
+                "TEMPS_OTEL_S3_REGION",
+            ),
+            (
+                self.s3_endpoint.is_settled_without_write(),
+                "TEMPS_OTEL_S3_ENDPOINT",
+            ),
+            (
+                self.s3_bucket.is_settled_without_write(),
+                "TEMPS_OTEL_S3_BUCKET",
+            ),
+            (
+                self.s3_prefix.is_settled_without_write(),
+                "TEMPS_OTEL_S3_PREFIX",
+            ),
+            (
+                self.s3_access_key.is_settled_without_write(),
+                "TEMPS_OTEL_S3_ACCESS_KEY",
+            ),
+            (
+                self.s3_secret_key.is_settled_without_write(),
+                "TEMPS_OTEL_S3_SECRET_KEY",
+            ),
+            (
+                self.rate_limit_requests.is_settled_without_write(),
+                "TEMPS_OTEL_RATE_LIMIT",
+            ),
+            (
+                self.rate_limit_window_secs.is_settled_without_write(),
+                "TEMPS_OTEL_RATE_LIMIT_WINDOW_SECS",
+            ),
+            (
+                self.quota_gb_per_project.is_settled_without_write(),
+                "TEMPS_OTEL_QUOTA_GB",
+            ),
+            (
+                self.enable_health_compute.is_settled_without_write(),
+                "TEMPS_OTEL_ENABLE_HEALTH_COMPUTE",
+            ),
+            (
+                self.enable_anomaly_detection.is_settled_without_write(),
+                "TEMPS_OTEL_ENABLE_ANOMALY_DETECTION",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(settled, env_var)| settled.then_some(env_var))
+        .collect()
+    }
+
     /// Emit the deprecation warning for every variable that was set.
     fn log(&self) {
         self.s3_region
@@ -572,8 +665,13 @@ async fn resolve_otel_ingest_settings(
         }
     };
 
-    let plan = plan_otel_env_migration(&OtelEnvSnapshot::from_process_env(), &stored);
+    let ledger = config_service.env_migration_ledger_or_empty().await;
+    let plan = plan_otel_env_migration(&OtelEnvSnapshot::from_process_env(), &stored)
+        .unless_handled(&ledger);
     plan.log();
+    config_service
+        .mark_env_migrations_handled(&plan.settled_without_write())
+        .await;
     let access_ciphertext =
         encrypt_env_secret(&plan.s3_access_key, encryption, "TEMPS_OTEL_S3_ACCESS_KEY");
     let secret_ciphertext =
@@ -597,6 +695,10 @@ async fn resolve_otel_ingest_settings(
         .await
     {
         Ok(saved) => {
+            let written_env_vars: Vec<&str> = written.iter().map(|(env_var, _)| *env_var).collect();
+            config_service
+                .mark_env_migrations_handled(&written_env_vars)
+                .await;
             for (env_var, setting) in written {
                 temps_core::record_env_setting_persisted(audit, env_var, setting).await;
             }

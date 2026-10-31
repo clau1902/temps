@@ -156,13 +156,23 @@ impl ScreenshotService {
     /// `TEMPS_SCREENSHOT_PROVIDER` is persisted into the setting once at
     /// startup (see [`Self::migrate_provider_env`]).
     pub async fn new(config_service: Arc<ConfigService>) -> ScreenshotResult<Self> {
+        Self::new_with_audit(config_service, None).await
+    }
+
+    /// [`Self::new`], audit-logging the one-time migration of
+    /// `TEMPS_SCREENSHOT_PROVIDER` the way every other migrated variable is.
+    /// The plugin passes the server's audit logger; tests pass `None`.
+    pub async fn new_with_audit(
+        config_service: Arc<ConfigService>,
+        audit: Option<&dyn temps_core::AuditLogger>,
+    ) -> ScreenshotResult<Self> {
         let mut settings = config_service
             .get_settings()
             .await
             .map_err(|e| ScreenshotError::ConfigError(format!("Failed to get settings: {}", e)))?;
 
         settings.screenshots =
-            Self::migrate_provider_env(&config_service, settings.screenshots).await;
+            Self::migrate_provider_env(&config_service, settings.screenshots, audit).await;
         let slot = Self::slot_from_settings(&settings)?;
         let provider = Arc::clone(&slot.provider);
 
@@ -229,10 +239,34 @@ impl ScreenshotService {
     async fn migrate_provider_env(
         config_service: &ConfigService,
         stored: temps_core::ScreenshotSettings,
+        audit: Option<&dyn temps_core::AuditLogger>,
     ) -> temps_core::ScreenshotSettings {
-        let env_value = screenshot_provider_env_value();
-        let plan = plan_screenshot_provider_env_migration(env_value.as_deref(), &stored);
+        Self::migrate_provider_value(
+            screenshot_provider_env_value(),
+            config_service,
+            stored,
+            audit,
+        )
+        .await
+    }
+
+    /// [`Self::migrate_provider_env`] with the variable's value passed in, so
+    /// tests can run it start after start without touching process environment.
+    async fn migrate_provider_value(
+        env_value: Option<String>,
+        config_service: &ConfigService,
+        stored: temps_core::ScreenshotSettings,
+        audit: Option<&dyn temps_core::AuditLogger>,
+    ) -> temps_core::ScreenshotSettings {
+        let ledger = config_service.env_migration_ledger_or_empty().await;
+        let plan = plan_screenshot_provider_env_migration(env_value.as_deref(), &stored)
+            .unless_handled(&ledger, SCREENSHOT_PROVIDER_ENV);
         plan.log(SCREENSHOT_PROVIDER_ENV, SCREENSHOT_PROVIDER_SETTING);
+        if plan.is_settled_without_write() {
+            config_service
+                .mark_env_migrations_handled(&[SCREENSHOT_PROVIDER_ENV])
+                .await;
+        }
         let Some(provider) = plan.into_persist() else {
             return stored;
         };
@@ -242,10 +276,11 @@ impl ScreenshotService {
             .await
         {
             Ok(saved) => {
-                // No audit logger is reachable from this service; the
-                // structured `info!` is the record.
+                config_service
+                    .mark_env_migrations_handled(&[SCREENSHOT_PROVIDER_ENV])
+                    .await;
                 temps_core::record_env_setting_persisted(
-                    None,
+                    audit,
                     SCREENSHOT_PROVIDER_ENV,
                     SCREENSHOT_PROVIDER_SETTING,
                 )
@@ -705,7 +740,14 @@ mod provider_selection_tests {
     }
 
     fn config_service(db: MockDatabase) -> Arc<ConfigService> {
-        let server_config = Arc::new(temps_config::ServerConfig {
+        Arc::new(ConfigService::new(
+            test_server_config(),
+            Arc::new(db.into_connection()),
+        ))
+    }
+
+    fn test_server_config() -> Arc<temps_config::ServerConfig> {
+        Arc::new(temps_config::ServerConfig {
             address: "127.0.0.1:3000".to_string(),
             database_url: "postgres://test".to_string(),
             tls_address: None,
@@ -730,11 +772,76 @@ mod provider_selection_tests {
             clickhouse_database: None,
             clickhouse_user: None,
             clickhouse_password: None,
-        });
-        Arc::new(ConfigService::new(
-            server_config,
-            Arc::new(db.into_connection()),
-        ))
+        })
+    }
+
+    #[derive(Default)]
+    struct RecordingAudit {
+        operations: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for RecordingAudit {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            self.operations
+                .lock()
+                .unwrap()
+                .push(operation.operation_type());
+            Ok(())
+        }
+    }
+
+    /// The provider variable is persisted once, audited like every other
+    /// migrated variable, and never re-applied over an admin's later choice
+    /// of the default provider.
+    #[tokio::test]
+    async fn provider_env_is_migrated_once_with_an_audit_record() {
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_database::test_utils::is_container_runtime_unavailable(
+                    &error.to_string(),
+                ) =>
+            {
+                eprintln!(
+                    "Docker unavailable; skipping screenshot provider migration test: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("failed to create test database: {error}"),
+        };
+        let config = ConfigService::new(test_server_config(), test_db.db.clone());
+        let audit = RecordingAudit::default();
+        let start = |stored: temps_core::ScreenshotSettings| {
+            ScreenshotService::migrate_provider_value(
+                Some("noop".to_string()),
+                &config,
+                stored,
+                Some(&audit),
+            )
+        };
+        let stored = || async { config.get_settings().await.expect("settings").screenshots };
+
+        let first = start(stored().await).await;
+        assert_eq!(first.provider, "noop");
+        assert_eq!(stored().await.provider, "noop");
+        assert_eq!(
+            *audit.operations.lock().unwrap(),
+            vec!["SETTING_MIGRATED_FROM_ENV".to_string()]
+        );
+
+        // The admin picks the default provider again; later starts keep it.
+        config
+            .update_screenshot_settings(|screenshots| screenshots.provider = "local".to_string())
+            .await
+            .expect("admin chooses local");
+        let later = start(stored().await).await;
+        assert_eq!(later.provider, "local");
+        assert_eq!(stored().await.provider, "local");
+        assert_eq!(audit.operations.lock().unwrap().len(), 1);
     }
 
     fn settings_driven(
