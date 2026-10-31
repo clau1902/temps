@@ -12,6 +12,9 @@ use super::templates::{
     applied_service_template_from_model, apply_new_template_default_when_unmodified,
     production_configured_variable_keys, validate_service_binding_compatibility,
 };
+use super::webhooks::{
+    git_webhook_base_url, github_connection_needs_repo_webhook, github_repo_webhook_url,
+};
 use super::*;
 
 // ------------------------------------------------------------------
