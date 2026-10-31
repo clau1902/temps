@@ -5,6 +5,7 @@
 name = "temps-observability"
 version.workspace = true
 edition.workspace = true
+description = "Unified Observe timeline: one paginated feed merging request logs, OTel spans, error events and revenue events"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

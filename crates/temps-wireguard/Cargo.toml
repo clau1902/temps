@@ -5,6 +5,7 @@
 name = "temps-wireguard"
 version.workspace = true
 edition.workspace = true
+description = "WireGuard mesh for multi-node clusters: kernel mesh via netlink, userspace boringtun helpers and node pairing"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

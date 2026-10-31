@@ -5,6 +5,7 @@
 name = "temps-edge"
 version.workspace = true
 edition.workspace = true
+description = "Database-free edge CDN node that caches static assets locally and proxies dynamic requests to a Temps control plane"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

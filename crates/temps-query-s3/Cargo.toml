@@ -5,6 +5,7 @@
 name = "temps-query-s3"
 version = "0.1.0"
 edition = "2021"
+description = "S3 and MinIO backend for temps-query: browse buckets and object prefixes and read objects"
 license.workspace = true
 
 [dependencies]

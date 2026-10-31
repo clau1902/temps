@@ -2,7 +2,9 @@
 SCOPE: AI tooling — expose the REST API to the LLM as read-only tools.
 -->
 
-# ADR-024: REST API as read-only LLM tools (generic invocation, permission-gated)
+# ADR-073: REST API as read-only LLM tools (generic invocation, permission-gated)
+
+> **Renumbered:** this ADR was numbered 024 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-024" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-06-29

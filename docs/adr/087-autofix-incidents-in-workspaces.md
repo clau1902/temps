@@ -1,9 +1,11 @@
-# ADR-054: Production crashes are fixed as incidents in a workspace
+# ADR-087: Production crashes are fixed as incidents in a workspace
+
+> **Renumbered:** this ADR was numbered 054 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-054" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-10-20
 **Author:** David Viejo
-**Builds on:** ADR-037 (sandbox snapshots), ADR-051 (sandbox service access), ADR-053 (workspaces hold the chats)
+**Builds on:** ADR-074 (sandbox snapshots), ADR-084 (sandbox service access), ADR-086 (workspaces hold the chats)
 **Supersedes:** the standalone Autofixer run flow (`crates/temps-agents/src/services/autofixer.rs`)
 
 ---

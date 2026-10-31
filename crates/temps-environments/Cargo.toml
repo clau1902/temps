@@ -5,6 +5,7 @@
 name = "temps-environments"
 version.workspace = true
 edition.workspace = true
+description = "Project environments: environment CRUD, environment variables and secrets, ingress and login settings, and Shield mode"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

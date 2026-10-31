@@ -1,6 +1,8 @@
 <!-- SCOPE: Defines how Temps models its execution environment, runtime capabilities, workload backends, and control-plane service endpoints. -->
 
-# ADR-040: Runtime Context, Capabilities, and Service Resolution
+# ADR-075: Runtime Context, Capabilities, and Service Resolution
+
+> **Renumbered:** this ADR was numbered 040 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-040" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Accepted
 **Date:** 2026-08-29

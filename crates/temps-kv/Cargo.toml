@@ -5,6 +5,7 @@
 name = "temps-kv"
 version.workspace = true
 edition.workspace = true
+description = "Project-isolated key-value store service and HTTP API backed by on-demand Redis containers"
 license.workspace = true
 authors.workspace = true
 

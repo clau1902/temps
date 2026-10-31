@@ -1,6 +1,6 @@
 # Implementation Plan: OIDC SSO (Community Tier)
 
-**Companion to:** [ADR-015](./015-oidc-sso-authentication.md)
+**Companion to:** [ADR-015](../015-oidc-sso-authentication.md)
 **Date:** 2026-05-15
 **Author:** David Viejo
 

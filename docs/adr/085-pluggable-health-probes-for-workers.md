@@ -1,9 +1,11 @@
-# ADR-052: Pluggable Health Probes for Deployments Without an HTTP Port
+# ADR-085: Pluggable Health Probes for Deployments Without an HTTP Port
+
+> **Renumbered:** this ADR was numbered 052 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-052" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-10-17
 **Author:** David Viejo
-**Builds on:** ADR-045 (host Docker socket grant: first non-web workload class), the container health loop in `temps-monitoring`
+**Builds on:** ADR-079 (host Docker socket grant: first non-web workload class), the container health loop in `temps-monitoring`
 
 ---
 

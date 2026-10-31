@@ -5,6 +5,7 @@
 name = "temps-memory"
 version.workspace = true
 edition.workspace = true
+description = "Workflow memory contract for AI runs: the WorkflowMemoryProvider trait, fact types and the in-sandbox memory shell script"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

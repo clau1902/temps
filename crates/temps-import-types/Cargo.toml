@@ -5,6 +5,7 @@
 name = "temps-import-types"
 version.workspace = true
 edition.workspace = true
+description = "Import system leaf types: the WorkloadImporter trait, workload and project snapshots, migration plans and errors"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

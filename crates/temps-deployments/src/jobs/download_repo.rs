@@ -31,7 +31,7 @@ fn keep_deployment_temp_files() -> bool {
     static WARNED: std::sync::Once = std::sync::Once::new();
     #[allow(
         clippy::disallowed_methods,
-        reason = "documented host-level operator policy: TEMPS_DEPLOYMENT_KEEP_TEMP_FILES debug toggle (CLAUDE.md env table)"
+        reason = "documented host-level operator policy: TEMPS_DEPLOYMENT_KEEP_TEMP_FILES debug toggle (docs/reference/environment-variables.md)"
     )]
     let keep = std::env::var("TEMPS_DEPLOYMENT_KEEP_TEMP_FILES").is_ok();
     if keep {

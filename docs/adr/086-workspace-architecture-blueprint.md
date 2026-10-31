@@ -1,9 +1,11 @@
-# ADR-053: Workspaces hold the chats, and an accepted architecture blueprint
+# ADR-086: Workspaces hold the chats, and an accepted architecture blueprint
+
+> **Renumbered:** this ADR was numbered 053 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-053" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Accepted (steps 1 to 5 implemented)
 **Date:** 2026-10-20
 **Author:** David Viejo
-**Builds on:** ADR-036 (persistent workspace sandboxes), ADR-051 (sandbox service access)
+**Builds on:** ADR-036 (persistent workspace sandboxes), ADR-084 (sandbox service access)
 
 ---
 

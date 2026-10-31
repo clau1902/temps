@@ -5,6 +5,7 @@
 name = "temps-error-tracking"
 version.workspace = true
 edition.workspace = true
+description = "Error tracking: Sentry-compatible envelope ingest, issue grouping, source maps, releases, feedback, alerts and HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

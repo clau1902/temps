@@ -5,6 +5,7 @@
 name = "temps-query-mongodb"
 version = "0.1.0"
 edition = "2021"
+description = "MongoDB backend for temps-query: browse databases and collections and query documents"
 license.workspace = true
 
 [dependencies]

@@ -1,15 +1,17 @@
-# ADR-051: One template schema for single- and multi-service apps
+# ADR-083: One template schema for single- and multi-service apps
+
+> **Renumbered:** this ADR was numbered 051 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-051" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-09-29
-**Related:** ADR-049 (monorepo path-filtered deploys); ADR-050 (path routes); `crates/temps-core/src/templates.rs`; `crates/temps-core/templates/`; `crates/temps-projects/src/handlers/templates.rs`; `crates/temps-project-groups`
+**Related:** ADR-081 (monorepo path-filtered deploys); ADR-082 (path routes); `crates/temps-core/src/templates.rs`; `crates/temps-core/templates/`; `crates/temps-projects/src/handlers/templates.rs`; `crates/temps-project-groups`
 
 ---
 
 ## Context
 
 In this ADR, a **project** (`project_groups`) gathers **services** (`projects`).
-A project can hold a repository, shared variables and path routes (ADR-050).
+A project can hold a repository, shared variables and path routes (ADR-082).
 
 Templates today are a single `ProjectTemplate` that always creates one service.
 There are two kinds:

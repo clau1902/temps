@@ -5,6 +5,7 @@
 name = "temps-preview-gateway"
 version.workspace = true
 edition.workspace = true
+description = "Preview gateway binary: in-network TCP reverse proxy that routes workspace preview hostnames to sandbox container ports"
 license.workspace = true
 authors.workspace = true
 

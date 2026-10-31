@@ -5,6 +5,7 @@
 name = "temps-routes"
 version.workspace = true
 edition.workspace = true
+description = "Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -5,6 +5,7 @@
 name = "temps-domains"
 version.workspace = true
 edition.workspace = true
+description = "Custom domains and TLS: ACME certificate issuance and renewal, DNS-01 and HTTP-01 challenges, and the domain HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

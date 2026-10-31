@@ -5,6 +5,7 @@
 name = "temps-infra"
 version.workspace = true
 edition.workspace = true
+description = "Platform info and DNS lookup endpoints: server public and private IPs, Docker platform features and A-record resolution"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -174,7 +174,7 @@ impl TraefikDiscoveryConfig {
     /// network the proxy can actually reach.
     #[allow(
         clippy::disallowed_methods,
-        reason = "documented host-level operator policy: TEMPS_TRAEFIK_DISCOVERY_ENABLED / TEMPS_TRAEFIK_DISCOVERY_NETWORK (CLAUDE.md env table)"
+        reason = "documented host-level operator policy: TEMPS_TRAEFIK_DISCOVERY_ENABLED / TEMPS_TRAEFIK_DISCOVERY_NETWORK (docs/reference/environment-variables.md)"
     )]
     pub fn from_env(default_network: &str) -> Self {
         Self::resolve(

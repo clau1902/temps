@@ -5,6 +5,7 @@
 name = "temps-vm-agent"
 version.workspace = true
 edition.workspace = true
+description = "In-guest PID 1 agent for Firecracker sandboxes and its vsock exec and filesystem RPC protocol"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -5,6 +5,7 @@
 name = "temps-external-plugins"
 version.workspace = true
 edition.workspace = true
+description = "External plugin host: discovers, installs, spawns and supervises standalone plugin binaries and proxies HTTP and events to them"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

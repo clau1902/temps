@@ -5,6 +5,7 @@
 name = "temps-import-docker"
 version.workspace = true
 edition.workspace = true
+description = "Docker importer: describes running Docker containers as workload snapshots for migration into Temps"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

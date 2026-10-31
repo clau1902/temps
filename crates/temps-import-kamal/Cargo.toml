@@ -5,6 +5,7 @@
 name = "temps-import-kamal"
 version.workspace = true
 edition.workspace = true
+description = "Kamal importer: parses a config/deploy.yml into workloads, accessories and domains and builds a migration plan"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

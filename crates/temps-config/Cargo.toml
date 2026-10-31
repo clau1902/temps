@@ -5,6 +5,7 @@
 name = "temps-config"
 version.workspace = true
 edition.workspace = true
+description = "Platform settings service and handlers, plus cluster CA, node enrollment tokens, installation secrets, disk status and retention settings"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

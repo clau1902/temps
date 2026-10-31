@@ -5,6 +5,7 @@
 name = "temps-projects"
 version.workspace = true
 edition.workspace = true
+description = "Projects: project CRUD, environment variables, custom domains, template-based creation, data purge and their HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
