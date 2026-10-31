@@ -41,7 +41,11 @@ export function ProjectSectionTabs({
               active && 'border-foreground text-foreground'
             )}
           >
-            <item.icon className="size-4 shrink-0" aria-hidden="true" />
+            {/* Labels only on a phone, like `TabsTrigger`. */}
+            <item.icon
+              className="size-4 shrink-0 max-sm:hidden"
+              aria-hidden="true"
+            />
             {item.title}
           </Link>
         )
