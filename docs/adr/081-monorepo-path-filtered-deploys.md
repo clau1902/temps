@@ -1,4 +1,6 @@
-# ADR-049: Monorepo path-filtered deploys for project group members
+# ADR-081: Monorepo path-filtered deploys for project group members
+
+> **Renumbered:** this ADR was numbered 049 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-049" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-09-28

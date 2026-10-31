@@ -1,8 +1,10 @@
-# ADR 055: Workers Join With No Public Address
+# ADR 088: Workers Join With No Public Address
+
+> **Renumbered:** this ADR was numbered 055 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-055" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 - **Status:** Proposed
 - **Date:** 2026-10-19
-- **Builds on:** ADR-048 (D1 optional endpoints, D2a URL join, D2b pairing, D3 node API over the mesh)
+- **Builds on:** ADR-080 (D1 optional endpoints, D2a URL join, D2b pairing, D3 node API over the mesh)
 
 ## Context
 

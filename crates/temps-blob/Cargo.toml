@@ -5,6 +5,7 @@
 name = "temps-blob"
 version.workspace = true
 edition.workspace = true
+description = "Project-isolated S3-compatible blob storage service and HTTP API backed by RustFS"
 license.workspace = true
 authors.workspace = true
 

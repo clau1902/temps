@@ -3,7 +3,9 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-040: Key-Based Analytics Ingest for Apps Not Deployed by Temps
+# ADR-076: Key-Based Analytics Ingest for Apps Not Deployed by Temps
+
+> **Renumbered:** this ADR was numbered 040 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-040" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 ## Status
 

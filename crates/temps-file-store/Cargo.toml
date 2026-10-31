@@ -5,6 +5,7 @@
 name = "temps-file-store"
 version.workspace = true
 edition.workspace = true
+description = "Content-addressable file store for static assets: SHA-256 keyed blobs on local disk or S3 with a path-to-hash lookup cache"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

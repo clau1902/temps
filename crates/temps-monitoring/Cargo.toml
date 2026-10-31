@@ -5,6 +5,7 @@
 name = "temps-monitoring"
 version.workspace = true
 edition.workspace = true
+description = "Monitoring and alarms: alarm lifecycle, container health, disk space, outage detection, metric alerts, cron monitors and HTTP checks"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

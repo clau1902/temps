@@ -1,8 +1,10 @@
-# ADR-050: Path routes between services of a project
+# ADR-082: Path routes between services of a project
+
+> **Renumbered:** this ADR was numbered 050 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-050" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-09-28
-**Related:** ADR-049; `crates/temps-project-groups/src/routes.rs`; `crates/temps-routes/src/route_table.rs`; `crates/temps-proxy/src/proxy.rs`
+**Related:** ADR-081; `crates/temps-project-groups/src/routes.rs`; `crates/temps-routes/src/route_table.rs`; `crates/temps-proxy/src/proxy.rs`
 
 ---
 

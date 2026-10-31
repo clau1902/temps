@@ -5,6 +5,7 @@
 name = "temps-backup-core"
 version.workspace = true
 edition.workspace = true
+description = "Backup executor primitives: the BackupEngine trait, the job processor, the concurrency-limited executor and failure notifier"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -5,6 +5,7 @@
 name = "temps-webhooks"
 version.workspace = true
 edition.workspace = true
+description = "Outgoing webhooks: per-project configuration, event delivery with retries and delivery history"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

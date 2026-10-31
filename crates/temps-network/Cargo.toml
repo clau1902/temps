@@ -5,6 +5,7 @@
 name = "temps-network"
 version.workspace = true
 edition.workspace = true
+description = "Multi-host container networking: per-node bridge, VXLAN or routed transport, Docker network setup and peer route reconciliation"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -37,7 +37,7 @@ use tracing::info;
 pub fn extra_allowed_repositories(env_var: &str) -> Vec<String> {
     #[allow(
         clippy::disallowed_methods,
-        reason = "documented host-level operator policy: TEMPS_ALLOWED_MARIADB_DOCKER_IMAGES / TEMPS_ALLOWED_MONGODB_DOCKER_IMAGES (CLAUDE.md env table)"
+        reason = "documented host-level operator policy: TEMPS_ALLOWED_MARIADB_DOCKER_IMAGES / TEMPS_ALLOWED_MONGODB_DOCKER_IMAGES (docs/reference/environment-variables.md)"
     )]
     let Ok(raw) = std::env::var(env_var) else {
         return Vec::new();

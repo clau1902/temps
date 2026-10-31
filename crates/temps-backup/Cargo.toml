@@ -5,6 +5,7 @@
 name = "temps-backup"
 version.workspace = true
 edition.workspace = true
+description = "Backups and restores: per-engine backup engines (Postgres, MariaDB, MongoDB, Redis, S3), schedules, S3 storage and HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

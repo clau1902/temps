@@ -178,6 +178,19 @@ jobs:
           python3 scripts/test_rule_drift.py
           python3 scripts/rule_drift.py
 
+      # The generated crate map must match `cargo metadata`; every workspace
+      # member needs a Cargo `description` and a layer.
+      - name: Crate map is current
+        run: |
+          python3 scripts/test_crate_map.py
+          python3 scripts/crate_map.py --check
+
+      # Every ADR number is unique and the ADR index matches the ADR files.
+      - name: ADR numbers are unique and the index is current
+        run: |
+          python3 scripts/test_adr_index.py
+          python3 scripts/adr_index.py --check
+
       - name: Test stateless file migration safety
         run: python3 scripts/test_migrate_stateless_files.py
 

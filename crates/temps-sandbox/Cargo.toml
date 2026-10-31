@@ -5,6 +5,7 @@
 name = "temps-sandbox"
 version.workspace = true
 edition.workspace = true
+description = "Standalone sandbox HTTP API (/v1/sandbox), compatible with the Vercel Sandbox SDK, backed by the shared SandboxProvider"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

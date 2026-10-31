@@ -5,6 +5,7 @@
 name = "temps-ai-agents"
 version.workspace = true
 edition.workspace = true
+description = "AI agent runs: agent definitions, workflows and triggers, AI CLI provider logins, the autofixer, and the sandbox providers they run in"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

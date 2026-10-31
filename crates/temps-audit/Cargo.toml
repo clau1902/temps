@@ -5,6 +5,7 @@
 name = "temps-audit"
 version.workspace = true
 edition.workspace = true
+description = "Audit log service and HTTP handlers for recording and querying audited write operations"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

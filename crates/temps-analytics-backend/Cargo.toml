@@ -5,6 +5,7 @@
 name = "temps-analytics-backend"
 version.workspace = true
 edition.workspace = true
+description = "Analytics storage abstraction: the AnalyticsBackend trait with TimescaleDB and ClickHouse implementations, migrations and retention"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

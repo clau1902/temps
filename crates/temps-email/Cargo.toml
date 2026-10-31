@@ -5,6 +5,7 @@
 name = "temps-email"
 version.workspace = true
 edition.workspace = true
+description = "Transactional email: provider credentials (AWS SES, Scaleway), sending domains with SPF and DKIM verification, and sent-email storage"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

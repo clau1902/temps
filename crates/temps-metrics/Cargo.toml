@@ -5,6 +5,7 @@
 name = "temps-metrics"
 version.workspace = true
 edition.workspace = true
+description = "Metrics collection: node, proxy and managed-service collectors, the scraper, and buffered TimescaleDB and ClickHouse metric stores"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

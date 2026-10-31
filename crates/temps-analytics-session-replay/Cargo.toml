@@ -5,6 +5,7 @@
 name = "temps-analytics-session-replay"
 version.workspace = true
 edition.workspace = true
+description = "Session replay: record, store and play back visitor browser sessions for user interaction analysis"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

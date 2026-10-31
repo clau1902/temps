@@ -1,6 +1,8 @@
 <!-- SCOPE: Defines how a Traefik-discovered route obtains, imports, serves, and renews a TLS certificate without letting a container's own labels drive issuance. -->
 
-# ADR-041: TLS certificate handling for Traefik-discovered routes
+# ADR-077: TLS certificate handling for Traefik-discovered routes
+
+> **Renumbered:** this ADR was numbered 041 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-041" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-08-31

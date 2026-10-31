@@ -5,6 +5,7 @@
 name = "temps-analytics-performance"
 version.workspace = true
 edition.workspace = true
+description = "Web performance analytics: ingest and query Core Web Vitals (LCP, CLS, INP, FCP, TTFB) per project"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

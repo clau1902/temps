@@ -5,6 +5,7 @@
 name = "temps-import"
 version.workspace = true
 edition.workspace = true
+description = "Import orchestrator: HTTP API and services that plan and run migrations of workloads into Temps from other platforms"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

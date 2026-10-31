@@ -1,4 +1,6 @@
-# ADR-037: Sandbox Snapshots
+# ADR-074: Sandbox Snapshots
+
+> **Renumbered:** this ADR was numbered 037 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-037" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Accepted
 **Date:** 2026-08-10

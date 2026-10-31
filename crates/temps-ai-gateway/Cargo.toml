@@ -5,6 +5,7 @@
 name = "temps-ai-gateway"
 version.workspace = true
 edition.workspace = true
+description = "AI gateway: OpenAI-compatible and native endpoints proxied to configured providers, with provider keys, models, pricing, usage and limits"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
