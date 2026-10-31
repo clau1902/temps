@@ -143,6 +143,7 @@ pub mod postgres_major_upgrades;
 pub mod preset;
 pub mod project_analytics_settings;
 pub mod project_custom_domains;
+pub mod project_data_purges;
 pub mod project_delivery_settings;
 pub mod project_ip_access_rules;
 pub mod project_services;
