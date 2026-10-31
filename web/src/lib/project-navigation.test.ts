@@ -135,6 +135,7 @@ describe('projectPageWidth', () => {
       'environment-variables',
       'settings/variables',
       'settings/deployment-tokens',
+      'settings/edge-rules',
       'security',
     ])
     for (const section of configure?.sections ?? []) {

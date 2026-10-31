@@ -47,6 +47,7 @@ import {
   KeyRound,
   Layers,
   LayoutGrid,
+  ListFilter,
   Lock,
   MessageSquare,
   Network,
@@ -387,6 +388,12 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
         width: 'form',
         tabs: [
           { title: 'Protection', icon: Lock, url: 'settings/security' },
+          {
+            title: 'Edge rules',
+            icon: ListFilter,
+            url: 'settings/edge-rules',
+            width: 'full',
+          },
           { title: 'Access', icon: UserCog, url: 'settings/access' },
           { title: 'Scans', icon: ShieldCheck, url: 'security', width: 'full' },
         ],
