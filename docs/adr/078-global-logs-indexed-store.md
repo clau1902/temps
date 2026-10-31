@@ -1,12 +1,14 @@
 <!-- SCOPE: Replaces the chunk-scan engine behind Global Logs with an ordered, indexed log-line store served through one backend trait (TimescaleDB by default, ClickHouse when configured). -->
 
-# ADR-045: Global Logs — an indexed log store, not a chunk scan
+# ADR-078: Global Logs — an indexed log store, not a chunk scan
+
+> **Renumbered:** this ADR was numbered 045 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-045" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed — requires `security-auditor` sign-off before implementation (see [Authorization](#7-authorization-must-become-an-allow-list-security-sensitive)).
 **Date:** 2026-09-16
 **Author:** David Viejo
-**Builds on:** ADR-012 (ClickHouse as an external analytics backend), ADR-016 (ClickHouse as the OTel telemetry backend), ADR-021 (Multi-node container log aggregation)
-**Supersedes the query design of:** ADR-021 "Phase B" (the `log_chunks` + object-storage search substrate). ADR-021's *ingest* invariants — bounded queues, drop-before-block, shed logs never traffic — are retained unchanged.
+**Builds on:** ADR-012 (ClickHouse as an external analytics backend), ADR-016 (ClickHouse as the OTel telemetry backend), ADR-072 (Multi-node container log aggregation)
+**Supersedes the query design of:** [ADR-072](./072-multi-node-log-aggregation.md) "Phase B" (the `log_chunks` + object-storage search substrate). ADR-072's *ingest* invariants — bounded queues, drop-before-block, shed logs never traffic — are retained unchanged.
 
 > **Numbering note.** ADR-044 (`044-cloud-managed-backup-default-schedule.md`) is the
 > most recent committed ADR; 045 is the next free number in the committed sequence.
@@ -663,5 +665,5 @@ they become the cold tier.
 - `crates/temps-proxy/migrations/clickhouse/0001_proxy_logs.sql` — the locked CH table design and the TTL-on-insert warning.
 - `crates/temps-core/src/retention.rs` — `RetentionResolver`, reused for per-row TTL.
 - [ADR-012](012-clickhouse-analytics-backend.md), [ADR-016](016-clickhouse-traces-backend.md) — ClickHouse is optional and additive.
-- [ADR-021](021-multi-node-log-aggregation.md) — the ingest invariants this ADR preserves.
+- [ADR-021](072-multi-node-log-aggregation.md) — the ingest invariants this ADR preserves.
 - Branch `fix/global-logs-continuous` (`95cd199fe`) — the stopgap this ADR recommends merging and then freezing.

@@ -1,4 +1,6 @@
-# ADR 045: Host Docker socket grant for operator-owned infrastructure services
+# ADR 079: Host Docker socket grant for operator-owned infrastructure services
+
+> **Renumbered:** this ADR was numbered 045 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-045" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-09-21

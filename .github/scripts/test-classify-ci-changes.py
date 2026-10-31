@@ -660,6 +660,8 @@ class RepositoryContractTests(unittest.TestCase):
     # test_ungated_readers_run_in_workflow_contracts keeps that true.
     UNGATED_JOB = "workflow-contracts"
     UNGATED_READERS = {
+        "scripts/adr_index.py",
+        "scripts/test_adr_index.py",
         "scripts/crate_map.py",
         "scripts/test_crate_map.py",
     }

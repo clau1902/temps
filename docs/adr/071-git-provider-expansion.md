@@ -1,14 +1,10 @@
-# ADR-020: Git Provider Expansion — Gitea, Bitbucket, and Generic Providers
+# ADR-071: Git Provider Expansion — Gitea, Bitbucket, and Generic Providers
+
+> **Renumbered:** this ADR was numbered 020 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-020" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-06-30
 **Author:** David Viejo
-
-> **ADR number note:** ADR-020 is also tentatively claimed by the parked
-> `harden/multi-node-deployments` branch (project memory: `project_multinode_hardening_adr020`).
-> Those two ADRs are independent in scope. This document should be renumbered to
-> ADR-021 at merge time if the multi-node hardening ADR lands first; the
-> implementer must check and reconcile before opening the PR.
 
 > **Security review (2026-06-30): SIGN-OFF WITH CONDITIONS.** The
 > `security-auditor` reviewed this design and approved it subject to five
