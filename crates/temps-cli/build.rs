@@ -287,6 +287,18 @@ fn run_cmd(cmd: &str, args: &[&str], dir: &std::path::Path) {
 /// Ensure a placeholder dist directory exists for include_dir! macro
 /// This prevents build errors when web build is skipped in debug mode
 fn ensure_placeholder_dist(dist_dir: &std::path::Path) {
+    // `dist/` is untracked, so a fresh checkout lacks it even when a restored
+    // target directory says this script already ran (CI backdates unchanged
+    // sources so cached units stay fresh). Watching the placeholder makes
+    // Cargo rerun the script when it is missing. Only the placeholder path
+    // emits this: it writes index.html once, so the script reruns one extra
+    // time and then stays fresh, whereas the release path rewrites dist/ on
+    // every run and would never settle.
+    println!(
+        "cargo:rerun-if-changed={}",
+        dist_dir.join("index.html").display()
+    );
+
     // Create dist directory if it doesn't exist
     if !dist_dir.exists() {
         fs::create_dir_all(dist_dir).unwrap_or_else(|e| {
@@ -356,22 +368,4 @@ fn ensure_placeholder_dist(dist_dir: &std::path::Path) {
 
         println!("cargo:warning=Created placeholder index.html for development");
     }
-
-    track_dist_index(&index_html);
-}
-
-/// Make cargo rerun this script when `dist/index.html` disappears.
-///
-/// `dist/` is untracked, so a fresh checkout that reuses a cached `target/`
-/// (CI restores the one `main` built) has no `dist/` while cargo still holds
-/// this script's output as fresh. Without this line the script is skipped
-/// and `include_dir!` fails with "dist is not a directory". Cargo reruns a
-/// build script whose `rerun-if-changed` path is missing, which recreates it.
-///
-/// Only the placeholder path tracks it: the placeholder is written once, so
-/// the script settles after one rerun. The real web build rewrites
-/// `index.html` on every run, so tracking it there would rebuild the web UI
-/// on every release build.
-fn track_dist_index(index_html: &std::path::Path) {
-    println!("cargo:rerun-if-changed={}", index_html.display());
 }
