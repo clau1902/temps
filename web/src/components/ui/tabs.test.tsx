@@ -39,4 +39,6 @@ test('a tab icon sits before the label and stays out of its name', () => {
   const icon = tab.querySelector('svg')
   expect(icon?.getAttribute('aria-hidden')).toBe('true')
   expect(tab.firstElementChild).toBe(icon)
+  // Phones keep the label only, so a strip's last tabs stay in view.
+  expect(icon?.getAttribute('class')).toContain('max-sm:hidden')
 })

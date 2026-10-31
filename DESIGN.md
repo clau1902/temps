@@ -411,7 +411,8 @@ active tab. No pill container, selected-card background, shadow, or page-local
 styling overrides. Labels keep a constant font weight. Lead each label with a
 Lucide icon through `TabsTrigger icon={Icon}` (`size-4`, hidden from assistive
 technology), so a strip can be scanned by shape as well as by word. The icon
-never replaces the label, on any screen size. Give every tab in a strip an
+never replaces the label, on any screen size; below `sm` the trigger drops the
+icon and keeps the label, so a phone fits more of the strip. Give every tab in a strip an
 icon or none, keep icons distinct within a strip, and let a section's landing
 tab share the icon its section has in the menu. Add icons to a strip when
 touching it.
