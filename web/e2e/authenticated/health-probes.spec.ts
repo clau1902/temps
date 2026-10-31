@@ -392,12 +392,9 @@ test.describe('live deployment health probes', () => {
             name: /Background worker healthy at deploy/,
           })
         ).toBeVisible()
-        await expect(
-          page.getByRole('link', {
-            name: 'Visit deployed site in a new window',
-            exact: true,
-          })
-        ).toHaveCount(0)
+        // The environment bar's "Visit <environment>" link appears only
+        // when the environment has a URL; a worker-only one has none.
+        await expect(page.getByRole('link', { name: /^Visit / })).toHaveCount(0)
         await expect(page.getByRole('link', { name: /^Uptime / })).toHaveCount(
           0
         )

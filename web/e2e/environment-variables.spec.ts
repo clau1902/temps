@@ -373,7 +373,7 @@ test('environment failure keeps manual variable management and preserves an expl
   await expect(row(page, 'SHARED_VALUE')).toBeVisible()
   await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
   await expect(
-    page.getByRole('button', { name: /^Add Variable/ })
+    page.getByRole('button', { name: /^Add variable/ })
   ).toBeDisabled()
   await expect(
     page.getByRole('button', { name: 'Import .env', exact: true })
@@ -422,7 +422,7 @@ test('environment failure keeps manual variable management and preserves an expl
     page.getByRole('button', { name: 'Retry environments' })
   ).toHaveCount(0)
   await expect(
-    page.getByRole('button', { name: /^Add Variable/ })
+    page.getByRole('button', { name: /^Add variable/ })
   ).toBeEnabled()
   await expect(page.getByLabel('Environment', { exact: true })).toContainText(
     'preview'
@@ -526,7 +526,7 @@ test('a pending environments request never broadens an explicit variable scope',
     await expect(row(page, 'PROD_ONLY')).toHaveCount(0)
     await expect(row(page, 'PREVIEW_DEFAULT')).toHaveCount(0)
     await expect(
-      page.getByRole('button', { name: /^Add Variable/ })
+      page.getByRole('button', { name: /^Add variable/ })
     ).toBeDisabled()
   } finally {
     release()
@@ -549,7 +549,7 @@ for (const mode of ['Add', 'Import'] as const) {
     await page.goto(path)
     await expect(row(page, 'SHARED_VALUE')).toBeVisible()
     if (mode === 'Add') {
-      await page.getByRole('button', { name: /^Add Variable/ }).click()
+      await page.getByRole('button', { name: /^Add variable/ }).click()
       await page
         .getByPlaceholder('DATABASE_URL', { exact: true })
         .fill('NEW_KEY')
