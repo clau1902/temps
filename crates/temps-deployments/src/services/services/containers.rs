@@ -259,11 +259,14 @@ impl DeploymentService {
     ) -> Result<Arc<dyn ContainerOperations>, DeploymentError> {
         let Some(node_id) = node_id else {
             let docker = self.docker_handle.require()?;
-            return Ok(Arc::new(LocalContainerOperations::new(
-                docker,
-                self.docker_log_service.clone(),
-                self.deployer.clone(),
-            )));
+            return Ok(Arc::new(
+                LocalContainerOperations::new(
+                    docker,
+                    self.docker_log_service.clone(),
+                    self.deployer.clone(),
+                )
+                .with_plane(self.workload_plane.get().cloned()),
+            ));
         };
 
         let node = nodes::Entity::find_by_id(node_id)
@@ -687,6 +690,12 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
         let deployment_id = container.deployment_id;
+        crate::services::plane_deployer::refuse_micro_vm_lifecycle(
+            self.workload_plane.get().map(Arc::as_ref),
+            &container.container_id,
+            "stop",
+        )
+        .await?;
 
         // Route to the worker that owns this container — calling the local
         // CP dockerd for a remote container would 404 silently, leaving the
@@ -740,6 +749,12 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
         let deployment_id = container.deployment_id;
+        crate::services::plane_deployer::refuse_micro_vm_lifecycle(
+            self.workload_plane.get().map(Arc::as_ref),
+            &container.container_id,
+            "start",
+        )
+        .await?;
 
         let deployer = self.deployer_for_node(container.node_id).await?;
         deployer
@@ -788,6 +803,12 @@ impl DeploymentService {
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
         let deployment_id = container.deployment_id;
+        crate::services::plane_deployer::refuse_micro_vm_lifecycle(
+            self.workload_plane.get().map(Arc::as_ref),
+            &container.container_id,
+            "restart",
+        )
+        .await?;
 
         let deployer = self.deployer_for_node(container.node_id).await?;
         deployer

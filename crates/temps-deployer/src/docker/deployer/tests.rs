@@ -18,6 +18,36 @@ use std::sync::Arc;
 /// Only Docker's 404 reports a container as gone. Callers record
 /// `ContainerNotFound` as confirmed removal, so any other inspect failure
 /// has to stay an error.
+fn blkio(op: &str, value: u64) -> bollard::models::ContainerBlkioStatEntry {
+    bollard::models::ContainerBlkioStatEntry {
+        major: Some(8),
+        minor: Some(0),
+        op: Some(op.to_string()),
+        value: Some(value),
+    }
+}
+
+#[test]
+fn block_io_sums_reads_and_writes_across_devices_and_cgroup_versions() {
+    // cgroup v1 capitalises the operation, v2 does not; two devices.
+    let entries = [
+        blkio("Read", 100),
+        blkio("Write", 40),
+        blkio("read", 11),
+        blkio("write", 2),
+        blkio("Sync", 999),
+        blkio("Total", 999),
+    ];
+    assert_eq!(block_io_bytes(&entries), (111, 42));
+    assert_eq!(block_io_bytes(&[]), (0, 0));
+}
+
+#[test]
+fn block_io_saturates_instead_of_wrapping() {
+    let entries = [blkio("Read", u64::MAX), blkio("Read", 5)];
+    assert_eq!(block_io_bytes(&entries).0, u64::MAX);
+}
+
 #[test]
 fn only_a_docker_404_reports_a_container_as_not_found() {
     let missing = inspect_error(

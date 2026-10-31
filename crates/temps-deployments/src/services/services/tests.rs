@@ -979,20 +979,13 @@ async fn cleanup_does_not_discover_foreign_containers_with_colliding_database_id
     Ok(())
 }
 
-/// A replica started through the workload plane is retired by the
-/// plane, never by the node's Docker: without a plane to retire it, the
-/// cleanup fails and the row stays fenced (`removing`) rather than being
-/// recorded as removed off a Docker 404.
-#[tokio::test]
-async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
+/// Record `container` as the replica the workload plane started for
+/// `deployment` in a Firecracker microVM, as an `enforce` deploy does.
+async fn insert_plane_replica(
+    db: &sea_orm::DatabaseConnection,
+    deployment: &deployments::Model,
+    container: &deployment_containers::Model,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !database_integration_tests_available().await {
-        eprintln!("Docker unavailable; skipping plane replica cleanup integration test");
-        return Ok(());
-    }
-    let test_db = TestDatabase::with_migrations().await?;
-    let db = test_db.connection_arc();
-    let (project, _environment, deployment, container) = setup_test_deployment(&db).await?;
     let now = chrono::Utc::now();
     let workload = temps_entities::workloads::ActiveModel {
         owner_kind: Set(crate::services::plane_deployer::DEPLOYMENT_OWNER_KIND.to_string()),
@@ -1012,7 +1005,7 @@ async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
         deleted_at: Set(None),
         ..Default::default()
     }
-    .insert(db.as_ref())
+    .insert(db)
     .await?;
     temps_entities::workload_instances::ActiveModel {
         workload_id: Set(workload.id),
@@ -1034,8 +1027,88 @@ async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
         updated_at: Set(now),
         ..Default::default()
     }
-    .insert(db.as_ref())
+    .insert(db)
     .await?;
+    Ok(())
+}
+
+/// Tearing down a deployment retires a replica the workload plane
+/// started instead of asking this host's Docker, which cannot see a
+/// microVM: without a plane the teardown fails and keeps the row; once
+/// the workload is retired, the row is tombstoned and Docker is still
+/// never asked.
+#[tokio::test]
+async fn teardown_retires_a_plane_replica_instead_of_stopping_it_in_docker(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping plane replica teardown integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    insert_plane_replica(db.as_ref(), &deployment, &container).await?;
+
+    let mut deployer = MockContainerDeployer::new();
+    deployer.expect_stop_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+    let error = service
+        .teardown_deployment(project.id, deployment.id)
+        .await
+        .expect_err("no plane runs to retire the replica");
+    assert!(
+        matches!(
+            error,
+            DeploymentError::ReplicaRetire(
+                crate::services::plane_deployer::ReplicaRetireError::PlaneUnavailable { .. }
+            )
+        ),
+        "{error}"
+    );
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert!(
+        row.deleted_at.is_none(),
+        "an unretired replica keeps its row"
+    );
+
+    temps_entities::workloads::Entity::update_many()
+        .col_expr(
+            temps_entities::workloads::Column::DeletedAt,
+            sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+        )
+        .exec(db.as_ref())
+        .await?;
+    service
+        .teardown_deployment(project.id, deployment.id)
+        .await?;
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert!(row.deleted_at.is_some());
+    assert_eq!(row.status.as_deref(), Some("stopped"));
+    Ok(())
+}
+
+/// A replica started through the workload plane is retired by the
+/// plane, never by the node's Docker: without a plane to retire it, the
+/// cleanup fails and the row stays fenced (`removing`) rather than being
+/// recorded as removed off a Docker 404.
+#[tokio::test]
+async fn cleanup_never_tombstones_a_plane_replica_it_could_not_retire(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping plane replica cleanup integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    insert_plane_replica(db.as_ref(), &deployment, &container).await?;
 
     // Docker would answer 404 for a microVM: it is never asked.
     let mut deployer = MockContainerDeployer::new();

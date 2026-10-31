@@ -770,6 +770,27 @@ impl WorkloadPlane {
         Ok(Some((handle, status)))
     }
 
+    /// What workload `id`'s latest instance is using right now, from its
+    /// driver (`None` when it has no instance yet). For products whose
+    /// instance is not a container the host's Docker can read (a microVM).
+    pub async fn instance_stats(
+        &self,
+        id: i64,
+    ) -> Result<Option<temps_workload::InstanceStats>, PlaneError> {
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        driver
+            .stats(&handle)
+            .await
+            .map(Some)
+            .map_err(|source| PlaneError::Driver {
+                workload_id: id,
+                operation: "read the instance's stats",
+                source,
+            })
+    }
+
     /// The last `tail` output lines of workload `id`'s latest instance, from
     /// its driver (`None` when it has no instance yet). For products whose
     /// instance is not a container the host's Docker can read (a microVM).
@@ -794,6 +815,7 @@ impl WorkloadPlane {
                     since: None,
                     tail: Some(tail),
                     follow: false,
+                    resume: false,
                 },
             )
             .await
@@ -801,6 +823,59 @@ impl WorkloadPlane {
         let lines: Vec<temps_workload::LogLine> =
             stream.try_collect().await.map_err(driver_error)?;
         Ok(Some(lines))
+    }
+
+    /// Follow workload `id`'s latest instance's output for ingestion: from
+    /// the checkpoint its driver keeps for the previous follower (the start
+    /// of what is retained on the first run), continuing as lines arrive.
+    /// `None` when it has no instance yet. The stream ends with an error when
+    /// the instance cannot be reached any more.
+    pub async fn follow_instance_logs(
+        &self,
+        id: i64,
+    ) -> Result<Option<temps_workload::LogStream>, PlaneError> {
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        driver
+            .logs(
+                &handle,
+                temps_workload::LogQuery {
+                    follow: true,
+                    resume: true,
+                    ..temps_workload::LogQuery::default()
+                },
+            )
+            .await
+            .map(Some)
+            .map_err(|source| PlaneError::Driver {
+                workload_id: id,
+                operation: "follow the instance's logs",
+                source,
+            })
+    }
+
+    /// Workload `id`'s latest instance's logs under `query`, as the driver
+    /// streams them (a following query keeps the stream open). `None` when it
+    /// has no instance yet. For an interactive viewer; the ingesting reader
+    /// uses [`Self::follow_instance_logs`].
+    pub async fn instance_log_stream(
+        &self,
+        id: i64,
+        query: temps_workload::LogQuery,
+    ) -> Result<Option<temps_workload::LogStream>, PlaneError> {
+        let Some((handle, driver)) = self.latest_instance(id).await? else {
+            return Ok(None);
+        };
+        driver
+            .logs(&handle, query)
+            .await
+            .map(Some)
+            .map_err(|source| PlaneError::Driver {
+                workload_id: id,
+                operation: "stream the instance's logs",
+                source,
+            })
     }
 
     /// Run `command` in workload `id`'s latest instance and collect its

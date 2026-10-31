@@ -210,6 +210,22 @@ impl DeploymentsPlugin {
                 // Rollback and promotion retire superseded `enforce`
                 // replicas through it.
                 deployment_service.set_workload_plane(plane.clone());
+                // The shared container deployer answers for a replica Docker
+                // cannot see (a microVM) through the plane: the health
+                // monitor, the Containers view, metrics and logs all read it.
+                if let Some(shared) =
+                    context.get_service::<temps_deployer::replica_aware::ReplicaAwareDeployer>()
+                {
+                    shared.set_reader(Arc::new(
+                        crate::services::plane_deployer::PlaneReplicaReader::new(plane.clone()),
+                    ));
+                }
+                // microVM replicas have no Docker log stream; history follows
+                // them through the plane.
+                if let Some(source) = context.get_service::<crate::services::RemoteLogSourceImpl>()
+                {
+                    source.set_plane(plane.clone());
+                }
                 // Products registered beside deployments (functions) find
                 // the started plane here.
                 if let Some(shared) = context.get_service::<temps_workload_plane::SharedPlane>() {
@@ -389,9 +405,13 @@ impl TempsPlugin for DeploymentsPlugin {
                 db.clone(),
                 config_service.clone(),
                 encryption_service.clone(),
-            ))
-                as Arc<dyn temps_log_aggregator::RemoteContainerLogSource>;
-            context.register_service(remote_log_source);
+            ));
+            // The concrete type too, so the started plane can be attached for
+            // the microVM replicas Docker cannot read.
+            context.register_service(remote_log_source.clone());
+            context.register_service(
+                remote_log_source as Arc<dyn temps_log_aggregator::RemoteContainerLogSource>,
+            );
 
             // Cancel any running deployments from previous server instance
             // Complete restart reconciliation before the durable queue consumer

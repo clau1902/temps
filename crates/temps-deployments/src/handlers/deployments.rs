@@ -553,6 +553,11 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Deployment Configuration Error")
                     .with_detail(error.to_string())
             }
+            DeploymentError::ReplicaRetire(ref error) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Replica Retirement Failed")
+                    .with_detail(error.to_string())
+            }
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -1498,7 +1503,13 @@ async fn handle_container_logs_socket(
                     }
                     Err(e) => {
                         stream_failed = true;
-                        error!("Error reading log line: {}", e);
+                        // The runtime ended the stream: the replica stopped or
+                        // was replaced while watched. The viewer is told why;
+                        // nothing failed on this side.
+                        warn!(
+                            "Log stream of container {} ended with an error: {}",
+                            params.container_id, e
+                        );
                         let error_msg = format!("ERROR: {}", e);
                         if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
                             error!("Failed to send error message over WebSocket: {}", e);
@@ -1664,7 +1675,11 @@ async fn handle_filtered_container_logs_socket(
             }
             Err(e) => {
                 stream_failed = true;
-                error!("Error reading log line: {}", e);
+                // See the single-container stream: the viewer is told why.
+                warn!(
+                    "Log stream of environment {} containers ended with an error: {}",
+                    params.environment_id, e
+                );
                 // Send error as plain text
                 let error_msg = format!("ERROR: {}", e);
                 if let Err(e) = socket.send(Message::Text(error_msg.into())).await {
@@ -2546,6 +2561,8 @@ pub async fn get_container_metrics(
         memory_percent: stats.memory_percent,
         network_rx_bytes: stats.network_rx_bytes,
         network_tx_bytes: stats.network_tx_bytes,
+        block_read_bytes: stats.block_read_bytes,
+        block_write_bytes: stats.block_write_bytes,
         timestamp: stats.timestamp.to_rfc3339(),
     };
 
@@ -2802,6 +2819,13 @@ pub async fn stream_container_metrics(
                             }
                         };
                         Some((Ok(event), ticker))
+                    }
+                    // Torn down or deleted while watched: there is nothing
+                    // left to sample, so end the stream instead of logging
+                    // an error every tick until the viewer leaves.
+                    Err(e @ crate::services::services::DeploymentError::NotFound(_)) => {
+                        debug!("Ending metrics stream for container {}: {}", c_id, e);
+                        None
                     }
                     Err(e) => {
                         error!("Failed to get metrics for container {}: {}", c_id, e);

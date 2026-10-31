@@ -55,10 +55,7 @@ impl DeploymentService {
             .await?;
 
         for container in containers {
-            self.deployer
-                .stop_container(&container.container_id)
-                .await
-                .map_err(|e| DeploymentError::Other(format!("Failed to stop container: {}", e)))?;
+            self.stop_replica_for_teardown(&container).await?;
 
             // Mark container as deleted
             let mut active_container: deployment_containers::ActiveModel = container.into();
@@ -73,6 +70,51 @@ impl DeploymentService {
         active_deployment.update(self.db.as_ref()).await?;
 
         Ok(())
+    }
+
+    /// Stop one replica of a deployment being torn down, wherever it runs.
+    /// A replica the workload plane started (a microVM, or a container on a
+    /// worker) is retired by deleting its workload: this host's Docker
+    /// cannot see it and answers 404. Any other replica is stopped by the
+    /// deployer of the node that runs it.
+    async fn stop_replica_for_teardown(
+        &self,
+        container: &temps_entities::deployment_containers::Model,
+    ) -> Result<(), DeploymentError> {
+        let workload = crate::services::plane_deployer::deployment_replica_workload(
+            self.db.as_ref(),
+            container.deployment_id,
+            &container.container_id,
+        )
+        .await?;
+        if let Some(workload) = workload {
+            crate::services::plane_deployer::retire_replica_workload(
+                self.workload_plane.get().map(Arc::as_ref),
+                container.deployment_id,
+                &container.container_id,
+                workload,
+            )
+            .await?;
+            info!(
+                deployment_id = container.deployment_id,
+                container_id = container.container_id,
+                workload_id = workload.workload_id,
+                "Retired workload-plane replica on teardown"
+            );
+            return Ok(());
+        }
+        self.deployer_for_node(container.node_id)
+            .await?
+            .stop_container(&container.container_id)
+            .await
+            .map_err(|e| DeploymentError::ContainerOperation {
+                container_id: container.container_id.clone(),
+                operation: "stop",
+                location: container
+                    .node_id
+                    .map_or_else(|| "this host".to_string(), |id| format!("node {id}")),
+                reason: e.to_string(),
+            })
     }
 
     /// Tears down an environment and all its active deployments
@@ -102,11 +144,21 @@ impl DeploymentService {
                 // Stop container with timeout - don't fail the whole teardown if one container fails
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(30),
-                    self.deployer.stop_container(&container.container_id),
+                    self.stop_replica_for_teardown(&container),
                 )
                 .await
                 {
                     Ok(Ok(())) => {}
+                    // The plane still runs it: keep the row, so a later
+                    // cleanup finds the workload and retires it, rather than
+                    // leaving a microVM no row accounts for.
+                    Ok(Err(e @ DeploymentError::ReplicaRetire(_))) => {
+                        warn!(
+                            "Failed to retire workload-plane replica {} during teardown: {} (continuing)",
+                            container.container_id, e
+                        );
+                        continue;
+                    }
                     Ok(Err(e)) => {
                         warn!(
                             "Failed to stop container {} during teardown: {} (continuing)",

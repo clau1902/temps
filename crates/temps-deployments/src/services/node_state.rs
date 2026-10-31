@@ -297,6 +297,8 @@ fn agent_capabilities() -> DriverCapabilities {
             memory: true,
             pids: false,
             disk: false,
+            disk_io: false,
+            network: false,
         },
     }
 }
@@ -584,6 +586,7 @@ impl RuntimeDriver for AgentApiDriver {
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         match self.remote.get_container_info(&handle.id).await {
             Ok(info) => Ok(InstanceStatus {
+                restart_at: None,
                 state: instance_state(&info.status),
                 exit_code: info.exit_code.map(i64::from),
                 started_at: None,
@@ -605,6 +608,7 @@ impl RuntimeDriver for AgentApiDriver {
                     .collect(),
             }),
             Err(DeployerError::ContainerNotFound(_)) => Ok(InstanceStatus {
+                restart_at: None,
                 state: InstanceState::Missing,
                 exit_code: None,
                 started_at: None,
@@ -637,6 +641,7 @@ impl RuntimeDriver for AgentApiDriver {
             Ok(LogLine {
                 stderr: false,
                 line: bytes::Bytes::from(line + "\n"),
+                timestamp: None,
             })
         });
         Ok(Box::pin(futures::stream::iter(items)))
@@ -652,6 +657,10 @@ impl RuntimeDriver for AgentApiDriver {
             cpu_nanos: None,
             memory_bytes: Some(stats.memory_bytes),
             pids: None,
+            net_rx_bytes: Some(stats.network_rx_bytes),
+            net_tx_bytes: Some(stats.network_tx_bytes),
+            memory_limit_bytes: stats.memory_limit_bytes,
+            ..InstanceStats::default()
         })
     }
 

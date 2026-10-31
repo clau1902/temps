@@ -117,6 +117,11 @@ pub enum DeploymentError {
     #[error(transparent)]
     EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
 
+    /// A replica the workload plane started (a microVM, or a container on
+    /// a worker) could not be looked up or retired through the plane.
+    #[error(transparent)]
+    ReplicaRetire(#[from] crate::services::plane_deployer::ReplicaRetireError),
+
     #[error("Other error: {0}")]
     Other(String),
 }

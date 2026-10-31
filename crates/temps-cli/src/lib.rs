@@ -919,6 +919,7 @@ mod command_tree_tests {
             "domain provision",
             "domain show",
             "edge",
+            "firecracker install-launcher",
             "firecracker setup",
             "join",
             "microsandbox setup",

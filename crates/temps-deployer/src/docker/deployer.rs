@@ -146,6 +146,23 @@ pub(crate) fn build_exit_reason(
 /// collapse to ~0% for any container that's been running long enough that
 /// (cumulative_cpu_time / system_time_since_boot) rounds to zero. The 1s
 /// interval matches the Docker CLI default.
+/// Bytes read and written, summed over every device in a container's
+/// `blkio_stats.io_service_bytes_recursive` (cgroup v1 reports `Read` and
+/// `Write`, v2 reports `read` and `write`; the other operations are ignored).
+fn block_io_bytes(entries: &[bollard::models::ContainerBlkioStatEntry]) -> (u64, u64) {
+    let mut read = 0u64;
+    let mut written = 0u64;
+    for entry in entries {
+        let value = entry.value.unwrap_or(0);
+        match entry.op.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("read") => read = read.saturating_add(value),
+            Some("write") => written = written.saturating_add(value),
+            _ => {}
+        }
+    }
+    (read, written)
+}
+
 async fn sample_container_stats_twice(
     docker: &Docker,
     container_id: &str,
@@ -644,6 +661,7 @@ impl ContainerDeployer for DockerRuntime {
                 memory_swap_bytes: memory_bytes,
                 pids: None,
                 disk_mb: None,
+                ..temps_workload::InstanceLimits::default()
             },
             log_rotation: request
                 .log_config
@@ -1094,6 +1112,13 @@ impl ContainerDeployer for DockerRuntime {
                 (0, 0)
             };
 
+        let (block_read_bytes, block_write_bytes) = second
+            .blkio_stats
+            .as_ref()
+            .and_then(|blkio| blkio.io_service_bytes_recursive.as_deref())
+            .map(block_io_bytes)
+            .unzip();
+
         Ok(crate::ContainerStats {
             container_id: container_info.container_id,
             container_name: container_info.container_name,
@@ -1105,6 +1130,8 @@ impl ContainerDeployer for DockerRuntime {
             memory_percent,
             network_rx_bytes,
             network_tx_bytes,
+            block_read_bytes,
+            block_write_bytes,
             restart_count: container_info.restart_count,
             started_at: container_info.started_at,
             timestamp: chrono::Utc::now(),
