@@ -299,8 +299,9 @@ test('delivery setup selects Bunny DNS and Bunny CDN independently using the des
   await expect(
     page.getByRole('heading', { name: 'No domains configured yet' })
   ).toBeVisible()
+  // The page header and the empty state both offer it (DESIGN.md).
   await expect(
-    page.getByRole('button', { name: /^Add domain/ })
+    page.getByRole('button', { name: /^Add domain/ }).first()
   ).toBeVisible()
   const settings = page.getByRole('button', { name: 'DNS and CDN settings' })
   await expect(settings).toHaveAttribute('aria-expanded', 'false')
