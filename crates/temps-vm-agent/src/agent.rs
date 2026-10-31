@@ -33,8 +33,9 @@ use serde_json::{json, Value};
 use temps_vm_agent::logging::{self, Level};
 use temps_vm_agent::mounts::{MountArgs, MountError};
 use temps_vm_agent::restart::RestartBackoff;
+use temps_vm_agent::stats;
 use temps_vm_agent::supervisor::{ProcessSpec, Supervision, DEFAULT_PATH};
-use temps_vm_agent::workload_log::{read_tail, LogLimits, LogPipeline, RotatingLog};
+use temps_vm_agent::workload_log::{self, read_tail, LogLimits, LogPipeline, RotatingLog};
 use temps_vm_agent::{
     read_frame, relay, write_frame, Request, Response, SpawnRestartPolicy, AGENT_PORT,
     DEFAULT_SPAWN_LOG, MAX_PTY_RELAYS, MAX_READ_LOG_LINES, MAX_SPAWNED_PROCESSES, PTY_AGENT_BIN,
@@ -90,8 +91,24 @@ const BOOT_MOUNTS: &[MountSpec] = &[
         "devpts",
         Some("mode=0620,ptmxmode=0666"),
     ),
+    // Container images expect a writable `/dev/shm`; size it like Docker's
+    // default so a guest cannot fill half its RAM through it.
+    ("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777,size=65536k")),
     ("tmpfs", "/tmp", "tmpfs", None),
     ("tmpfs", "/run", "tmpfs", None),
+];
+
+/// Symlinks every container runtime creates in `/dev` and devtmpfs does not.
+///
+/// Images log by pointing files at these (nginx's `access.log` is a link to
+/// `/dev/stdout`). Without them the link dangles, the first open creates a
+/// regular file at `/dev/stdout`, and the workload's output never reaches its
+/// log stream.
+const DEV_LINKS: &[(&str, &str)] = &[
+    ("/proc/self/fd", "/dev/fd"),
+    ("/proc/self/fd/0", "/dev/stdin"),
+    ("/proc/self/fd/1", "/dev/stdout"),
+    ("/proc/self/fd/2", "/dev/stderr"),
 ];
 
 /// Minimal boot-time setup when running as PID 1.
@@ -111,6 +128,20 @@ fn setup_system() {
                     ("error", json!(e.to_string())),
                 ],
             );
+        }
+    }
+    for (target, link) in DEV_LINKS {
+        match std::os::unix::fs::symlink(target, link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => warn(
+                "dev_link_failed",
+                &[
+                    ("link", json!(link)),
+                    ("target", json!(target)),
+                    ("error", json!(e.to_string())),
+                ],
+            ),
         }
     }
     unsafe {
@@ -616,6 +647,7 @@ fn handle_request(request: Request) -> Response {
             restart,
             log_max_bytes,
             log_max_files,
+            limits,
         } => spawn(SpawnArgs {
             cmd,
             env,
@@ -625,9 +657,17 @@ fn handle_request(request: Request) -> Response {
             log_path,
             restart,
             log_limits: LogLimits::from_request(log_max_bytes, log_max_files),
+            limits,
         }),
         Request::ProcessStatus { pid } => process_status(pid),
         Request::ReadLog { path, tail_lines } => read_log(path, tail_lines),
+        Request::ReadLogSince {
+            path,
+            cursor,
+            max_bytes,
+            include_partial,
+        } => read_log_since(path, cursor, max_bytes, include_partial),
+        Request::ReadStats { pid } => read_stats(pid),
     }
 }
 
@@ -662,6 +702,7 @@ struct SpawnArgs {
     log_path: Option<String>,
     restart: SpawnRestartPolicy,
     log_limits: LogLimits,
+    limits: temps_vm_agent::SpawnLimits,
 }
 
 fn spawn(args: SpawnArgs) -> Response {
@@ -712,6 +753,7 @@ fn spawn(args: SpawnArgs) -> Response {
         cwd: args.cwd.unwrap_or_else(|| "/".to_string()),
         uid: args.uid,
         gid: args.gid,
+        limits: args.limits,
     };
     match Supervision::start(spec, args.restart, RestartBackoff::default(), pipeline) {
         Ok(supervision) => {
@@ -755,6 +797,54 @@ fn process_status(pid: u32) -> Response {
         restart_count: status.restart_count,
         restarting: status.restarting,
     }
+}
+
+fn read_log_since(
+    path: Option<String>,
+    cursor: Option<temps_vm_agent::LogCursor>,
+    max_bytes: Option<u32>,
+    include_partial: bool,
+) -> Response {
+    let path = path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let limit = max_bytes
+        .unwrap_or(temps_vm_agent::DEFAULT_LOG_CHUNK_BYTES)
+        .clamp(1, temps_vm_agent::MAX_LOG_CHUNK_BYTES) as usize;
+    match workload_log::read_since(Path::new(&path), cursor, limit, include_partial) {
+        Ok(read) => Response::LogChunk {
+            data: String::from_utf8_lossy(&read.data).into_owned(),
+            cursor: read.cursor,
+            skipped: read.skipped,
+            more: read.more,
+        },
+        Err(e) => Response::Err {
+            message: format!("read log {path}: {e}"),
+        },
+    }
+}
+
+/// Sample the guest. With a `pid`, CPU and memory are those of the tree of
+/// the process spawn started as that pid, rooted at its *current* process (the
+/// supervised pid changes when it restarts); a process that is down between
+/// restarts reports an empty tree rather than the whole VM.
+fn read_stats(pid: Option<u32>) -> Response {
+    let root = match pid {
+        None => None,
+        Some(pid) => {
+            let spawned = spawned_table();
+            let Some(supervision) = spawned.iter().rev().find(|s| s.matches(pid)) else {
+                return Response::Err {
+                    message: format!("read stats: pid {pid} was not started by spawn"),
+                };
+            };
+            // No live pid: a root no process has, so the tree is empty.
+            Some(supervision.status().current_pid.unwrap_or(0))
+        }
+    };
+    Response::Stats(stats::collect(
+        Path::new("/proc"),
+        root,
+        stats::ProcUnits::from_system(),
+    ))
 }
 
 fn read_log(path: Option<String>, tail_lines: u32) -> Response {
@@ -918,6 +1008,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_guest_dev_gives_images_the_links_and_shm_a_container_would() {
+        // An image that logs through `/dev/stdout` must reach the log stream,
+        // not a regular file the dangling link would create.
+        let links: Vec<_> = DEV_LINKS.iter().map(|(_, link)| *link).collect();
+        assert_eq!(
+            links,
+            ["/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"]
+        );
+        for (target, link) in DEV_LINKS {
+            assert!(target.starts_with("/proc/self/fd"), "{link} -> {target}");
+        }
+
+        let mounted_at = |dir: &str| BOOT_MOUNTS.iter().position(|(_, t, _, _)| *t == dir);
+        let shm = mounted_at("/dev/shm").expect("/dev/shm is mounted at boot");
+        assert!(shm > mounted_at("/dev").expect("/dev is mounted"));
+        let (_, _, fstype, data) = BOOT_MOUNTS[shm];
+        assert_eq!(fstype, "tmpfs");
+        assert!(
+            data.is_some_and(|d| d.contains("size=")),
+            "bounded: {data:?}"
+        );
+    }
+
+    #[test]
     fn boot_mounts_provide_devpts_after_devtmpfs() {
         // Without devpts every `openpty` — and so every terminal tab — fails
         // in a guest that boots straight into this binary.
@@ -975,6 +1089,7 @@ mod tests {
             log_path: Some(log.display().to_string()),
             restart,
             log_limits: LogLimits::default(),
+            limits: temps_vm_agent::SpawnLimits::default(),
         }
     }
 

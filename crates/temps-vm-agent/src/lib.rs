@@ -19,6 +19,7 @@
 pub mod logging;
 pub mod mounts;
 pub mod restart;
+pub mod stats;
 pub mod supervisor;
 pub mod workload_log;
 
@@ -153,6 +154,8 @@ pub enum Request {
         log_max_bytes: Option<u64>,
         #[serde(default)]
         log_max_files: Option<u32>,
+        #[serde(default)]
+        limits: SpawnLimits,
     },
     /// Whether a process [`Request::Spawn`] started still runs. `pid` is the
     /// pid `Spawned` returned; it keeps naming the process across restarts.
@@ -166,8 +169,65 @@ pub enum Request {
         path: Option<String>,
         tail_lines: u32,
     },
+    /// The log's complete lines after `cursor` (from the start of what is
+    /// still retained when `None`), at most `max_bytes` of them, read across
+    /// rotated files. The returned cursor goes into the next request, so a
+    /// reader sees every line once without the guest keeping any state.
+    /// A line still being written is held back until it ends, unless
+    /// `include_partial` asks for it.
+    ReadLogSince {
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        cursor: Option<LogCursor>,
+        #[serde(default)]
+        max_bytes: Option<u32>,
+        #[serde(default)]
+        include_partial: bool,
+    },
+    /// Cumulative CPU, memory, disk and network counters of the guest, with
+    /// CPU and memory taken from the tree of the process [`Request::Spawn`]
+    /// started as `pid` (every process when absent). The host turns two
+    /// samples into rates; the counters restart from zero when the supervised
+    /// process does.
+    ReadStats {
+        #[serde(default)]
+        pid: Option<u32>,
+    },
     Shutdown,
 }
+
+/// Resource ceilings a spawned process runs under, set with `setrlimit`
+/// after the user switch so they bind the workload and not the agent. A
+/// field left `None` keeps the guest kernel's default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnLimits {
+    /// `RLIMIT_NOFILE`: open file descriptors.
+    #[serde(default)]
+    pub max_open_files: Option<u64>,
+    /// `RLIMIT_NPROC`: processes and threads of the process's user. The
+    /// kernel does not apply it to root, so a workload that runs as root
+    /// is not bounded by it.
+    #[serde(default)]
+    pub max_processes: Option<u64>,
+}
+
+/// A position in a rotating log: the file (by inode, which survives the
+/// rename a rotation does) and the byte offset in it. Handed back by
+/// [`Response::LogChunk`] and passed to the next [`Request::ReadLogSince`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogCursor {
+    pub inode: u64,
+    pub offset: u64,
+}
+
+/// Most bytes one [`Request::ReadLogSince`] returns when the request names
+/// no limit.
+pub const DEFAULT_LOG_CHUNK_BYTES: u32 = 256 * 1024;
+
+/// Largest chunk honoured, so one request cannot build a frame the host
+/// would refuse ([`MAX_FRAME_BYTES`]).
+pub const MAX_LOG_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
 /// Where a spawned process writes its output when the request names no path.
 pub const DEFAULT_SPAWN_LOG: &str = "/var/log/temps-workload.log";
@@ -213,6 +273,24 @@ pub enum Response {
     Log {
         data: String,
     },
+    /// What [`Request::ReadLogSince`] found.
+    LogChunk {
+        /// Complete lines (lossy UTF-8), oldest first.
+        data: String,
+        /// Where the next read starts; `None` when the log has no file yet.
+        #[serde(default)]
+        cursor: Option<LogCursor>,
+        /// The file the request's cursor named was rotated away before it
+        /// was read: lines between the cursor and the oldest retained file
+        /// are lost.
+        #[serde(default)]
+        skipped: bool,
+        /// More is already available: read again without waiting.
+        #[serde(default)]
+        more: bool,
+    },
+    /// What [`Request::ReadStats`] sampled.
+    Stats(stats::GuestStats),
     Err {
         message: String,
     },
@@ -535,6 +613,10 @@ mod tests {
             restart: SpawnRestartPolicy::UnlessStopped,
             log_max_bytes: Some(10 * 1024 * 1024),
             log_max_files: Some(3),
+            limits: SpawnLimits {
+                max_open_files: Some(4096),
+                max_processes: Some(512),
+            },
         };
         let json = serde_json::to_string(&request).expect("serialises");
         assert!(
@@ -560,6 +642,29 @@ mod tests {
                 tail_lines: 50
             }
         ));
+    }
+
+    #[test]
+    fn read_stats_parses_with_and_without_a_pid() {
+        let all: Request = serde_json::from_str(r#"{"op":"read_stats"}"#).expect("parses");
+        assert!(matches!(all, Request::ReadStats { pid: None }));
+        let one: Request = serde_json::from_str(r#"{"op":"read_stats","pid":42}"#).expect("parses");
+        assert!(matches!(one, Request::ReadStats { pid: Some(42) }));
+    }
+
+    #[test]
+    fn a_stats_response_round_trips_with_its_result_tag() {
+        let stats = stats::GuestStats {
+            cpu_nanos: 5,
+            memory_bytes: 6,
+            pids: 2,
+            net_tx_bytes: 9,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&Response::Stats(stats)).expect("serializes");
+        assert!(json.contains(r#""result":"stats""#), "{json}");
+        let back: Response = serde_json::from_str(&json).expect("parses");
+        assert!(matches!(back, Response::Stats(s) if s == stats));
     }
 
     #[test]

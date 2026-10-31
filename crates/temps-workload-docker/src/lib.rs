@@ -189,6 +189,8 @@ pub fn capabilities() -> DriverCapabilities {
             memory: true,
             pids: true,
             disk: false,
+            disk_io: false,
+            network: false,
         },
     }
 }
@@ -563,6 +565,7 @@ impl RuntimeDriver for DockerDriver {
             Ok(inspect) => inspect,
             Err(e) if is_not_found(&e) => {
                 return Ok(InstanceStatus {
+                    restart_at: None,
                     state: InstanceState::Missing,
                     exit_code: None,
                     started_at: None,
@@ -618,6 +621,7 @@ impl RuntimeDriver for DockerDriver {
         }
         published_ports.sort_by_key(|p| (p.container_port, p.host_ip.clone()));
         Ok(InstanceStatus {
+            restart_at: None,
             state: instance_state,
             exit_code: (!running).then_some(state.exit_code).flatten(),
             started_at,
@@ -655,9 +659,12 @@ impl RuntimeDriver for DockerDriver {
                     reason: e.to_string(),
                 })?;
                 let stderr = matches!(chunk, bollard::container::LogOutput::StdErr { .. });
+                // Docker's own timestamps are not requested here; the
+                // container log path asks Docker for them directly.
                 Ok(LogLine {
                     stderr,
                     line: chunk.into_bytes(),
+                    timestamp: None,
                 })
             });
         Ok(Box::pin(stream))
@@ -680,6 +687,7 @@ impl RuntimeDriver for DockerDriver {
                 .and_then(|u| u.total_usage),
             memory_bytes: stats.memory_stats.and_then(|m| m.usage),
             pids: stats.pids_stats.and_then(|p| p.current),
+            ..InstanceStats::default()
         })
     }
 
@@ -872,6 +880,7 @@ mod tests {
                 memory_swap_bytes: Some(512 * 1024 * 1024),
                 pids: None,
                 disk_mb: None,
+                ..InstanceLimits::default()
             },
             log_rotation: Some(LogRotation {
                 max_size: "50m".into(),

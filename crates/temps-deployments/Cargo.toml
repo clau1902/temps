@@ -14,7 +14,7 @@ homepage.workspace = true
 temps-runtime-health = { path = "../temps-runtime-health" }
 jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 # Adding servers over SSH (ADR 048 D2c).
-russh = "0.64"
+russh = "0.65"
 zeroize = "1"
 temps-auth = { path = "../temps-auth" }
 temps-blob = { path = "../temps-blob" }

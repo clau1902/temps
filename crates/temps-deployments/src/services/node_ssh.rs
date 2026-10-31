@@ -1993,7 +1993,7 @@ mod tests {
             async fn auth_publickey_offered(
                 &mut self,
                 _user: &str,
-                _key: &russh::keys::PublicKey,
+                _key: server::PublicKeyOffer<'_>,
             ) -> Result<Auth, Self::Error> {
                 self.attempt();
                 Ok(Auth::reject())
@@ -2002,7 +2002,7 @@ mod tests {
             async fn auth_publickey(
                 &mut self,
                 _user: &str,
-                _key: &russh::keys::PublicKey,
+                _key: server::VerifiedPublicKey<'_>,
             ) -> Result<Auth, Self::Error> {
                 self.attempt();
                 Ok(Auth::reject())

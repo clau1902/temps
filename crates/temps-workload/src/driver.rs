@@ -63,6 +63,13 @@ pub struct LimitSupport {
     pub memory: bool,
     pub pids: bool,
     pub disk: bool,
+    /// Block I/O bandwidth cap. Absent in a capability set written before
+    /// the limit existed: that driver does not enforce it.
+    #[serde(default)]
+    pub disk_io: bool,
+    /// Network bandwidth cap; absent likewise.
+    #[serde(default)]
+    pub network: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -133,6 +140,12 @@ pub struct InstanceLimits {
     pub memory_swap_bytes: Option<i64>,
     pub pids: Option<i64>,
     pub disk_mb: Option<u32>,
+    /// Bytes per second a block device may move (reads plus writes).
+    #[serde(default)]
+    pub disk_io_bytes_per_sec: Option<i64>,
+    /// Bytes per second the network interface may move, each direction.
+    #[serde(default)]
+    pub network_bytes_per_sec: Option<i64>,
 }
 
 /// The spec of one instance, fully resolved. Transient: built for a
@@ -240,6 +253,11 @@ pub struct InstanceStatus {
     pub address: Option<String>,
     /// Ports the runtime actually published (host port picked at create).
     pub published_ports: Vec<PortBinding>,
+    /// For an exited instance the runtime itself starts again under its
+    /// restart policy: when it will. `None` when it will not, or when the
+    /// runtime does not say (Docker's own restarts are not announced).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -247,12 +265,22 @@ pub struct LogQuery {
     pub since: Option<DateTime<Utc>>,
     pub tail: Option<u32>,
     pub follow: bool,
+    /// Follow from the checkpoint the driver keeps of what the previous
+    /// `resume` follower consumed. The checkpoint moves past a batch of lines
+    /// only once the reader asks for more, so a restart never skips a line but
+    /// may repeat the last batch the previous reader received and stopped on
+    /// (at-least-once). For the one ingesting reader of an instance; drivers
+    /// that keep no checkpoint ignore it. Takes the place of `tail`.
+    pub resume: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogLine {
     pub stderr: bool,
     pub line: Bytes,
+    /// When the runtime captured the line. `None` when it records no time
+    /// (a microVM whose guest agent predates timestamped logs).
+    pub timestamp: Option<DateTime<Utc>>,
 }
 
 pub type LogStream = BoxStream<'static, Result<LogLine, DriverError>>;
@@ -263,6 +291,22 @@ pub struct InstanceStats {
     pub cpu_nanos: Option<u64>,
     pub memory_bytes: Option<u64>,
     pub pids: Option<u64>,
+    /// Cumulative bytes the instance read from, and wrote to, its block
+    /// devices. `None` when the runtime does not report it.
+    #[serde(default)]
+    pub disk_read_bytes: Option<u64>,
+    #[serde(default)]
+    pub disk_write_bytes: Option<u64>,
+    /// Cumulative bytes received and sent on the instance's network
+    /// interfaces (loopback excluded).
+    #[serde(default)]
+    pub net_rx_bytes: Option<u64>,
+    #[serde(default)]
+    pub net_tx_bytes: Option<u64>,
+    /// The memory the instance may use, when the runtime knows it (a
+    /// microVM's configured RAM).
+    #[serde(default)]
+    pub memory_limit_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

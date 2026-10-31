@@ -18,7 +18,6 @@ import {
 import { ResourceStat, Status, fmtBytes, fmtPercent } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import {
-  Box,
   ChevronRight,
   Cpu,
   ExternalLink,
@@ -33,7 +32,9 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { ContainerMetricHistory } from './ContainerMetricHistory'
 import { ContainerEmptyState } from './ContainerEmptyState'
+import { ContainerRuntimeBadge, ContainerRuntimeLogo } from './ContainerRuntime'
 import { containerPublicUrls } from './container-public-urls'
+import { uptimeStart } from './container-uptime'
 
 interface ContainerListProps {
   project: ProjectResponse
@@ -148,7 +149,7 @@ function ContainerRow({
       className="group flex items-center gap-4 px-4 py-4 cursor-pointer hover:bg-neutral-50 dark:hover:bg-white/5 transition-colors"
     >
       <div className="shrink-0 flex size-10 items-center justify-center rounded-md bg-neutral-100 text-neutral-600 dark:bg-white/5 dark:text-neutral-300">
-        <Box className="size-5" aria-hidden="true" />
+        <ContainerRuntimeLogo container={container} />
       </div>
 
       <div className="flex-1 min-w-0">
@@ -170,6 +171,7 @@ function ContainerRow({
           <code className="font-mono truncate max-w-[24rem]">
             {container.image_name}
           </code>
+          <ContainerRuntimeBadge container={container} />
           {container.node_name && (
             <span className="inline-flex items-center gap-1">
               <ServerIcon className="size-3" aria-hidden="true" />
@@ -198,9 +200,10 @@ function ContainerRow({
               <span>at deploy</span>
             </span>
           )}
-          {container.container_port != null && container.created_at && (
-            <UptimeInline createdAt={container.created_at} />
-          )}
+          {container.container_port != null &&
+            uptimeStart(container.status, container.created_at) && (
+              <UptimeInline createdAt={container.created_at} />
+            )}
           {running && metrics && (
             <>
               <ResourceStat

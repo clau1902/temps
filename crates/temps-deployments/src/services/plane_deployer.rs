@@ -57,6 +57,8 @@ use temps_workload::{
 use temps_workload_plane::scheduler::CONTROL_PLANE_NODE_ID;
 use temps_workload_plane::{ApplyRequest, Owner, WorkloadPlane};
 
+use super::DeploymentError;
+
 /// Owner kind of a deployment's workloads.
 pub const DEPLOYMENT_OWNER_KIND: &str = "deployment";
 
@@ -182,10 +184,7 @@ pub async fn retire_replica_workload(
         .delete(
             workload.workload_id,
             "Retired",
-            &format!(
-                "deployment {deployment_id} was superseded or rejected; container \
-                 {container_id} retired"
-            ),
+            &format!("container {container_id} of deployment {deployment_id} was retired"),
         )
         .await
         .map_err(|e| ReplicaRetireError::Delete {
@@ -204,6 +203,389 @@ pub struct ControlPlaneMicroVmDriver(pub Arc<dyn RuntimeDriver>);
 
 /// How many log lines a microVM replica's log read returns.
 const MICRO_VM_LOG_TAIL: u32 = 500;
+
+/// How long a read remembers that an id is not a plane replica. A Docker
+/// container is read by the health monitor every cycle; this keeps that from
+/// costing a database lookup each time, while a replica the plane has only
+/// just started is looked for again within seconds.
+const NOT_A_REPLICA_TTL: Duration = Duration::from_secs(15);
+
+/// A CPU sample older than this is a long enough window to compute a rate
+/// from; a younger one is too noisy, so the reader takes a fresh pair.
+const CPU_WINDOW_MIN: Duration = Duration::from_secs(1);
+
+/// The gap between the two samples taken when there is no usable previous
+/// one.
+const CPU_SAMPLE_GAP: Duration = Duration::from_millis(500);
+
+/// Most distinct replicas whose last CPU sample is remembered.
+const CPU_SAMPLES_MAX: usize = 256;
+
+/// CPU usage as a percentage where 100 is one full core, from CPU time used
+/// over a wall-clock window. A counter that went backwards (the guest process
+/// restarted and its counters began again) is not a negative rate: 0.
+pub fn cpu_percent_between(previous_nanos: u64, current_nanos: u64, elapsed: Duration) -> f64 {
+    let wall = elapsed.as_nanos();
+    if wall == 0 {
+        return 0.0;
+    }
+    let used = current_nanos.saturating_sub(previous_nanos);
+    (used as f64 / wall as f64) * 100.0
+}
+
+#[derive(Clone, Copy)]
+enum Classified {
+    Replica(i64),
+    NotReplica(std::time::Instant),
+}
+
+/// Reads microVM replicas through the workload plane, for
+/// [`temps_deployer::replica_aware::ReplicaAwareDeployer`].
+pub struct PlaneReplicaReader {
+    plane: Arc<WorkloadPlane>,
+    classified: Mutex<HashMap<String, Classified>>,
+    /// Container id -> (when, cumulative CPU nanoseconds) of its last stats
+    /// read, so the next read has a rate window without sleeping.
+    cpu_samples: Mutex<HashMap<String, (std::time::Instant, u64)>>,
+}
+
+impl PlaneReplicaReader {
+    pub fn new(plane: Arc<WorkloadPlane>) -> Self {
+        Self {
+            plane,
+            classified: Mutex::new(HashMap::new()),
+            cpu_samples: Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn workload(&self, container_id: &str) -> Result<Option<i64>, DeployerError> {
+        let cached = self
+            .classified
+            .lock()
+            .ok()
+            .and_then(|known| known.get(container_id).copied());
+        match cached {
+            Some(Classified::Replica(workload_id)) => return Ok(Some(workload_id)),
+            Some(Classified::NotReplica(at)) if at.elapsed() < NOT_A_REPLICA_TTL => {
+                return Ok(None)
+            }
+            _ => {}
+        }
+        let workload = micro_vm_replica_workload(&self.plane, container_id)
+            .await
+            .map_err(|e| DeployerError::DeploymentFailed(e.to_string()))?;
+        if let Ok(mut known) = self.classified.lock() {
+            if known.len() >= CPU_SAMPLES_MAX * 4 {
+                known.retain(|_, entry| match entry {
+                    Classified::Replica(_) => true,
+                    Classified::NotReplica(at) => at.elapsed() < NOT_A_REPLICA_TTL,
+                });
+            }
+            known.insert(
+                container_id.to_string(),
+                match workload {
+                    Some(workload_id) => Classified::Replica(workload_id),
+                    None => Classified::NotReplica(std::time::Instant::now()),
+                },
+            );
+        }
+        Ok(workload)
+    }
+
+    fn previous_cpu_sample(&self, container_id: &str) -> Option<(std::time::Instant, u64)> {
+        self.cpu_samples
+            .lock()
+            .ok()
+            .and_then(|samples| samples.get(container_id).copied())
+            .filter(|(at, _)| at.elapsed() >= CPU_WINDOW_MIN)
+    }
+
+    fn remember_cpu_sample(&self, container_id: &str, at: std::time::Instant, nanos: u64) {
+        if let Ok(mut samples) = self.cpu_samples.lock() {
+            if samples.len() >= CPU_SAMPLES_MAX {
+                samples.retain(|_, (taken, _)| taken.elapsed() < Duration::from_secs(600));
+            }
+            samples.insert(container_id.to_string(), (at, nanos));
+        }
+    }
+}
+
+fn plane_failure(
+    container_id: &str,
+    operation: &str,
+    reason: impl std::fmt::Display,
+) -> DeployerError {
+    DeployerError::DeploymentFailed(format!(
+        "Workload plane could not {operation} microVM replica {container_id}: {reason}"
+    ))
+}
+
+#[async_trait]
+impl temps_deployer::replica_aware::ReplicaReader for PlaneReplicaReader {
+    async fn info(&self, container_id: &str) -> Result<Option<ContainerInfo>, DeployerError> {
+        let Some(workload_id) = self.workload(container_id).await? else {
+            return Ok(None);
+        };
+        let view = self
+            .plane
+            .get(workload_id)
+            .await
+            .map_err(|e| plane_failure(container_id, "read the workload of", e))?;
+        let (handle, status) = self
+            .plane
+            .instance_status(workload_id)
+            .await
+            .map_err(|e| plane_failure(container_id, "inspect", e))?
+            .ok_or_else(|| {
+                plane_failure(container_id, "inspect", "its workload has no instance")
+            })?;
+        Ok(Some(micro_vm_container_info(&view.spec, &handle, &status)))
+    }
+
+    async fn stats(
+        &self,
+        container_id: &str,
+    ) -> Result<Option<temps_deployer::ContainerStats>, DeployerError> {
+        let Some(workload_id) = self.workload(container_id).await? else {
+            return Ok(None);
+        };
+        let view = self
+            .plane
+            .get(workload_id)
+            .await
+            .map_err(|e| plane_failure(container_id, "read the workload of", e))?;
+        let (handle, status) = self
+            .plane
+            .instance_status(workload_id)
+            .await
+            .map_err(|e| plane_failure(container_id, "inspect", e))?
+            .ok_or_else(|| {
+                plane_failure(container_id, "inspect", "its workload has no instance")
+            })?;
+        let read = || async {
+            let at = std::time::Instant::now();
+            self.plane
+                .instance_stats(workload_id)
+                .await
+                .map_err(|e| plane_failure(container_id, "read the stats of", e))?
+                .map(|stats| (at, stats))
+                .ok_or_else(|| plane_failure(container_id, "read the stats of", "no instance"))
+        };
+        let (at, stats) = read().await?;
+        let cpu_percent = match (stats.cpu_nanos, self.previous_cpu_sample(container_id)) {
+            (Some(now), Some((before_at, before))) => {
+                cpu_percent_between(before, now, at.duration_since(before_at))
+            }
+            (Some(first), None) => {
+                // No usable earlier sample: take a second one a moment later.
+                tokio::time::sleep(CPU_SAMPLE_GAP).await;
+                let (later_at, later) = read().await?;
+                match later.cpu_nanos {
+                    Some(second) => cpu_percent_between(first, second, later_at.duration_since(at)),
+                    None => 0.0,
+                }
+            }
+            (None, _) => 0.0,
+        };
+        if let Some(nanos) = stats.cpu_nanos {
+            self.remember_cpu_sample(container_id, at, nanos);
+        }
+        let memory_limit_bytes = stats.memory_limit_bytes;
+        let memory_bytes = stats.memory_bytes.unwrap_or(0);
+        let cpu_limit_cores = view
+            .spec
+            .resources
+            .limits
+            .as_ref()
+            .and_then(|limits| limits.cpu_millis)
+            .map(|millis| f64::from(millis) / 1000.0);
+        Ok(Some(temps_deployer::ContainerStats {
+            container_id: handle.id,
+            container_name: handle.name,
+            cpu_percent,
+            cpu_limit_cores,
+            online_cpus: None,
+            memory_bytes,
+            memory_limit_bytes,
+            memory_percent: memory_limit_bytes
+                .filter(|limit| *limit > 0)
+                .map(|limit| ((memory_bytes as f64 / limit as f64) * 100.0).clamp(0.0, 100.0)),
+            network_rx_bytes: stats.net_rx_bytes.unwrap_or(0),
+            network_tx_bytes: stats.net_tx_bytes.unwrap_or(0),
+            block_read_bytes: stats.disk_read_bytes,
+            block_write_bytes: stats.disk_write_bytes,
+            restart_count: None,
+            started_at: status.started_at,
+            timestamp: chrono::Utc::now(),
+        }))
+    }
+
+    async fn logs(&self, container_id: &str) -> Result<Option<Vec<String>>, DeployerError> {
+        let Some(workload_id) = self.workload(container_id).await? else {
+            return Ok(None);
+        };
+        let lines = self
+            .plane
+            .instance_logs(workload_id, MICRO_VM_LOG_TAIL)
+            .await
+            .map_err(|e| plane_failure(container_id, "read the logs of", e))?
+            .unwrap_or_default();
+        Ok(Some(
+            lines
+                .iter()
+                .map(|line| String::from_utf8_lossy(&line.line).into_owned())
+                .collect(),
+        ))
+    }
+}
+
+/// The workload behind `container_id` when it is a microVM replica, which
+/// no container runtime on the host can see. `None` for anything else: a
+/// container the local Docker serves, or an id the plane never started.
+pub async fn micro_vm_replica_workload(
+    plane: &WorkloadPlane,
+    container_id: &str,
+) -> Result<Option<i64>, DeploymentError> {
+    let plane_error =
+        |operation: &'static str, reason: String| DeploymentError::ContainerOperation {
+            container_id: container_id.to_string(),
+            operation,
+            location: "workload plane".to_string(),
+            reason,
+        };
+    let Some((workload_id, _driver)) = plane
+        .workload_for_instance(container_id)
+        .await
+        .map_err(|e| plane_error("look up the workload", e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    match plane.get(workload_id).await {
+        Ok(view) => Ok(served_by_plane_only(view.spec.isolation).then_some(workload_id)),
+        // Gone with its instances: nothing the plane could serve.
+        Err(temps_workload_plane::PlaneError::NotFound { .. }) => Ok(None),
+        Err(e) => Err(plane_error("read the workload", e.to_string())),
+    }
+}
+
+/// Refuse to `operation` (stop, start, restart) `container_id` by hand when
+/// it is a microVM replica. The plane has no stopped state for a deployment
+/// replica: stopping one retires its workload for good and there is
+/// nothing a start could bring back, while Docker, the only other place
+/// the request could go, has never heard of it.
+///
+/// A plane that cannot classify the id lets the operation through: this
+/// runs for every container, and a Docker container must stay
+/// controllable while the plane is unhealthy.
+pub async fn refuse_micro_vm_lifecycle(
+    plane: Option<&WorkloadPlane>,
+    container_id: &str,
+    operation: &str,
+) -> Result<(), DeploymentError> {
+    let Some(plane) = plane else {
+        return Ok(());
+    };
+    match micro_vm_replica_workload(plane, container_id).await {
+        Ok(Some(workload_id)) => Err(DeploymentError::InvalidDeploymentState(format!(
+            "Cannot {operation} container {container_id}: it runs in a Firecracker microVM \
+             (workload {workload_id}), which cannot be stopped, started or restarted on its \
+             own. Redeploy the environment to replace it, or delete the deployment to remove it"
+        ))),
+        Ok(None) => Ok(()),
+        Err(error) => {
+            tracing::warn!(
+                container_id,
+                operation,
+                %error,
+                "Workload plane could not classify the container; treating it as Docker's"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// The most lines a microVM log view asks the guest for.
+const MICRO_VM_LOG_TAIL_MAX: u32 = 10_000;
+
+/// A microVM replica's log query for a viewer's `params`: how many lines to
+/// start with and whether to keep following. The guest log cannot be
+/// searched by date, so a date range is refused rather than answered with
+/// lines outside it; `timestamps` changes how a line is rendered, not which
+/// lines are read (see [`micro_vm_log_line`]).
+fn micro_vm_log_query(
+    container_id: &str,
+    params: &super::services::ContainerLogParams,
+) -> Result<temps_workload::LogQuery, DeploymentError> {
+    let refuse = |reason: String| {
+        DeploymentError::InvalidInput(format!("logs of microVM replica {container_id}: {reason}"))
+    };
+    if params.start_date.is_some() || params.end_date.is_some() {
+        return Err(refuse(
+            "a microVM's logs cannot be filtered by date; use tail and follow".to_string(),
+        ));
+    }
+    let tail = match params.tail.as_deref().map(str::trim) {
+        None | Some("") => MICRO_VM_LOG_TAIL,
+        Some(all) if all.eq_ignore_ascii_case("all") => MICRO_VM_LOG_TAIL_MAX,
+        Some(count) => count
+            .parse::<u32>()
+            .map_err(|_| refuse(format!("tail '{count}' is not a number or 'all'")))?
+            .min(MICRO_VM_LOG_TAIL_MAX),
+    };
+    Ok(temps_workload::LogQuery {
+        since: None,
+        tail: Some(tail),
+        follow: params.follow,
+        resume: false,
+    })
+}
+
+/// A microVM replica's logs for a viewer: its last `tail` lines, then new
+/// ones while `follow` is set. `None` when `container_id` is not a microVM.
+pub async fn micro_vm_replica_logs(
+    plane: &WorkloadPlane,
+    container_id: &str,
+    params: &super::services::ContainerLogParams,
+) -> Result<Option<super::services::ContainerLogStream>, DeploymentError> {
+    use futures::StreamExt;
+    let Some(workload_id) = micro_vm_replica_workload(plane, container_id).await? else {
+        return Ok(None);
+    };
+    let query = micro_vm_log_query(container_id, params)?;
+    let Some(stream) = plane
+        .instance_log_stream(workload_id, query)
+        .await
+        .map_err(|e| DeploymentError::ContainerOperation {
+            container_id: container_id.to_string(),
+            operation: "read the logs",
+            location: "workload plane".to_string(),
+            reason: e.to_string(),
+        })?
+    else {
+        return Ok(Some(Box::pin(futures::stream::empty())));
+    };
+    let timestamps = params.timestamps;
+    Ok(Some(Box::pin(stream.map(move |line| {
+        line.map(|line| micro_vm_log_line(&line, timestamps))
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }))))
+}
+
+/// One line of a microVM replica's log as a viewer gets it. With
+/// `timestamps`, a line the guest dated starts with that time the way
+/// Docker's does (`<RFC 3339 nanoseconds> <text>`), which the console moves
+/// into its time column; a line from a guest agent that predates dated logs
+/// is passed through as it is rather than given a time it never had.
+fn micro_vm_log_line(line: &temps_workload::LogLine, timestamps: bool) -> String {
+    let text = String::from_utf8_lossy(&line.line);
+    match line.timestamp {
+        Some(at) if timestamps => format!(
+            "{} {text}",
+            at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+        ),
+        _ => text.into_owned(),
+    }
+}
 
 /// The `Deployment` workload one replica's create request becomes: pinned
 /// to `node_id` (the job already placed it there) with `isolation`, long-running
@@ -271,6 +653,8 @@ pub fn deployment_workload_spec(
             .map(|mb| u32::try_from(mb).unwrap_or(u32::MAX)),
         disk_mb: None,
         pids: None,
+        disk_io_mbps: None,
+        network_mbps: None,
     };
     Ok(WorkloadSpec {
         owner: WorkloadRef::new(WorkloadKind::Deployment, i64::from(deployment_id)),
@@ -932,6 +1316,10 @@ fn micro_vm_container_info(
             .labels
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
+            .chain([(
+                temps_deployer::RUNTIME_LABEL.to_string(),
+                handle.driver.clone(),
+            )])
             .collect(),
         exit_code: status.exit_code.and_then(|code| i32::try_from(code).ok()),
         exit_reason: status.exit_code.map(|code| format!("Exit code {code}")),
@@ -946,7 +1334,48 @@ fn micro_vm_container_info(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_deployer::replica_aware::ReplicaReader;
     use temps_workload as tw;
+
+    #[test]
+    fn a_micro_vm_replica_names_the_runtime_it_runs_on() {
+        // The console shows what runs a replica; a microVM must not be
+        // reported as a Docker container.
+        // A microVM joins no Docker network.
+        let mut on_a_vm = request();
+        on_a_vm.extra_networks.clear();
+        let spec = deployment_workload_spec(&on_a_vm, 42, 0, "staged:k".into(), Isolation::MicroVm)
+            .unwrap();
+        let handle = temps_workload::InstanceHandle {
+            driver: "firecracker".into(),
+            id: "vm-42-1".into(),
+            name: "app-production-42-1".into(),
+        };
+        let status = temps_workload::InstanceStatus {
+            restart_at: None,
+            state: temps_workload::InstanceState::Running,
+            exit_code: None,
+            started_at: None,
+            finished_at: None,
+            address: None,
+            published_ports: Vec::new(),
+        };
+
+        let info = micro_vm_container_info(&spec, &handle, &status);
+        assert_eq!(
+            temps_deployer::container_runtime(&info.labels),
+            "firecracker"
+        );
+        // The spec's own labels are still there beside it.
+        assert_eq!(
+            info.labels.get("sh.temps.deploy_id").map(String::as_str),
+            spec.labels.get("sh.temps.deploy_id").map(String::as_str)
+        );
+        assert_eq!(
+            crate::handlers::types::ContainerInfoResponse::from(info).runtime,
+            "firecracker"
+        );
+    }
 
     fn request() -> DeployRequest {
         DeployRequest {
@@ -1546,7 +1975,11 @@ mod tests {
             attempt: Set(1),
             node_id: Set(None),
             driver: Set(driver.to_string()),
-            handle: Set(serde_json::json!({ "id": container_id })),
+            handle: Set(serde_json::json!({
+                "driver": driver,
+                "id": container_id,
+                "name": name,
+            })),
             address: Set(None),
             phase: Set("running".into()),
             ready: Set(true),
@@ -1662,6 +2095,443 @@ mod tests {
         );
     }
 
+    /// A Firecracker stand-in: reports one running instance and a fixed log.
+    struct FakeMicroVm {
+        capabilities: tw::DriverCapabilities,
+        /// The guest cannot be read: its log read fails.
+        logs_fail: bool,
+        stats_calls: std::sync::atomic::AtomicU64,
+    }
+
+    impl FakeMicroVm {
+        fn new() -> Self {
+            Self::with_logs_failing(false)
+        }
+
+        fn with_logs_failing(logs_fail: bool) -> Self {
+            Self {
+                logs_fail,
+                stats_calls: std::sync::atomic::AtomicU64::new(0),
+                capabilities: tw::DriverCapabilities {
+                    name: "firecracker".into(),
+                    artifacts: tw::ArtifactKinds::default(),
+                    isolation: Isolation::MicroVm,
+                    network_attachment: tw::AttachmentKind::Tap,
+                    volumes: tw::VolumeKinds::default(),
+                    exec: false,
+                    snapshot: false,
+                    resize_disk: false,
+                    limits: tw::LimitSupport::default(),
+                },
+            }
+        }
+    }
+
+    #[async_trait]
+    impl tw::RuntimeDriver for FakeMicroVm {
+        fn capabilities(&self) -> &tw::DriverCapabilities {
+            &self.capabilities
+        }
+        async fn prepare(&self, _: &tw::Artifact) -> Result<tw::PreparedArtifact, tw::DriverError> {
+            unreachable!("the read path never prepares an artifact")
+        }
+        async fn create(
+            &self,
+            _: &tw::InstanceSpec,
+            _: &tw::Attachments,
+        ) -> Result<tw::InstanceHandle, tw::DriverError> {
+            unreachable!("the read path never creates an instance")
+        }
+        async fn start(&self, _: &tw::InstanceHandle) -> Result<(), tw::DriverError> {
+            Ok(())
+        }
+        async fn stop(&self, _: &tw::InstanceHandle) -> Result<(), tw::DriverError> {
+            Ok(())
+        }
+        async fn remove(&self, _: &tw::InstanceHandle, _: bool) -> Result<(), tw::DriverError> {
+            Ok(())
+        }
+        async fn inspect(
+            &self,
+            _: &tw::InstanceHandle,
+        ) -> Result<tw::InstanceStatus, tw::DriverError> {
+            Ok(tw::InstanceStatus {
+                restart_at: None,
+                state: tw::InstanceState::Running,
+                exit_code: None,
+                started_at: Some(chrono::Utc::now()),
+                finished_at: None,
+                address: Some("172.20.0.10".into()),
+                published_ports: Vec::new(),
+            })
+        }
+        async fn logs(
+            &self,
+            _: &tw::InstanceHandle,
+            _: tw::LogQuery,
+        ) -> Result<tw::LogStream, tw::DriverError> {
+            use futures::StreamExt;
+            if self.logs_fail {
+                return Err(tw::DriverError::Unavailable {
+                    driver: "firecracker".into(),
+                    reason: "the guest agent does not answer".into(),
+                });
+            }
+            let lines = ["Ready in 1440ms\n", "GET / 200\n"].map(|line| {
+                Ok(tw::LogLine {
+                    stderr: false,
+                    line: bytes::Bytes::from(line),
+                    timestamp: None,
+                })
+            });
+            Ok(futures::stream::iter(lines).boxed())
+        }
+        async fn stats(
+            &self,
+            _: &tw::InstanceHandle,
+        ) -> Result<tw::InstanceStats, tw::DriverError> {
+            // CPU time advances 250 ms of a core's time per call.
+            let calls = self
+                .stats_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            Ok(tw::InstanceStats {
+                cpu_nanos: Some(calls * 250_000_000),
+                memory_bytes: Some(64 * 1024 * 1024),
+                pids: Some(3),
+                disk_read_bytes: Some(4096),
+                disk_write_bytes: Some(8192),
+                net_rx_bytes: Some(1000),
+                net_tx_bytes: Some(2000),
+                memory_limit_bytes: Some(256 * 1024 * 1024),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn the_containers_view_reads_a_micro_vm_replica_from_the_plane() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-read-test"),
+            )
+            .with_local_driver(Arc::new(FakeMicroVm::new())),
+        );
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::Process,
+            "docker",
+            "c-docker",
+        )
+        .await;
+        let micro_vm = plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-2",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-2",
+        )
+        .await;
+
+        assert_eq!(
+            micro_vm_replica_workload(&plane, "vm-42-2")
+                .await
+                .expect("classified"),
+            Some(micro_vm)
+        );
+
+        let reader = PlaneReplicaReader::new(plane.clone());
+        let info = reader
+            .info("vm-42-2")
+            .await
+            .expect("inspected")
+            .expect("a microVM replica is described by the plane");
+        assert_eq!(info.container_id, "vm-42-2");
+        assert_eq!(info.status, ContainerStatus::Running);
+
+        // The log tail is what the guest wrote, one entry per line.
+        let logs = reader
+            .logs("vm-42-2")
+            .await
+            .expect("logs read")
+            .expect("a microVM replica's logs come from the plane");
+        assert_eq!(logs, vec!["Ready in 1440ms\n", "GET / 200\n"]);
+
+        // Stats: the first read has no earlier sample, so it takes two a
+        // moment apart; the fake driver burns 250 ms of CPU between them.
+        let stats = reader
+            .stats("vm-42-2")
+            .await
+            .expect("stats read")
+            .expect("a microVM replica's stats come from the plane");
+        assert_eq!(stats.memory_bytes, 64 * 1024 * 1024);
+        assert_eq!(stats.memory_limit_bytes, Some(256 * 1024 * 1024));
+        assert_eq!(stats.memory_percent, Some(25.0));
+        assert_eq!(stats.network_rx_bytes, 1000);
+        assert_eq!(stats.network_tx_bytes, 2000);
+        assert_eq!(stats.block_read_bytes, Some(4096));
+        assert_eq!(stats.block_write_bytes, Some(8192));
+        // 250 ms of CPU over a ~500 ms gap: about half a core, never zero
+        // and never more than a core for one busy thread.
+        assert!(
+            stats.cpu_percent > 5.0 && stats.cpu_percent <= 100.0,
+            "{}",
+            stats.cpu_percent
+        );
+
+        // Docker serves its own containers and ids the plane never started:
+        // the plane answers "not mine" so the caller asks Docker.
+        for id in ["c-docker", "legacy-1"] {
+            assert_eq!(
+                micro_vm_replica_workload(&plane, id)
+                    .await
+                    .expect("classified"),
+                None,
+                "{id} is not a microVM"
+            );
+            assert!(reader.info(id).await.expect("not an error").is_none());
+            assert!(reader.stats(id).await.expect("not an error").is_none());
+            assert!(reader.logs(id).await.expect("not an error").is_none());
+        }
+    }
+
+    #[test]
+    fn cpu_percent_is_the_share_of_one_core_over_the_window() {
+        let second = Duration::from_secs(1);
+        assert_eq!(cpu_percent_between(0, 500_000_000, second), 50.0);
+        assert_eq!(cpu_percent_between(0, 2_000_000_000, second), 200.0);
+        // A restarted process starts its counters again: not a negative rate.
+        assert_eq!(cpu_percent_between(5_000_000_000, 1_000, second), 0.0);
+        assert_eq!(cpu_percent_between(0, 100, Duration::ZERO), 0.0);
+    }
+
+    /// The logs view asks Docker for a container's logs. A microVM is not a
+    /// Docker container, so its tail has to come from the plane, and every
+    /// other id must still reach Docker.
+    #[tokio::test]
+    async fn a_micro_vms_logs_are_served_by_the_plane_not_docker() {
+        use crate::services::container_operations::{
+            ContainerOperations, LocalContainerOperations,
+        };
+        use futures::StreamExt;
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-log-test"),
+            )
+            .with_local_driver(Arc::new(FakeMicroVm::new())),
+        );
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-1",
+        )
+        .await;
+
+        // No daemon behind either handle (the client only connects when
+        // used): reaching Docker would fail.
+        let Ok(docker) = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            5,
+            bollard::API_DEFAULT_VERSION,
+        ) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        let operations = LocalContainerOperations::new(
+            Arc::new(docker),
+            Arc::new(temps_logs::DockerLogService::new(Arc::new(
+                temps_core::DockerHandle::disabled("test", "no Docker in this test"),
+            ))),
+            Arc::new(UnusedDeployer),
+        )
+        .with_plane(Some(plane));
+        let params = || crate::services::ContainerLogParams {
+            start_date: None,
+            end_date: None,
+            tail: None,
+            timestamps: false,
+            follow: false,
+        };
+
+        let stream = operations
+            .stream_logs("vm-42-1", params())
+            .await
+            .expect("a microVM's logs come from the plane");
+        let lines: Vec<String> = stream.map(|line| line.expect("a log line")).collect().await;
+        assert_eq!(lines, vec!["Ready in 1440ms\n", "GET / 200\n"]);
+
+        let error = match operations.stream_logs("c-docker", params()).await {
+            Ok(_) => panic!("a Docker container's logs must still go to Docker"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                crate::services::DeploymentError::DockerUnavailable(_)
+            ),
+            "{error}"
+        );
+    }
+
+    /// Stopping a microVM by hand is refused with what to do instead,
+    /// rather than sent to Docker, which answers "no such container". A
+    /// container, and an id the plane never started, are let through.
+    #[tokio::test]
+    async fn a_microvm_is_not_stopped_or_started_by_hand() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = WorkloadPlane::new(
+            db.clone(),
+            temps_workload_plane::NodeDriver(None),
+            Arc::new(temps_workload_plane::NoEnvSource),
+            Arc::new(AcceptingAudit),
+            temps_workload_plane::PlaneConfig::new("adr055-lifecycle-test"),
+        )
+        .with_local_driver(Arc::new(FakeMicroVm::new()));
+        let micro_vm = plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-1",
+        )
+        .await;
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-2",
+            Isolation::Process,
+            "docker",
+            "c-docker",
+        )
+        .await;
+
+        for operation in ["stop", "start", "restart"] {
+            let refused = refuse_micro_vm_lifecycle(Some(&plane), "vm-42-1", operation)
+                .await
+                .expect_err("a microVM is refused");
+            let message = refused.to_string();
+            assert!(
+                matches!(refused, DeploymentError::InvalidDeploymentState(_)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("Cannot {operation} container vm-42-1"))
+                    && message.contains(&format!("workload {micro_vm}"))
+                    && message.contains("Redeploy the environment"),
+                "{message}"
+            );
+        }
+        for container_id in ["c-docker", "never-started"] {
+            refuse_micro_vm_lifecycle(Some(&plane), container_id, "stop")
+                .await
+                .unwrap_or_else(|e| panic!("{container_id} goes to its runtime: {e}"));
+        }
+        refuse_micro_vm_lifecycle(None, "vm-42-1", "stop")
+            .await
+            .expect("without a plane there is nothing to refuse");
+    }
+
+    /// A plane that cannot read a replica must not take a Docker
+    /// container's logs with it: the read falls through to Docker.
+    #[tokio::test]
+    async fn a_plane_error_on_the_log_path_falls_through_to_docker() {
+        use crate::services::container_operations::{
+            ContainerOperations, LocalContainerOperations,
+        };
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let plane = Arc::new(
+            WorkloadPlane::new(
+                db.clone(),
+                temps_workload_plane::NodeDriver(None),
+                Arc::new(temps_workload_plane::NoEnvSource),
+                Arc::new(AcceptingAudit),
+                temps_workload_plane::PlaneConfig::new("adr055-log-fallthrough-test"),
+            )
+            .with_local_driver(Arc::new(FakeMicroVm::with_logs_failing(true))),
+        );
+        plane_replica(
+            &plane,
+            db.as_ref(),
+            "app-production-42-1",
+            Isolation::MicroVm,
+            "firecracker",
+            "vm-42-1",
+        )
+        .await;
+        let Ok(docker) = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            5,
+            bollard::API_DEFAULT_VERSION,
+        ) else {
+            println!("Docker client unavailable, skipping");
+            return;
+        };
+        let operations = LocalContainerOperations::new(
+            Arc::new(docker),
+            Arc::new(temps_logs::DockerLogService::new(Arc::new(
+                temps_core::DockerHandle::disabled("test", "no Docker in this test"),
+            ))),
+            Arc::new(UnusedDeployer),
+        )
+        .with_plane(Some(plane));
+
+        let error = match operations
+            .stream_logs(
+                "vm-42-1",
+                crate::services::ContainerLogParams {
+                    start_date: None,
+                    end_date: None,
+                    tail: None,
+                    timestamps: false,
+                    follow: false,
+                },
+            )
+            .await
+        {
+            Ok(_) => panic!("an unreadable guest has no logs to stream"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                crate::services::DeploymentError::DockerUnavailable(_)
+            ),
+            "the plane's failure must not replace Docker's answer: {error}"
+        );
+    }
+
     #[tokio::test]
     async fn a_plane_owned_replica_is_retired_through_the_plane() {
         let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
@@ -1736,5 +2606,79 @@ mod tests {
         retire_replica_workload(None, 42, "c-worker", after)
             .await
             .expect("idempotent");
+    }
+
+    fn log_params(tail: Option<&str>, follow: bool) -> crate::services::ContainerLogParams {
+        crate::services::ContainerLogParams {
+            start_date: None,
+            end_date: None,
+            tail: tail.map(str::to_string),
+            timestamps: false,
+            follow,
+        }
+    }
+
+    #[test]
+    fn a_viewers_tail_and_follow_reach_the_microvm_log_query() {
+        let default = micro_vm_log_query("vm-1", &log_params(None, false)).unwrap();
+        assert_eq!(default.tail, Some(MICRO_VM_LOG_TAIL));
+        assert!(!default.follow);
+        assert!(
+            !default.resume,
+            "a viewer must not move the ingest checkpoint"
+        );
+
+        let followed = micro_vm_log_query("vm-1", &log_params(Some("50"), true)).unwrap();
+        assert_eq!(followed.tail, Some(50));
+        assert!(followed.follow, "a live view keeps the stream open");
+
+        let all = micro_vm_log_query("vm-1", &log_params(Some("ALL"), false)).unwrap();
+        assert_eq!(all.tail, Some(MICRO_VM_LOG_TAIL_MAX));
+        let huge = micro_vm_log_query("vm-1", &log_params(Some("99999999"), false)).unwrap();
+        assert_eq!(huge.tail, Some(MICRO_VM_LOG_TAIL_MAX), "bounded");
+    }
+
+    #[test]
+    fn a_microvm_log_line_carries_the_guests_time_when_the_viewer_asks_for_it() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-10-30T21:27:02.5Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let dated = temps_workload::LogLine {
+            stderr: false,
+            line: bytes::Bytes::from_static(b"GET / 200\n"),
+            timestamp: Some(at),
+        };
+        assert_eq!(
+            micro_vm_log_line(&dated, true),
+            "2026-10-30T21:27:02.500000000Z GET / 200\n"
+        );
+        assert_eq!(micro_vm_log_line(&dated, false), "GET / 200\n");
+
+        let undated = temps_workload::LogLine {
+            timestamp: None,
+            ..dated
+        };
+        assert_eq!(micro_vm_log_line(&undated, true), "GET / 200\n");
+    }
+
+    #[test]
+    fn a_microvm_log_query_it_cannot_answer_is_refused_by_name() {
+        let mut dated = log_params(None, false);
+        dated.start_date = Some(1_700_000_000);
+        let error = micro_vm_log_query("vm-9", &dated).unwrap_err().to_string();
+        assert!(error.contains("vm-9"), "{error}");
+        assert!(error.contains("date"), "{error}");
+        dated.start_date = None;
+        dated.end_date = Some(1_700_000_000);
+        assert!(micro_vm_log_query("vm-9", &dated).is_err());
+
+        let error = micro_vm_log_query("vm-9", &log_params(Some("lots"), false))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("'lots'"), "{error}");
+        assert!(matches!(
+            micro_vm_log_query("vm-9", &dated),
+            Err(DeploymentError::InvalidInput(_))
+        ));
     }
 }
