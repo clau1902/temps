@@ -304,7 +304,7 @@
       "lazy_error_variants": 18,
       "unguarded_require_auth": 5,
       "anyhow_in_library": 10,
-      "files_over_3000_lines": 2,
+      "files_over_3000_lines": 1,
       "functions_over_300_lines": 4
     },
     "temps-providers": {
