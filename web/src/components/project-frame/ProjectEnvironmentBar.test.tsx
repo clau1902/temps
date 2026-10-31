@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, fireEvent, render, within } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import type {
@@ -203,6 +209,37 @@ test('a healthy environment reads Live, without a link', async () => {
   expect(await view.findByRole('img', { name: /^Live: / })).toBeTruthy()
   expect(view.queryByRole('link', { name: /^Live/ })).toBeNull()
 })
+
+for (const [workload, containerPort, visible] of [
+  ['a worker, which serves nothing to visit,', null, false],
+  ['a web service', 3000, true],
+] as const)
+  test(`${workload} ${visible ? 'offers' : 'offers no'} Visit`, async () => {
+    const view = renderBar(
+      { ...service, project_type: 'server' } as ProjectResponse,
+      null,
+      {
+        environment: liveProduction,
+        routes: {
+          'GET /projects/7/deployments': deployments('completed'),
+          'GET /projects/7/environments/3/containers': () =>
+            jsonResponse({
+              containers: [
+                { container_port: containerPort, health_state: 'healthy' },
+              ],
+            }),
+        },
+      }
+    )
+
+    // Until the containers load, nothing says this is a worker, so the
+    // worker's link only goes once they have.
+    await waitFor(() =>
+      expect(
+        view.queryByRole('link', { name: 'Visit production' }) !== null
+      ).toBe(visible)
+    )
+  })
 
 test('the repository opens from the menu, without credentials in the link', async () => {
   const view = renderBar({

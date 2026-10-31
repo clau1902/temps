@@ -143,6 +143,9 @@ export function ProjectEnvironmentBar({
   // why they cannot. A worker serves nothing to visit.
   const checkReachability =
     !!environment?.current_deployment_id && !external && !health.isWorker
+  // The environment keeps its address when it runs only a worker, but
+  // nothing answers there: offer no Visit for it.
+  const visitUrl = health.isWorker ? undefined : environment?.main_url
   const reachability = useQuery({
     ...getEnvironmentReachabilityOptions({
       path: { project_id: project.id, environment_id: environment?.id ?? 0 },
@@ -254,16 +257,16 @@ export function ProjectEnvironmentBar({
       </nav>
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
-        {environment?.main_url && (
+        {visitUrl && (
           <Button variant="outline" size="sm" className="max-sm:hidden" asChild>
             <a
-              href={environment.main_url}
+              href={visitUrl}
               target="_blank"
               rel="noopener noreferrer"
-              title={environment.main_url}
+              title={visitUrl}
             >
               <ExternalLink className="size-4" aria-hidden="true" />
-              Visit {environment.name}
+              Visit {environment?.name}
             </a>
           </Button>
         )}
@@ -294,15 +297,11 @@ export function ProjectEnvironmentBar({
                 Deploy
               </DropdownMenuItem>
             )}
-            {environment?.main_url && (
+            {visitUrl && (
               <DropdownMenuItem className="sm:hidden" asChild>
-                <a
-                  href={environment.main_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                >
+                <a href={visitUrl} target="_blank" rel="noopener noreferrer">
                   <ExternalLink className="size-4" aria-hidden="true" />
-                  Visit {environment.name}
+                  Visit {environment?.name}
                 </a>
               </DropdownMenuItem>
             )}
