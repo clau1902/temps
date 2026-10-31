@@ -62,7 +62,7 @@ test.describe('project creation', () => {
     // form controls, so they are asserted by their visible text, not getByLabel.
     await expect(page.getByText('Branch', { exact: true })).toBeVisible()
     await expect(
-      page.getByText('Root Directory', { exact: true })
+      page.getByText('Root directory', { exact: true })
     ).toBeVisible()
 
     // Preset auto-detection resolves a beat AFTER the form paints, and until it
