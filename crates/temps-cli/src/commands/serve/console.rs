@@ -43,6 +43,7 @@ use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
 use temps_deployer::traefik_discovery::DriftAlarmSink;
+use temps_deployment_logs::LogsPlugin;
 use temps_deployments::DeploymentsPlugin;
 use temps_dns::DnsPlugin;
 use temps_domains::DomainsPlugin;
@@ -57,7 +58,6 @@ use temps_import::ImportPlugin;
 use temps_infra::InfraPlugin;
 use temps_kv::KvPlugin;
 use temps_log_aggregator::{LogAggregatorPlugin, StorageConfig};
-use temps_logs::LogsPlugin;
 use temps_mcp_server::{McpHandlerState, McpServerPlugin};
 use temps_monitoring::{
     AlarmService, ContainerHealthConfig, ContainerHealthMonitor, ContainerRuntimeResolver,

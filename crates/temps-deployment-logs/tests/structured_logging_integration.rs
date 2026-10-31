@@ -6,7 +6,7 @@
 //! Demonstrates how existing code can use structured logging with minimal changes
 
 use tempfile::TempDir;
-use temps_logs::{LogLevel, LogService};
+use temps_deployment_logs::{LogLevel, LogService};
 
 #[tokio::test]
 async fn test_structured_logging_api() {

@@ -172,7 +172,7 @@ struct CentralEndpointError {
 #[derive(Clone)]
 pub struct FailureReportService {
     deployment_service: Arc<DeploymentService>,
-    log_service: Arc<temps_logs::LogService>,
+    log_service: Arc<temps_deployment_logs::LogService>,
     encryption_service: Arc<EncryptionService>,
     client: reqwest::Client,
     endpoint: String,
@@ -186,7 +186,7 @@ pub struct FailureReportService {
 impl FailureReportService {
     pub fn new(
         deployment_service: Arc<DeploymentService>,
-        log_service: Arc<temps_logs::LogService>,
+        log_service: Arc<temps_deployment_logs::LogService>,
         encryption_service: Arc<EncryptionService>,
     ) -> Result<Self, FailureReportError> {
         #[allow(

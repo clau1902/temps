@@ -272,8 +272,8 @@ impl TempsPlugin for DeploymentsPlugin {
         use temps_core::plugin::RequiredService;
         vec![
             RequiredService::of::<sea_orm::DatabaseConnection>(),
-            RequiredService::of::<temps_logs::LogService>(),
-            RequiredService::of::<temps_logs::DockerLogService>(),
+            RequiredService::of::<temps_deployment_logs::LogService>(),
+            RequiredService::of::<temps_deployment_logs::DockerLogService>(),
             RequiredService::of::<temps_config::ConfigService>(),
             RequiredService::of::<temps_core::DockerHandle>(),
             RequiredService::of::<dyn temps_deployer::ContainerDeployer>(),
@@ -295,10 +295,11 @@ impl TempsPlugin for DeploymentsPlugin {
         Box::pin(async move {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let log_service = context.require_service::<temps_logs::LogService>();
+            let log_service = context.require_service::<temps_deployment_logs::LogService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let queue_service = context.require_service::<dyn temps_core::JobQueue>();
-            let docker_log_service = context.require_service::<temps_logs::DockerLogService>();
+            let docker_log_service =
+                context.require_service::<temps_deployment_logs::DockerLogService>();
             // Always registered, in every profile; the daemon behind it is
             // not always there. Resolved lazily via `.require()` at each
             // point of use, so a control-plane process (no local daemon)
@@ -1086,7 +1087,7 @@ impl TempsPlugin for DeploymentsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let deployment_service = context.require_service::<DeploymentService>();
-        let log_service = context.require_service::<temps_logs::LogService>();
+        let log_service = context.require_service::<temps_deployment_logs::LogService>();
         let cron_service = context.require_service::<crate::services::DatabaseCronConfigService>();
 
         // Optional. configure_routes runs only after every plugin's
@@ -1465,7 +1466,7 @@ impl TempsPlugin for DeploymentsPlugin {
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let state = Arc::new(handlers::ci_dispatch::CiRunnerState {
             dispatch: context.require_service::<crate::services::ci_dispatch::CiDispatchService>(),
-            log_service: context.require_service::<temps_logs::LogService>(),
+            log_service: context.require_service::<temps_deployment_logs::LogService>(),
             audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
         });
         Some(PluginRoutes::new(
@@ -1585,7 +1586,7 @@ mod tests {
             .unwrap(),
         );
         context.register_service(dispatch);
-        context.register_service(Arc::new(temps_logs::LogService::new(
+        context.register_service(Arc::new(temps_deployment_logs::LogService::new(
             root.path().join("logs"),
         )));
         context.register_service::<dyn temps_core::AuditLogger>(Arc::new(RunnerAudit));

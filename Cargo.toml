@@ -21,7 +21,7 @@ members = [
     "crates/temps-auth",
     "crates/temps-git",
     "crates/temps-presets",
-    "crates/temps-logs",
+    "crates/temps-deployment-logs",
     "crates/temps-deployer",
     "crates/temps-docker-capture",
     "crates/temps-workload",

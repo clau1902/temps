@@ -17,8 +17,8 @@ use temps_core::{
     WorkflowTask,
 };
 use temps_deployer::{BuildRequest, ImageBuilder};
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::preset::{Preset as StoredPreset, PresetConfig as StoredPresetConfig};
-use temps_logs::{LogLevel, LogService};
 use temps_presets;
 use tokio::time::{sleep, Duration};
 

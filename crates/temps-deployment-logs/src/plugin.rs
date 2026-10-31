@@ -45,7 +45,7 @@ impl LogsPlugin {
     }
 
     /// Build the archive backend implied by `storage_config`. `None` for the
-    /// `Filesystem` variant -- `temps-logs` itself always writes local files
+    /// `Filesystem` variant -- `temps-deployment-logs` itself always writes local files
     /// while a job is running, so "filesystem" for this plugin just means
     /// "no archival step", not a distinct backend implementation the way it
     /// is for `temps-log-aggregator`.

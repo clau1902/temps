@@ -263,7 +263,7 @@ impl TempsPlugin for BackupPlugin {
             // typed `DockerUnavailable` there instead of this registration
             // step panicking.
             let docker_handle = context.require_service::<temps_core::DockerHandle>();
-            let log_service = context.require_service::<temps_logs::LogService>();
+            let log_service = context.require_service::<temps_deployment_logs::LogService>();
             let backup_provider: Arc<dyn PreUpgradeBackupProvider> = backup_service.clone();
             let lifecycle: Arc<dyn PostgresContainerLifecycle> =
                 Arc::new(PostgresLifecycleAdapter::new(

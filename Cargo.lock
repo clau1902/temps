@@ -12259,11 +12259,11 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-deployment-logs",
  "temps-entities",
  "temps-environments",
  "temps-error-tracking",
  "temps-git",
- "temps-logs",
  "temps-projects",
  "temps-providers",
  "temps-sandbox",
@@ -12581,8 +12581,8 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-deployment-logs",
  "temps-entities",
- "temps-logs",
  "temps-migrations",
  "temps-monitoring",
  "temps-providers",
@@ -12731,6 +12731,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-deployer",
+ "temps-deployment-logs",
  "temps-deployments",
  "temps-dns",
  "temps-domains",
@@ -12750,7 +12751,6 @@ dependencies = [
  "temps-ingress",
  "temps-kv",
  "temps-log-aggregator",
- "temps-logs",
  "temps-mcp-server",
  "temps-metrics",
  "temps-monitoring",
@@ -13065,6 +13065,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-deployment-logs"
+version = "0.1.0-beta.57"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "aws-sdk-s3",
+ "bollard",
+ "chrono",
+ "futures",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "temps-config",
+ "temps-core",
+ "temps-file-store",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "utoipa",
+]
+
+[[package]]
 name = "temps-deployments"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -13114,13 +13137,13 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-deployer",
+ "temps-deployment-logs",
  "temps-dns",
  "temps-entities",
  "temps-error-tracking",
  "temps-file-store",
  "temps-git",
  "temps-log-aggregator",
- "temps-logs",
  "temps-metrics",
  "temps-migrations",
  "temps-monitoring",
@@ -14087,29 +14110,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "temps-logs"
-version = "0.1.0-beta.57"
-dependencies = [
- "async-stream",
- "async-trait",
- "aws-sdk-s3",
- "bollard",
- "chrono",
- "futures",
- "hex",
- "serde",
- "serde_json",
- "tempfile",
- "temps-config",
- "temps-core",
- "temps-file-store",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "utoipa",
-]
-
-[[package]]
 name = "temps-mcp-server"
 version = "0.1.0-beta.57"
 dependencies = [
@@ -14664,11 +14664,11 @@ dependencies = [
  "temps-config",
  "temps-core",
  "temps-database",
+ "temps-deployment-logs",
  "temps-dns",
  "temps-dns-resolver",
  "temps-docker-capture",
  "temps-entities",
- "temps-logs",
  "temps-metrics",
  "temps-migrations",
  "temps-monitoring",

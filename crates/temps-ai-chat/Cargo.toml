@@ -22,7 +22,7 @@ temps-entities = { path = "../temps-entities" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-auth = { path = "../temps-auth" }
-temps-logs = { path = "../temps-logs" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-git = { path = "../temps-git" }
 temps-sandbox = { path = "../temps-sandbox" }
 temps-projects = { path = "../temps-projects" }

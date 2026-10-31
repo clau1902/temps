@@ -861,7 +861,7 @@ debug!("Initializing backup service with {} providers", count); // Technical det
 
 ### Deployment Logging (JSONL)
 
-Deployment/build logs use structured JSONL format via `temps-logs`:
+Deployment/build logs use structured JSONL format via `temps-deployment-logs`:
 
 ```rust
 log_service.log_info(log_id, "Building image...").await?;
@@ -980,7 +980,7 @@ trailer, not just the final one.
 | **Domains/TLS** | `temps-domains`, `temps-dns` |
 | **External Services** | `temps-providers`, `temps-query`, `temps-query-postgres`, `temps-query-s3`, `temps-query-redis`, `temps-query-mongodb` |
 | **Analytics** | `temps-analytics`, `temps-analytics-events`, `temps-analytics-funnels`, `temps-analytics-session-replay`, `temps-analytics-performance` |
-| **Operations** | `temps-backup`, `temps-logs`, `temps-monitoring`, `temps-audit`, `temps-notifications` |
+| **Operations** | `temps-backup`, `temps-deployment-logs`, `temps-monitoring`, `temps-audit`, `temps-notifications` |
 | **Storage** | `temps-kv`, `temps-blob`, `temps-static-files` |
 | **Error Tracking** | `temps-error-tracking`, `temps-embeddings` |
 | **Other** | `temps-cli`, `temps-email`, `temps-webhooks`, `temps-geo`, `temps-presets`, `temps-import`, `temps-import-types`, `temps-import-docker`, `temps-vulnerability-scanner`, `temps-infra`, `temps-status-page`, `temps-captcha-wasm` |

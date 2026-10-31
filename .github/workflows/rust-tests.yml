@@ -1342,7 +1342,7 @@ jobs:
               package(temps-query-redis) or package(temps-query-mongodb) or
               package(temps-query-postgres) or package(temps-embeddings) or
               package(temps-config) or package(temps-notifications) or
-              package(temps-deployer) or package(temps-logs) or
+              package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or
               package(temps-node-agent) or
               (package(temps-metrics) and kind(=lib)) or

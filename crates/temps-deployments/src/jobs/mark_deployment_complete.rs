@@ -21,10 +21,10 @@ use temps_core::{
     WorkflowTask,
 };
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::{
     deployment_container_logs, deployment_containers, deployments, environments, nodes, projects,
 };
-use temps_logs::{LogLevel, LogService};
 use tracing::{debug, info, warn};
 
 /// Deployment states the previous-deployment teardown sweep picks up.
@@ -3771,7 +3771,9 @@ mod teardown_tests {
         );
         let job = make_job(db, 42, Arc::new(RecordingDeployer::new()))
             .with_log_id("post-success.log".to_string())
-            .with_log_service(Arc::new(temps_logs::LogService::new("/dev/null".into())));
+            .with_log_service(Arc::new(temps_deployment_logs::LogService::new(
+                "/dev/null".into(),
+            )));
         let context = crate::test_utils::create_test_context(
             "post-success-bookkeeping".to_string(),
             42,

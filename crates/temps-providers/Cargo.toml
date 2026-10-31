@@ -16,7 +16,7 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-logs = { path = "../temps-logs" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-query = { path = "../temps-query" }
 temps-query-postgres = { path = "../temps-query-postgres" }
 temps-query-s3 = { path = "../temps-query-s3" }

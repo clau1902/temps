@@ -19,7 +19,7 @@ temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-providers = { path = "../temps-providers" }
-temps-logs = { path = "../temps-logs" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
 temps-workload = { path = "../temps-workload" }
 temps-workload-plane = { path = "../temps-workload-plane" }
 temps-workload-volumes = { path = "../temps-workload-volumes" }
