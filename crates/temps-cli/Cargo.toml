@@ -78,7 +78,6 @@ temps-log-aggregator = { path = "../temps-log-aggregator" }
 temps-clickhouse = { path = "../temps-clickhouse" }
 temps-logs = { path = "../temps-logs" }
 temps-mcp-server = { path = "../temps-mcp-server" }
-temps-migrations = { path = "../temps-migrations" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
 temps-notifications = { path = "../temps-notifications" }

@@ -20,7 +20,6 @@ temps-shield = { path = "../temps-shield" }
 
 # Database
 sea-orm = { workspace = true }
-sea-orm-migration = { workspace = true }
 sqlx = { workspace = true }
 
 # Concurrency
@@ -43,10 +42,8 @@ serde_json = { workspace = true }
 # HTTP for the internal route-sync endpoint that workers long-poll
 # against. Same wire model as `temps-dns::handlers::dns_sync`.
 axum = { workspace = true }
-http = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-async-trait = { workspace = true }
 chrono = { workspace = true }
 
 # Constant-time byte comparison for the per-node bearer-token hash check.

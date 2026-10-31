@@ -56,9 +56,7 @@ sea-orm = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
 axum = { workspace = true }
-axum-macros = { workspace = true }
 chrono = { workspace = true }
-serde_derive = { workspace = true }
 anyhow = { workspace = true }
 url	= { workspace = true }
 octocrab = { workspace = true }

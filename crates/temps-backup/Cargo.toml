@@ -18,7 +18,6 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-notifications = { path = "../temps-notifications" }
 temps-providers = { path = "../temps-providers" }
 temps-logs = { path = "../temps-logs" }
 temps-workload = { path = "../temps-workload" }
@@ -46,7 +45,6 @@ md5 = "0.8"
 base64 = { workspace = true }
 sea-orm = { workspace = true }
 serde_json = { workspace = true }
-serde_derive = { workspace = true }
 thiserror = { workspace = true }
 yaml_serde = { workspace = true }
 sha2 = { workspace = true }
@@ -66,7 +64,6 @@ bollard = { workspace = true }
 futures = { workspace = true }
 tar = { workspace = true }
 async-trait = { workspace = true }
-async-stream = { workspace = true }
 urlencoding = { workspace = true }
 
 [features]

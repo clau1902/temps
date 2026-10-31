@@ -18,7 +18,6 @@ temps-ai = { path = "../temps-ai" }
 temps-config = { path = "../temps-config" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-deployer = { path = "../temps-deployer" }
 temps-auth = { path = "../temps-auth" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
@@ -49,10 +48,7 @@ sea-orm = { workspace = true }
 # HTTP framework
 axum = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
-http = { workspace = true }
 bytes = { workspace = true }
-hyper = { workspace = true }
 
 # API documentation
 utoipa = { workspace = true }
@@ -80,7 +76,6 @@ base64 = { workspace = true }
 clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 
 # Rate limiting
-tokio-util = { workspace = true }
 moka = { version = "0.12", features = ["future"] }
 
 # Write-once ArcSwap handle for the OtelRelay extension point.
@@ -93,7 +88,6 @@ prost-build = "0.14"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tower = { workspace = true }
 http-body-util = { workspace = true }
-temps-migrations = { path = "../temps-migrations" }
 # For the no-op AuditLogger used in the e2e handler test (AuditLogger is an
 # #[async_trait] returning anyhow::Result).
 async-trait = { workspace = true }

@@ -20,7 +20,6 @@ temps-entities = { path = "../temps-entities" }
 
 # Async runtime
 tokio = { workspace = true }
-async-trait = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -40,7 +39,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 # Utilities
-chrono = { workspace = true }
 uuid = { workspace = true }
 urlencoding = { workspace = true }
 hex = { workspace = true }
@@ -69,4 +67,3 @@ x509-parser = "0.18"
 
 [dev-dependencies]
 tokio-test = "0.4"
-temps-migrations = { path = "../temps-migrations" }

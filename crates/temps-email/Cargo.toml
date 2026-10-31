@@ -21,7 +21,6 @@ temps-entities = { path = "../temps-entities" }
 # Async runtime
 tokio = { workspace = true }
 async-trait = { workspace = true }
-futures = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -47,7 +46,6 @@ lettre = { workspace = true }
 
 # Web framework
 axum = { workspace = true }
-axum-macros = { workspace = true }
 
 # OpenAPI
 utoipa = { workspace = true }
@@ -60,7 +58,6 @@ tracing = { workspace = true }
 # Utilities
 chrono = { workspace = true }
 uuid = { workspace = true }
-urlencoding = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
@@ -72,9 +69,7 @@ tokio-socks = "0.5"
 md5 = "0.8"
 
 [dev-dependencies]
-tokio-test = "0.4"
 testcontainers = { workspace = true }
-temps-migrations = { path = "../temps-migrations" }
 tower = { workspace = true }
 http = { workspace = true }
 http-body-util = { workspace = true }

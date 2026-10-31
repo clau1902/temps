@@ -23,9 +23,6 @@ temps-analytics = { path = "../temps-analytics" }
 # Web framework
 axum = { workspace = true }
 utoipa = { workspace = true }
-# CORS on the public ingest routes (ADR-040): the browser blocks a
-# cross-origin POST before it leaves the page without it.
-tower-http = { workspace = true }
 
 # Database
 sea-orm = { workspace = true }
@@ -56,10 +53,7 @@ chrono = { workspace = true }
 # contention on the ingest hot path). Matches temps-proxy's precedent.
 dashmap = "6"
 
-
-
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-axum-test = "21.0.0"
 # Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
 tower = { version = "0.5", features = ["util"] }

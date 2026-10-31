@@ -21,7 +21,6 @@ serde = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
 sea-orm = { workspace = true }
-log = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }

@@ -50,14 +50,9 @@ arc-swap = { workspace = true }
 # Error handling & logging
 thiserror = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
-
-# Misc
-chrono = { workspace = true }
 
 [dev-dependencies]
 hickory-resolver = "0.26"
 temps-workload = { path = "../temps-workload" }
-tokio-test = "0.4"
 wiremock = "0.6"
 tempfile = "3"

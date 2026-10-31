@@ -33,7 +33,6 @@ clap = { version = "4", features = ["derive"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "http2"] }
 tower = { version = "0.5", features = ["util"] }
-tokio-stream = { version = "0.1", features = ["net"] }
 
 # WebSocket support for the platform channel
 tokio-tungstenite = "0.30"
@@ -45,12 +44,7 @@ utoipa = { workspace = true }
 # Shared types from temps
 temps-core = { path = "../temps-core" }
 
-# Tar extraction for UI bundles
-flate2 = "1"
-tar = "0.4.45"
-
 # UUID for request IDs
-uuid = { workspace = true }
 subtle = "2.6"
 
 [dev-dependencies]

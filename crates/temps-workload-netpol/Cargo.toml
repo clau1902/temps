@@ -17,7 +17,6 @@ temps-netpol-ebpf-common = { path = "../temps-netpol-ebpf-common" }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
-bytes = { workspace = true }
 crossbeam-queue = "0.3"
 futures = { workspace = true }
 httparse = "1.10"

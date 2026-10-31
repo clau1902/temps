@@ -30,14 +30,9 @@ serde_json = { workspace = true }
 
 # Async
 tokio = { workspace = true }
-async-trait = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
-
-# Error handling
-thiserror = { workspace = true }
-anyhow = { workspace = true }
 
 # Time
 chrono = { workspace = true }

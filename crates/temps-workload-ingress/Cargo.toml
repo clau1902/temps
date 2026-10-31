@@ -12,7 +12,6 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-workload = { path = "../temps-workload" }
 serde = { workspace = true }
 thiserror = { workspace = true }
 hmac = "0.13"
