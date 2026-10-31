@@ -5,6 +5,7 @@
 name = "temps-email-tracking"
 version.workspace = true
 edition.workspace = true
+description = "Email open and click tracking (pixel, link rewriting) and SES bounce, complaint and delivery processing via SNS"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

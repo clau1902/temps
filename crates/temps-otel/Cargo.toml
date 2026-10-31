@@ -5,6 +5,7 @@
 name = "temps-otel"
 version.workspace = true
 edition.workspace = true
+description = "OpenTelemetry: OTLP ingest of metrics, traces and logs, TimescaleDB or ClickHouse storage, sampling, anomaly detection and sidecars"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

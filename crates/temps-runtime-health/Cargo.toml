@@ -5,6 +5,7 @@
 name = "temps-runtime-health"
 version.workspace = true
 edition.workspace = true
+description = "Node-local runtime health probes (process, HTTP, TCP) with bounded scheduling and lease-fenced assignments"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

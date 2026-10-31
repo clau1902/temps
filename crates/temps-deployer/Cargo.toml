@@ -5,6 +5,7 @@
 name = "temps-deployer"
 version.workspace = true
 edition.workspace = true
+description = "Container runtime layer: Docker image builds, container lifecycle, compose, static deploys, remote node deployers and Traefik discovery"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -5,6 +5,7 @@
 name = "temps-product-telemetry"
 version.workspace = true
 edition.workspace = true
+description = "Anonymous product usage telemetry reporter (not OpenTelemetry), with its admin on/off setting and HTTP handlers"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

@@ -5,6 +5,7 @@
 name = "temps-revenue"
 version.workspace = true
 edition.workspace = true
+description = "Per-project revenue tracking from verified payment-provider webhooks (Stripe), normalized into a provider-agnostic model"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

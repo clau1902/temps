@@ -5,6 +5,7 @@
 name = "temps-auth"
 version.workspace = true
 edition.workspace = true
+description = "Authentication and authorization: users, sessions, API keys, OIDC, MFA, CLI device login, permissions and permission_guard macros"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

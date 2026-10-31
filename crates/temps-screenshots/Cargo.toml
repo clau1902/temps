@@ -5,6 +5,7 @@
 name = "temps-screenshots"
 version.workspace = true
 edition.workspace = true
+description = "Screenshot capture of deployed apps via local headless Chrome or a remote provider"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

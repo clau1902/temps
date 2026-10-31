@@ -5,6 +5,7 @@
 name = "temps-geo"
 version.workspace = true
 edition.workspace = true
+description = "IP geolocation: MaxMind GeoIP lookups, database refresh, IP address info and the geolocation settings"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

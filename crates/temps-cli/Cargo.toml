@@ -5,6 +5,7 @@
 name = "temps-cli"
 version.workspace = true
 edition.workspace = true
+description = "The temps binary: command dispatch for serve, proxy, agent, join, migrate, backup and admin commands, also usable as a library"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

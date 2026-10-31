@@ -5,6 +5,7 @@
 name = "temps-proxy"
 version.workspace = true
 edition.workspace = true
+description = "Pingora reverse proxy: request routing, TLS and on-demand certificates, request logs, IP access control, rate limits and Shield"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

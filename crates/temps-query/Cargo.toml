@@ -5,6 +5,7 @@
 name = "temps-query"
 version.workspace = true
 edition.workspace = true
+description = "Data browser abstractions: the DataSource and capability traits, types and registry for querying heterogeneous backends"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

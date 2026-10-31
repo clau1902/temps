@@ -5,6 +5,7 @@
 name = "temps-notifications"
 version.workspace = true
 edition.workspace = true
+description = "Notification providers (email, Slack, webhook), alert routing, weekly digests and vulnerability notifications"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

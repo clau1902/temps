@@ -5,6 +5,7 @@
 name = "temps-deployment-logs"
 version.workspace = true
 edition.workspace = true
+description = "Deployment and pipeline logs: structured JSONL log files, Docker container log streaming and S3 log archiving"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

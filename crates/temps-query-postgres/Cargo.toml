@@ -5,6 +5,7 @@
 name = "temps-query-postgres"
 version.workspace = true
 edition.workspace = true
+description = "PostgreSQL backend for temps-query: schema introspection, table browsing and bounded SQL queries"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true

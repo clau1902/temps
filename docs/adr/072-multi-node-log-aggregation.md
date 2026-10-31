@@ -1,11 +1,13 @@
 ---
-title: "ADR-021: Multi-node container log aggregation and shipping"
+title: "ADR-072: Multi-node container log aggregation and shipping"
 status: Accepted — history (pull-first) implemented; agent-push deferred
 date: 2026-06-28
 author: David Viejo
 ---
 
-# ADR-021: Multi-node container log aggregation and shipping
+# ADR-072: Multi-node container log aggregation and shipping
+
+> **Renumbered:** this ADR was numbered 021 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-021" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 > **Implementation status (v1, shipped):** searchable **history** now covers
 > remote-node containers, implemented **pull-first** rather than agent-push (see

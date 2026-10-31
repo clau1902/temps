@@ -1,4 +1,6 @@
-# ADR-051: Sandbox access to linked services
+# ADR-084: Sandbox access to linked services
+
+> **Renumbered:** this ADR was numbered 051 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-051" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 **Status:** Proposed
 **Date:** 2026-10-17

@@ -1,4 +1,6 @@
-# ADR 048: Control-Plane Enrollment, Mesh Hubs and Ingress Nodes
+# ADR 080: Control-Plane Enrollment, Mesh Hubs and Ingress Nodes
+
+> **Renumbered:** this ADR was numbered 048 until 2026-10-31, when duplicate ADR numbers were removed. Older references to "ADR-048" may mean this document; the [ADR index](./README.md#renumbered-adrs) lists every renumbered ADR.
 
 - **Status:** Proposed
 - **Date:** 2026-09-28 (revised 2026-09-29)

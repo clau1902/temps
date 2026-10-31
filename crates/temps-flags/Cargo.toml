@@ -5,6 +5,7 @@
 name = "temps-flags"
 version.workspace = true
 edition.workspace = true
+description = "Feature flags: per-project flags with per-environment values, evaluation and bucketing, changed without a redeploy"
 license.workspace = true
 authors.workspace = true
 

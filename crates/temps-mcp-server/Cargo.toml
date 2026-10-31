@@ -5,6 +5,7 @@
 name = "temps-mcp-server"
 version.workspace = true
 edition.workspace = true
+description = "Axum-native MCP server exposing Temps tools to AI clients, with propose-then-confirm execution for write tools"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
