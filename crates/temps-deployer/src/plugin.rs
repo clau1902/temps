@@ -30,7 +30,7 @@ const CONTROL_PLANE_DNS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn spawn_control_plane_dns_probe(
     docker: Arc<temps_core::DockerHandle>,
-    slot: temps_dns_resolver::OverlayDnsSlot,
+    slot: temps_node_dns::OverlayDnsSlot,
 ) {
     tokio::spawn(async move {
         let runtime =
@@ -41,10 +41,8 @@ fn spawn_control_plane_dns_probe(
             let gateway = runtime.inspect_app_network_gateway().await;
             let available = match gateway {
                 Some(gateway) => {
-                    temps_dns_resolver::probe::probe_resolver(std::net::SocketAddr::new(
-                        gateway, 53,
-                    ))
-                    .await
+                    temps_node_dns::probe::probe_resolver(std::net::SocketAddr::new(gateway, 53))
+                        .await
                 }
                 None => false,
             };

@@ -16,7 +16,7 @@ use sea_orm::{ActiveModelTrait, EntityTrait, Set};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use temps_agents::AgentsPlugin;
+use temps_ai_agents::AgentsPlugin;
 use temps_analytics::AnalyticsPlugin;
 use temps_analytics_events::EventsPlugin;
 use temps_analytics_funnels::FunnelsPlugin;
@@ -35,7 +35,7 @@ use temps_cloud_client::FirstLinkEnrollment;
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::{PluginManager, TempsPlugin};
-use temps_telemetry::TelemetryPlugin;
+use temps_product_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through
 // `dyn TempsPlugin` in `ConsoleApiParams`.
 use temps_core::templates::TemplateService;
@@ -43,6 +43,7 @@ use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
 use temps_deployer::traefik_discovery::DriftAlarmSink;
+use temps_deployment_logs::LogsPlugin;
 use temps_deployments::DeploymentsPlugin;
 use temps_dns::DnsPlugin;
 use temps_domains::DomainsPlugin;
@@ -57,7 +58,6 @@ use temps_import::ImportPlugin;
 use temps_infra::InfraPlugin;
 use temps_kv::KvPlugin;
 use temps_log_aggregator::{LogAggregatorPlugin, StorageConfig};
-use temps_logs::LogsPlugin;
 use temps_mcp_server::{McpHandlerState, McpServerPlugin};
 use temps_monitoring::{
     AlarmService, ContainerHealthConfig, ContainerHealthMonitor, ContainerRuntimeResolver,

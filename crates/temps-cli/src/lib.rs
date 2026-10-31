@@ -172,7 +172,7 @@ pub fn install_tracing_with_otel(
              temps_domains={level},\
              temps_proxy={level},\
              temps_queue={level},\
-             temps_logs={level},\
+             temps_deployment_logs={level},\
              temps_auth={level},\
              temps_providers={level},\
              temps_audit={level},\
@@ -220,14 +220,14 @@ pub fn install_tracing_with_otel(
              temps_screenshots={level},\
              temps_static_files={level},\
              temps_vulnerability_scanner={level},\
-             temps_agent={level},\
+             temps_node_agent={level},\
              temps_edge={level},\
              temps_wireguard={level},\
              temps_ai={level},\
              temps_ai_gateway={level},\
              temps_ai_chat={level},\
              temps_ai_api_tools={level},\
-             temps_agents={level},\
+             temps_ai_agents={level},\
              temps_sandbox={level},\
              temps_network_policy={level},\
              temps_workload={level},\

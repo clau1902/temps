@@ -2806,8 +2806,8 @@ impl ExternalServiceManager {
             Ok(slot) => *slot,
             Err(poisoned) => *poisoned.into_inner(),
         }?;
-        Some(temps_dns_resolver::host_dns::dns_with_fallback(vec![
-            resolver.to_string(),
+        Some(temps_node_dns::host_dns::dns_with_fallback(vec![
+            resolver.to_string()
         ]))
     }
 

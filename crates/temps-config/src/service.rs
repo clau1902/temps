@@ -6723,7 +6723,7 @@ mod tests {
     #[test]
     fn external_url_use_in_receiver_crates_is_classified() {
         const RECEIVER_CRATES: &[&str] = &[
-            "temps-agents",
+            "temps-ai-agents",
             "temps-analytics-events",
             "temps-analytics-performance",
             "temps-analytics-session-replay",

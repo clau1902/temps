@@ -729,10 +729,10 @@ impl ReuseImageProvenance {
 #[derive(Clone)]
 pub struct DeploymentService {
     db: Arc<temps_database::DbConnection>,
-    log_service: Arc<temps_logs::LogService>,
+    log_service: Arc<temps_deployment_logs::LogService>,
     config_service: Arc<temps_config::ConfigService>,
     queue_service: Arc<dyn temps_core::JobQueue>,
-    docker_log_service: Arc<temps_logs::DockerLogService>,
+    docker_log_service: Arc<temps_deployment_logs::DockerLogService>,
     docker_handle: Arc<temps_core::DockerHandle>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     encryption_service: Arc<temps_core::EncryptionService>,
@@ -1673,10 +1673,10 @@ impl DeploymentService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<temps_database::DbConnection>,
-        log_service: Arc<temps_logs::LogService>,
+        log_service: Arc<temps_deployment_logs::LogService>,
         config_service: Arc<temps_config::ConfigService>,
         queue_service: Arc<dyn temps_core::JobQueue>,
-        docker_log_service: Arc<temps_logs::DockerLogService>,
+        docker_log_service: Arc<temps_deployment_logs::DockerLogService>,
         docker_handle: Arc<temps_core::DockerHandle>,
         deployer: Arc<dyn temps_deployer::ContainerDeployer>,
         image_builder: Arc<dyn temps_deployer::ImageBuilder>,
@@ -6011,7 +6011,11 @@ impl DeploymentService {
                 );
                 if let Err(error) = self
                     .log_service
-                    .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &message)
+                    .append_structured_log(
+                        &job.log_id,
+                        temps_deployment_logs::LogLevel::Error,
+                        &message,
+                    )
                     .await
                 {
                     warn!(
@@ -6152,7 +6156,11 @@ impl DeploymentService {
             );
             if let Err(e) = self
                 .log_service
-                .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &cancel_msg)
+                .append_structured_log(
+                    &job.log_id,
+                    temps_deployment_logs::LogLevel::Error,
+                    &cancel_msg,
+                )
                 .await
             {
                 warn!(
@@ -8228,7 +8236,7 @@ mod tests {
         db: Arc<temps_database::DbConnection>,
     ) -> DeploymentService {
         // Create mock log service
-        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let log_service = Arc::new(temps_deployment_logs::LogService::new(std::env::temp_dir()));
 
         // Create a minimal real config service for testing
         // We need to provide the database URL that the test database is using
@@ -8338,7 +8346,9 @@ mod tests {
         // For tests, we'll create a basic Docker connection (may fail but that's OK for tests)
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
         let docker_handle = Arc::new(temps_core::DockerHandle::available(docker.clone()));
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker_handle.clone()));
+        let docker_log_service = Arc::new(temps_deployment_logs::DockerLogService::new(
+            docker_handle.clone(),
+        ));
 
         // Create mock deployer with all required methods
         let mut deployer = MockContainerDeployer::new();
@@ -8474,10 +8484,12 @@ mod tests {
 
         DeploymentService {
             db,
-            log_service: Arc::new(temps_logs::LogService::new(std::env::temp_dir())),
+            log_service: Arc::new(temps_deployment_logs::LogService::new(std::env::temp_dir())),
             config_service,
             queue_service,
-            docker_log_service: Arc::new(temps_logs::DockerLogService::new(docker_handle.clone())),
+            docker_log_service: Arc::new(temps_deployment_logs::DockerLogService::new(
+                docker_handle.clone(),
+            )),
             docker_handle,
             deployer,
             image_builder: Arc::new(NoopImageBuilder),
@@ -10783,7 +10795,7 @@ mod tests {
     fn create_deployment_service_for_rebuild(
         db: Arc<temps_database::DbConnection>,
     ) -> DeploymentService {
-        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let log_service = Arc::new(temps_deployment_logs::LogService::new(std::env::temp_dir()));
         let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
@@ -10805,7 +10817,9 @@ mod tests {
 
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
         let docker_handle = Arc::new(temps_core::DockerHandle::available(docker));
-        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker_handle.clone()));
+        let docker_log_service = Arc::new(temps_deployment_logs::DockerLogService::new(
+            docker_handle.clone(),
+        ));
 
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_deploy_container().returning(|_| {
@@ -11145,7 +11159,7 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let log_service = Arc::new(temps_deployment_logs::LogService::new(std::env::temp_dir()));
         // Setup test data
         let (_project, _environment, deployment) = setup_test_data(&db).await?;
         // Create config service
@@ -11238,7 +11252,7 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let log_service = Arc::new(temps_deployment_logs::LogService::new(std::env::temp_dir()));
         // Setup test data
         let (_project, _environment, deployment) = setup_test_data(&db).await?;
 
@@ -12368,7 +12382,7 @@ mod tests {
         )?);
         let planner = WorkflowPlanner::new(
             db.clone(),
-            Arc::new(temps_logs::LogService::new(std::env::temp_dir())),
+            Arc::new(temps_deployment_logs::LogService::new(std::env::temp_dir())),
             create_test_external_service_manager(db.clone()),
             Arc::new(temps_config::ConfigService::new(server_config, db.clone())),
             Arc::new(temps_error_tracking::DSNService::new(db.clone())),
@@ -12565,7 +12579,7 @@ mod tests {
 
         let enc = create_test_encryption_service();
         let log_base = std::env::temp_dir();
-        let log_service = Arc::new(temps_logs::LogService::new(log_base.clone()));
+        let log_service = Arc::new(temps_deployment_logs::LogService::new(log_base.clone()));
 
         let unique = uuid::Uuid::new_v4().simple().to_string();
         let mut secrets_config = serde_json::Map::new();

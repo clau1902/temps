@@ -1111,14 +1111,14 @@ jobs:
             # This list is deliberately short. Every candidate was run
             # locally first, and two were dropped because they FAIL today —
             # they are not in scope here and each needs its own fix:
-            #   temps-dns-resolver  both end_to_end tests time out
+            #   temps-node-dns      both end_to_end tests time out
             #                       ("first sync converged: Elapsed(())")
-            #   temps-agents        sandbox_credential_smoke_test builds a
+            #   temps-ai-agents     sandbox_credential_smoke_test builds a
             #                       Docker image; `cargo build --release
             #                       --bin temps-pty-agent` exits 101
             # Also excluded, needing infrastructure CI does not have:
             # temps-network (it_kernel/it_allocator — covered by
-            # network-kernel-tests.yml), temps-agents::firecracker_e2e (KVM),
+            # network-kernel-tests.yml), temps-ai-agents::firecracker_e2e (KVM),
             # temps-auth::oidc_discovery_live and temps-git::gitea_e2e (live
             # network / a Gitea server).
             filter: >-
@@ -1323,7 +1323,7 @@ jobs:
             # server: without TEMPS_TEST_DATABASE_URL, TestDatabase boots a
             # container per test process (measured: 195s vs ~90 minutes).
             #
-            # temps-agent belongs here rather than in a unit group: it had no
+            # temps-node-agent belongs here rather than in a unit group: it had no
             # group at all (its tests only ever got compiled, never run), and
             # the platform-detection tests it now carries assert against a
             # real `docker info`.
@@ -1342,9 +1342,9 @@ jobs:
               package(temps-query-redis) or package(temps-query-mongodb) or
               package(temps-query-postgres) or package(temps-embeddings) or
               package(temps-config) or package(temps-notifications) or
-              package(temps-deployer) or package(temps-logs) or
+              package(temps-deployer) or package(temps-deployment-logs) or
               package(temps-domains) or package(temps-projects) or
-              package(temps-agent) or
+              package(temps-node-agent) or
               (package(temps-metrics) and kind(=lib)) or
               (package(temps-otel) and kind(=test) and
                (binary(timescaledb_storage_test) or binary(e2e_http_test) or

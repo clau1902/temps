@@ -1621,7 +1621,7 @@ async fn bootstrap_only() {
     // Give the kernel a moment to settle FDB / route additions.
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Mirror what the production caller (temps-agent's network_sync.rs)
+    // Mirror what the production caller (temps-node-agent's network_sync.rs)
     // does right after bootstrap: create the Docker bridge network pinned
     // to the kernel bridge we just brought up. `NetworkManager::bootstrap`
     // deliberately stays pure of bollard (see `bootstrap_creates_docker_network`

@@ -300,11 +300,11 @@ pub struct AppSettings {
     pub plugin_installation_reporting_enabled: bool,
 
     /// Admin preference for anonymous product telemetry (the events sent to
-    /// the Temps maintainers by `temps-telemetry`; unrelated to Temps Cloud
+    /// the Temps maintainers by `temps-product-telemetry`; unrelated to Temps Cloud
     /// mirroring in `cloud.telemetry_enabled` and to OpenTelemetry ingest).
     ///
     /// - `None` (default) — the operator has not chosen; the built-in default
-    ///   applies (see `temps_telemetry::DEFAULT_TELEMETRY_ENABLED`).
+    ///   applies (see `temps_product_telemetry::DEFAULT_TELEMETRY_ENABLED`).
     /// - `Some(true)` / `Some(false)` — an admin turned it on/off from
     ///   Settings › Telemetry. Applied at runtime without a restart.
     ///

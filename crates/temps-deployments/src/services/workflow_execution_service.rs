@@ -17,10 +17,10 @@ use temps_core::{
 };
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
+use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 use temps_error_tracking::services::SourceMapService;
 use temps_git::GitProviderManagerTrait;
-use temps_logs::LogService;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 

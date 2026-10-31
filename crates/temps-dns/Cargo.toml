@@ -17,7 +17,7 @@ temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 # ADR-024: the control plane runs the same per-node Hickory resolver as workers,
 # fed directly from the local service_endpoints DB.
-temps-dns-resolver = { path = "../temps-dns-resolver" }
+temps-node-dns = { path = "../temps-node-dns" }
 hickory-proto = { workspace = true }
 
 # Async runtime
@@ -77,7 +77,7 @@ wiremock = { workspace = true }
 serial_test = { workspace = true }
 tower.workspace = true
 # ADR-024 integration test: in-process DNS client to query the real
-# control-plane resolver over a UDP socket (mirrors temps-dns-resolver's
+# control-plane resolver over a UDP socket (mirrors temps-node-dns's
 # own end_to_end.rs client).
 hickory-resolver = { workspace = true }
 # The policy slot test: a restricted snapshot for the test client's address.

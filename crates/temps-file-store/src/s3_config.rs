@@ -459,7 +459,7 @@ mod tests {
     /// runs under this lock and clears its own variables afterward. Clears
     /// both this subsystem's own switch and the reused `TEMPS_LOG_S3_*`
     /// connection variables; using the same variable names as
-    /// `temps-logs`'/`temps-log-aggregator`'s own env-var tests is safe
+    /// `temps-deployment-logs`'/`temps-log-aggregator`'s own env-var tests is safe
     /// since each crate's tests run in their own `cargo test` process.
     fn clear_env() {
         for variable in [
