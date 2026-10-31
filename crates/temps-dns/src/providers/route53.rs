@@ -242,9 +242,6 @@ struct HostedZone {
     id: String,
     #[serde(rename = "Name")]
     name: String,
-    #[serde(rename = "CallerReference")]
-    #[allow(dead_code)]
-    caller_reference: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

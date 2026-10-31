@@ -81,8 +81,6 @@ struct MintRequestBody {
 struct MintResponseBody {
     username: String,
     password: String,
-    #[allow(dead_code)]
-    expires_at: Option<String>,
 }
 
 /// Per-(host,owner,repo,op) ephemeral cache. Holds a credential for at

@@ -522,7 +522,6 @@ pub struct RustfsService {
     resource_limits: Arc<RwLock<ServiceResourceLimits>>,
     docker: Arc<Docker>,
     /// Reserved for encrypting/decrypting credentials when storing to database
-    #[allow(dead_code)]
     encryption_service: Arc<EncryptionService>,
 }
 

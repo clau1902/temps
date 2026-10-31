@@ -519,8 +519,6 @@ struct RemotePullImageRequest {
 #[derive(Deserialize)]
 struct RemotePullImageResponse {
     image_id: String,
-    #[allow(dead_code)]
-    digest: Option<String>,
 }
 
 /// Response envelope from the agent API.

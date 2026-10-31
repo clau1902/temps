@@ -94,7 +94,7 @@ impl PlannedDowntime {
 }
 
 /// The lock guards are held only for their `Drop`.
-#[allow(dead_code)]
+#[allow(dead_code)] // variants hold their guard only for its Drop
 enum Claim {
     Planned(tokio::sync::OwnedRwLockWriteGuard<()>),
     Observing(tokio::sync::OwnedRwLockReadGuard<()>),

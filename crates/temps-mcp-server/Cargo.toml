@@ -29,7 +29,6 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 temps-entities = { path = "../temps-entities" }
 async-trait = { workspace = true }
-sea-orm = { workspace = true }
 chrono = { workspace = true }
 
 [lints]

@@ -110,7 +110,6 @@ pub struct NodeRemoveCommand {
 // ── API response types ──
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct NodeInfoResponse {
     id: i32,
     name: String,
@@ -119,7 +118,6 @@ struct NodeInfoResponse {
     role: String,
     status: String,
     labels: serde_json::Value,
-    capacity: serde_json::Value,
     last_heartbeat: Option<String>,
     created_at: String,
 }
@@ -144,11 +142,7 @@ struct RemoveNodeResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct DrainStatusApiResponse {
-    node_id: i32,
-    node_name: String,
-    status: String,
     remaining_containers: usize,
     /// Sandboxes still on the node (ADR-048). Draining does not move them;
     /// they must be evicted before the node can be removed. Absent from
@@ -161,9 +155,7 @@ struct DrainStatusApiResponse {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct NodeContainerListResponse {
-    containers: Vec<serde_json::Value>,
     total: usize,
 }
 

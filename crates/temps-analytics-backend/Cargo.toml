@@ -20,7 +20,6 @@ sea-orm = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
-serde_json = { workspace = true }
 
 # Async
 tokio = { workspace = true }
@@ -33,12 +32,11 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 # Time
-chrono = { workspace = true }
 uuid = { workspace = true }
 
 # ClickHouse client. Always linked — operators flip CH on by setting
 # TEMPS_CLICKHOUSE_*; we don't make them rebuild with a feature flag for it.
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
+clickhouse = { workspace = true }
 
 [dev-dependencies]
 temps-database = { path = "../temps-database" }

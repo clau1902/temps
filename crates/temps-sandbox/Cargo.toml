@@ -35,11 +35,11 @@ axum = { workspace = true }
 http = { workspace = true }
 rand = { workspace = true }
 argon2 = { workspace = true }
-hex = "0.4"
-ipnetwork = "0.21"
+hex = { workspace = true }
+ipnetwork = { workspace = true }
 url = { workspace = true }
-percent-encoding = "2.3"
-tokio-stream = { version = "0.1.17", features = ["sync"] }
+percent-encoding = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["io"] }
 futures = { workspace = true }
 async-stream = { workspace = true }

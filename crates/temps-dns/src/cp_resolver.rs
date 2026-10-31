@@ -14,7 +14,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use sea_orm::DatabaseConnection;
@@ -24,10 +24,9 @@ use tracing::{info, warn};
 
 use crate::services::DnsRegistry;
 
-/// Shared slot the deployer reads to write the resolver IP into every
-/// container's `/etc/resolv.conf` (`HostConfig.dns`). Same shape as the
-/// agent's `overlay_dns_slot`.
-pub type OverlayDnsSlot = Arc<RwLock<Option<IpAddr>>>;
+/// Defined in `temps-dns-resolver` so the deployer can share the slot without
+/// depending on this crate; re-exported here for the existing callers.
+pub use temps_dns_resolver::OverlayDnsSlot;
 
 /// How often the control-plane feeder re-reads the zone from the DB. Matches
 /// the worker long-poll cadence; reads are cheap (local Postgres).

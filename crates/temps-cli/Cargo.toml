@@ -78,7 +78,6 @@ temps-log-aggregator = { path = "../temps-log-aggregator" }
 temps-clickhouse = { path = "../temps-clickhouse" }
 temps-logs = { path = "../temps-logs" }
 temps-mcp-server = { path = "../temps-mcp-server" }
-temps-migrations = { path = "../temps-migrations" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
 temps-notifications = { path = "../temps-notifications" }
@@ -104,27 +103,27 @@ temps-network-policy = { path = "../temps-network-policy" }
 tokio-util = { workspace = true }
 
 # CLI and runtime dependencies - reference from crates workspace
-clap = "4.4"
-colored = "3.1"
+clap = { workspace = true }
+colored = { workspace = true }
 chrono = { workspace = true }
 # ClickHouse client for the `temps backfill clickhouse --domain ...` data copy.
 # Same version/features as the domain crates so the row structs line up.
-clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
-argon2 = "0.6"
+clickhouse = { workspace = true }
+argon2 = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
+tracing-subscriber = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # Blocking HTTPS client handed to the OTLP/HTTP exporter. Must be the same
 # reqwest major opentelemetry-http uses (0.13), not the workspace 0.12.
-reqwest-otlp = { package = "reqwest", version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+reqwest-otlp = { workspace = true }
 anyhow = { workspace = true }
 yaml_serde = { workspace = true }
-dirs = { version = "7.0" }
-gethostname = "1.1"
+dirs = { workspace = true }
+gethostname = { workspace = true }
 rand = { workspace = true }
 hex = { workspace = true }
 bollard = { workspace = true }
@@ -139,27 +138,27 @@ sea-orm = { workspace = true }
 sqlx = { workspace = true }
 sysinfo = { workspace = true }
 include_dir = { workspace = true }
-ipnet = "2.10"
-mime_guess = "2.0"
+ipnet = { workspace = true }
+mime_guess = { workspace = true }
 thiserror = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 url = { workspace = true }
 urlencoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-flate2 = "1.0"
-indicatif = "0.18"
+flate2 = { workspace = true }
+indicatif = { workspace = true }
 tar = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
+hyper-util = { workspace = true, features = ["default", "http1", "http2", "server-auto"] }
 tower = { workspace = true }
 sha2 = { workspace = true }
-x509-parser = "0.18"
-glob = "0.3"
+x509-parser = { workspace = true }
+glob = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 base64 = { workspace = true }

@@ -16,9 +16,7 @@ futures = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 async-stream = { workspace = true }
-notify = { workspace = true }
 bollard = { workspace = true }
-futures-util = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

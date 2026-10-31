@@ -7665,9 +7665,8 @@ mod tests {
     }
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
-        deployment_config::DeploymentConfig, deployments, env_vars, environments,
-        external_services, preset::Preset, project_services, projects,
-        upstream_config::UpstreamList,
+        deployment_config::DeploymentConfig, deployments, env_vars, environments, preset::Preset,
+        projects, upstream_config::UpstreamList,
     };
 
     // Mock for other services
@@ -8192,37 +8191,6 @@ mod tests {
             ..Default::default()
         };
         env_override.insert(db.as_ref()).await?;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    async fn setup_test_external_services(
-        db: &Arc<temps_database::DbConnection>,
-        project_id: i32,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        // Create external service
-        let external_service = external_services::ActiveModel {
-            name: Set("Redis".to_string()),
-            service_type: Set("redis".to_string()),
-            version: Set(Some("7.0".to_string())),
-            status: Set("active".to_string()),
-            slug: Set(Some("redis".to_string())),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        let external_service = external_service.insert(db.as_ref()).await?;
-
-        // Create project-service relationship
-        let project_service = project_services::ActiveModel {
-            project_id: Set(project_id),
-            service_id: Set(external_service.id),
-            created_at: Set(Utc::now()),
-            updated_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        project_service.insert(db.as_ref()).await?;
 
         Ok(())
     }

@@ -47,6 +47,12 @@ pub use zone_store::ZoneStore;
 
 pub type Result<T> = std::result::Result<T, ResolverError>;
 
+/// Shared slot the deployer reads to write the resolver IP into every
+/// container's `/etc/resolv.conf` (`HostConfig.dns`). `None` until the
+/// resolver answers its readiness probe ([`probe::probe_resolver`]). Same
+/// shape as the agent's `overlay_dns_slot`.
+pub type OverlayDnsSlot = std::sync::Arc<std::sync::RwLock<Option<std::net::IpAddr>>>;
+
 /// The network policy's DNS view of one node, shared by the node's enforcer,
 /// which swaps in a new snapshot after every pass, and the node's resolver,
 /// which answers restricted workloads from it (ADR-055 §9). One per node and

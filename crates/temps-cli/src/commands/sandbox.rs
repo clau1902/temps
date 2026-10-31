@@ -175,7 +175,6 @@ struct SandboxResponse {
     id: String,
     name: String,
     status: String,
-    #[allow(dead_code)]
     image: Option<String>,
     cwd: String,
     #[serde(rename = "createdAt")]

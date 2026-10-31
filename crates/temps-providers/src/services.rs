@@ -53,9 +53,6 @@ mod workload_ops;
 pub use workload_ops::{
     RecreateOutcome, WorkloadModeChange, WorkloadModeStatus, SHADOW_BATCH, SHADOW_INTERVAL,
 };
-// Add these constants at the top of the file proper key management
-#[allow(dead_code)]
-const NONCE_LENGTH: usize = 12;
 
 /// Local cluster ports are published on Docker's IPv4 loopback interface.
 /// Keep control-plane connections on the same address: `localhost` may resolve
@@ -2235,8 +2232,6 @@ enum MonitorReachability {
 #[derive(Clone)]
 struct AddMemberPlan {
     service_id: i32,
-    #[allow(dead_code)]
-    service_name: String,
     spec: ClusterMemberSpec,
     container_name: String,
     member_fqdn: String,
@@ -10853,7 +10848,6 @@ echo "[restore] Pre-seed complete"
 
         Ok(AddMemberPlan {
             service_id,
-            service_name: service.name.clone(),
             spec,
             container_name,
             member_fqdn,
@@ -18024,7 +18018,6 @@ mod tests {
     fn local_member_plan(container_name: &str) -> AddMemberPlan {
         AddMemberPlan {
             service_id: 7,
-            service_name: "orders".to_string(),
             spec: ClusterMemberSpec {
                 role: "replica".to_string(),
                 node_id: None,

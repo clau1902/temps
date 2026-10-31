@@ -876,7 +876,6 @@ mod tests {
         }
     }
 
-    #[allow(deprecated)]
     fn delivery(id: i32, webhook_id: i32) -> temps_entities::webhook_deliveries::Model {
         temps_entities::webhook_deliveries::Model {
             id,
@@ -886,7 +885,6 @@ mod tests {
             payload: "{}".to_string(),
             success: false,
             status_code: None,
-            response_body: None,
             error_message: None,
             attempt_number: 1,
             delivery_id: None,
@@ -896,7 +894,6 @@ mod tests {
     }
 
     /// A history row for one attempt of a delivery.
-    #[allow(deprecated)]
     fn attempt_row(
         id: i32,
         webhook_id: i32,

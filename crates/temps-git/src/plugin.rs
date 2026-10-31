@@ -301,30 +301,6 @@ fn route_state(context: &PluginContext) -> Option<Arc<crate::handlers::types::Gi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-
-    use temps_core::QueueError;
-    use temps_core::{Job, JobReceiver};
-
-    // Mock implementations for testing
-    #[allow(dead_code)]
-    struct MockConfigService;
-    #[allow(dead_code)]
-    struct MockAuditService;
-
-    #[allow(dead_code)]
-    struct MockJobQueue;
-
-    #[async_trait]
-    impl JobQueue for MockJobQueue {
-        async fn send(&self, _job: Job) -> Result<(), QueueError> {
-            Ok(())
-        }
-
-        fn subscribe(&self) -> Box<dyn JobReceiver> {
-            unimplemented!("Not needed for plugin test")
-        }
-    }
 
     #[tokio::test]
     async fn test_git_plugin_name() {

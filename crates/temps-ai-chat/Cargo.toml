@@ -49,8 +49,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 anyhow = { workspace = true }
 regex = { workspace = true }
-rustix = { version = "1.1.4", features = ["fs"] }
-nix = { version = "0.31", features = ["dir", "fs"] }
+rustix = { workspace = true }
+nix = { workspace = true, features = ["dir", "fs"] }
 walkdir = { workspace = true }
 zip = { workspace = true }
 tar = { workspace = true }
@@ -59,9 +59,9 @@ flate2 = { workspace = true }
 # panic guard) because the input is untrusted. Used directly rather than via
 # pdf-extract, which pins lopdf 0.42 and with it the unmaintained ttf-parser
 # (RUSTSEC-2026-0192). Default features (clock, rayon) are not needed to read.
-lopdf = { version = "0.46", default-features = false }
-unicode-normalization = "0.1"
-unicode-casefold = "0.2"
+lopdf = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-casefold = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]

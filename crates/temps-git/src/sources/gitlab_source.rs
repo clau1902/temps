@@ -15,30 +15,15 @@ use tracing::{debug, warn};
 
 #[derive(Debug, Deserialize)]
 struct GitLabTreeEntry {
-    #[allow(dead_code)]
-    id: String,
-    #[allow(dead_code)]
-    name: String,
     #[serde(rename = "type")]
     entry_type: String,
     path: String,
-    #[allow(dead_code)]
-    mode: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct GitLabFileContent {
-    #[allow(dead_code)]
-    file_name: String,
-    #[allow(dead_code)]
-    file_path: String,
-    #[allow(dead_code)]
-    size: i64,
     encoding: String,
     content: String,
-    #[allow(dead_code)]
-    #[serde(rename = "ref")]
-    reference: String,
 }
 
 /// GitLab-backed ProjectSource

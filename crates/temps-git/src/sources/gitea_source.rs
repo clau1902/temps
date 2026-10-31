@@ -16,10 +16,6 @@ use tracing::{debug, warn};
 
 #[derive(Deserialize)]
 struct GiteaTreeEntry {
-    #[allow(dead_code)]
-    sha: Option<String>,
-    #[allow(dead_code)]
-    name: String,
     #[serde(rename = "type")]
     entry_type: String,
     path: String,
@@ -27,10 +23,6 @@ struct GiteaTreeEntry {
 
 #[derive(Deserialize)]
 struct GiteaFileContent {
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    path: String,
     content: Option<String>,
     encoding: Option<String>,
 }

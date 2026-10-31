@@ -26,7 +26,6 @@ serde_json = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 tower = { workspace = true }
-tower-http = { workspace = true }
 http = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
@@ -36,7 +35,7 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 sysinfo = { workspace = true }
 uuid = { workspace = true }
-http-body-util = "0.1"
+http-body-util = { workspace = true }
 bollard = { workspace = true }
 bytes = { workspace = true }
 temps-core = { path = "../temps-core" }
@@ -56,21 +55,21 @@ temps-workload-netpol = { path = "../temps-workload-netpol" }
 temps-metrics = { path = "../temps-metrics" }
 temps-shield = { path = "../temps-shield", features = ["tokio", "crawlers", "netwatch"] }
 flate2 = { workspace = true }
-ipnet = "2.10"
-hickory-resolver = "0.26"
-parking_lot = "0.12"
+ipnet = { workspace = true }
+hickory-resolver = { workspace = true }
+parking_lot = { workspace = true }
 libc = { workspace = true }
-if-addrs = "0.15"
+if-addrs = { workspace = true }
 x25519-dalek = { workspace = true }
 rand = { workspace = true }
 # Needed for hyper::upgrade::on in the internal proxy's WS tunnel path,
 # and for the mTLS server accept loop (ADR-020 WS-2.1).
 hyper = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-auto"] }
+hyper-util = { workspace = true, features = ["default", "http1", "http2", "server-auto"] }
 # mTLS: the agent serves rustls TLS with client-cert verification (WS-2.1).
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
-x509-parser = "0.18"
+x509-parser = { workspace = true }
 tokio-rustls = { workspace = true }
 tar = { workspace = true }
 temps-agents = { path = "../temps-agents" }
@@ -83,7 +82,7 @@ tempfile = { workspace = true }
 temps-docker-capture = { path = "../temps-docker-capture" }
 # ADR-055 Phase 4: `external_services` rows for the shadow-pass proof.
 temps-entities = { path = "../temps-entities" }
-tempfile = "3"
+tempfile = { workspace = true }
 rcgen = { workspace = true }
 # `test-util` provides the paused clock the build-queue tests use.
 tokio = { workspace = true, features = ["test-util"] }
