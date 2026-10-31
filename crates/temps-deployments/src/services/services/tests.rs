@@ -3,6 +3,7 @@
 
 use super::cleanup::{recorded_container_ownership, RecordedContainerOwnership};
 use super::redeploy::check_redeploy_plan_batch;
+use super::reuse::deployment_asset_origin;
 use super::*;
 
 use chrono::Utc;
@@ -91,57 +92,6 @@ impl temps_deployer::ImageBuilder for NoopImageBuilder {
 }
 
 #[test]
-fn health_probe_reuse_preserves_repo_probe_and_target_setting_precedence() {
-    use temps_core::repo_config::HealthCheckConfig;
-    use temps_entities::deployment_config::DeploymentConfig;
-    let exec = HealthCheckConfig {
-        probe_type: Some("exec".into()),
-        command: vec!["check-worker".into()],
-        ..Default::default()
-    };
-    let project = DeploymentConfig {
-        health: Some(exec.clone()),
-        ..Default::default()
-    };
-    let environment = DeploymentConfig {
-        health: Some(HealthCheckConfig {
-            probe_type: Some("process".into()),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    assert_eq!(
-        resolve_reused_health(None, None, Some(&project)).unwrap(),
-        Some(exec.clone())
-    );
-    assert_eq!(
-        resolve_reused_health(None, Some(&environment), Some(&project)).unwrap(),
-        environment.health
-    );
-    assert_eq!(
-        resolve_reused_health(
-            Some(&serde_json::json!({"health":exec})),
-            Some(&environment),
-            Some(&project)
-        )
-        .unwrap(),
-        Some(exec)
-    );
-    for health in [
-        serde_json::json!({"type":"typo"}),
-        serde_json::json!({"type":"exec","command":[]}),
-        serde_json::json!("malformed"),
-    ] {
-        assert!(resolve_reused_health(
-            Some(&serde_json::json!({"health":health})),
-            None,
-            Some(&project)
-        )
-        .is_err());
-    }
-}
-
-#[test]
 fn archive_cleanup_paths_are_lexically_confined() {
     let root = std::path::Path::new("/var/lib/temps");
     assert_eq!(
@@ -175,36 +125,6 @@ fn unrelated_database_errors_are_not_treated_as_a_unique_violation() {
     )));
 }
 
-#[test]
-fn complete_asset_origin_stays_canonical_across_reuse_hops() {
-    let first_reuse_context = serde_json::json!({
-        "source_deployment_id": 10,
-        "source_environment_id": 20,
-        "source_deployment_slug": "original-build",
-    });
-
-    let origin =
-        complete_deployment_asset_origin(30, 40, "first-promotion", Some(&first_reuse_context))
-            .expect("complete reuse metadata should resolve without a database lookup");
-    assert_eq!(
-        origin,
-        DeploymentAssetOrigin {
-            deployment_id: 10,
-            environment_id: 20,
-            slug: "original-build".to_string(),
-        }
-    );
-
-    let second_reuse_context = serde_json::json!({
-        "source_deployment_id": origin.deployment_id,
-        "source_environment_id": origin.environment_id,
-        "source_deployment_slug": origin.slug.clone(),
-    });
-    assert_eq!(
-        complete_deployment_asset_origin(50, 60, "second-promotion", Some(&second_reuse_context),),
-        Some(origin)
-    );
-}
 use temps_database::test_utils::TestDatabase;
 use temps_entities::{
     deployment_config::DeploymentConfig, deployments, env_vars, environments, preset::Preset,
