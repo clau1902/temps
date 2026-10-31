@@ -254,7 +254,8 @@ test.describe('live deployment health probes', () => {
                   .endsWith(`/projects/${project.id}/deployment-config`)
             ),
             page
-              .getByRole('button', { name: 'Save Configuration', exact: true })
+              .locator('#setting-port-and-health')
+              .getByRole('button', { name: 'Save', exact: true })
               .click(),
           ])
           expect(response.ok()).toBe(true)
@@ -262,7 +263,7 @@ test.describe('live deployment health probes', () => {
         await save()
         await expect(
           page
-            .getByText('Deployment configuration updated successfully', {
+            .getByText('Port and health check saved', {
               exact: true,
             })
             .last()
@@ -272,7 +273,7 @@ test.describe('live deployment health probes', () => {
         await save()
         await expect(
           page
-            .getByText('Deployment configuration updated successfully', {
+            .getByText('Port and health check saved', {
               exact: true,
             })
             .last()

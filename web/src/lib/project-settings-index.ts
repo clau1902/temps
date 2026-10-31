@@ -257,7 +257,7 @@ export const PROJECT_SETTINGS_INDEX: readonly ProjectSettingEntry[] = [
     anchor: settingAnchor('automatic-deployments'),
     title: 'Automatic deployments',
     page: DELIVERY,
-    section: 'deployment',
+    section: 'repository',
     keywords: ['auto deploy', 'deploy on push', 'automatic', 'push'],
   },
   {
