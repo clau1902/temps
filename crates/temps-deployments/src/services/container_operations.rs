@@ -58,6 +58,8 @@ pub struct LocalContainerOperations {
     docker: Arc<bollard::Docker>,
     log_service: Arc<temps_logs::DockerLogService>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    /// The workload plane, for the replicas Docker cannot see (a microVM).
+    plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 impl LocalContainerOperations {
@@ -70,7 +72,15 @@ impl LocalContainerOperations {
             docker,
             log_service,
             deployer,
+            plane: None,
         }
+    }
+
+    /// Serve a microVM replica's logs from the workload plane instead of
+    /// Docker, which has no such container.
+    pub fn with_plane(mut self, plane: Option<Arc<temps_workload_plane::WorkloadPlane>>) -> Self {
+        self.plane = plane;
+        self
     }
 
     fn operation_error(
@@ -98,6 +108,29 @@ impl ContainerOperations for LocalContainerOperations {
         container_id: &str,
         params: ContainerLogParams,
     ) -> Result<ContainerLogStream, DeploymentError> {
+        // A microVM is not a Docker container: its logs come from the plane,
+        // which reads them from the guest.
+        if let Some(plane) = self.plane.as_deref() {
+            match super::plane_deployer::micro_vm_replica_logs(plane, container_id, &params).await {
+                Ok(Some(stream)) => return Ok(stream),
+                Ok(None) => {}
+                // This runs for every local container: a plane that cannot
+                // classify one must not take a healthy Docker container's logs
+                // with it. A real microVM then gets Docker's "no such container".
+                Err(error @ DeploymentError::InvalidInput(_)) => {
+                    // A request the plane understood and refused (a date range
+                    // on a microVM) is answered, not retried against Docker.
+                    return Err(error);
+                }
+                Err(error) => {
+                    warn!(
+                        container_id,
+                        %error,
+                        "Workload plane could not serve the logs; trying Docker"
+                    );
+                }
+            }
+        }
         let stream = self
             .log_service
             .get_container_logs(

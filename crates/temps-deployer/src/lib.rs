@@ -56,6 +56,7 @@ pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
+pub mod replica_aware;
 pub mod resolver_coverage;
 pub mod s3_static_deployer;
 pub mod static_deployer;
@@ -605,6 +606,22 @@ pub enum ContainerStatus {
     Dead,
 }
 
+/// Label naming the runtime a replica runs on when it is not a Docker
+/// container (`firecracker` for a microVM). Set only on the container info
+/// the workload plane builds for its replicas; a container without it is a
+/// Docker container.
+pub const RUNTIME_LABEL: &str = "sh.temps.runtime";
+
+/// The runtime a container runs on: [`RUNTIME_LABEL`] when present, `docker`
+/// otherwise.
+pub fn container_runtime(labels: &HashMap<String, String>) -> &str {
+    labels
+        .get(RUNTIME_LABEL)
+        .map(String::as_str)
+        .filter(|runtime| !runtime.is_empty())
+        .unwrap_or("docker")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ContainerInfo {
     pub container_id: String,
@@ -704,6 +721,13 @@ pub struct ContainerStats {
     pub network_rx_bytes: u64,
     /// Network bytes transmitted
     pub network_tx_bytes: u64,
+    /// Cumulative bytes read from block devices. `None` when the runtime
+    /// does not report it, so a chart shows "unknown" rather than zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_read_bytes: Option<u64>,
+    /// Cumulative bytes written to block devices.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_write_bytes: Option<u64>,
     /// Container restart count from Docker. Lets the UI render
     /// "Restarted 3×" so a restart loop is visible at a glance.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -730,6 +754,8 @@ impl Default for ContainerStats {
             memory_percent: None,
             network_rx_bytes: 0,
             network_tx_bytes: 0,
+            block_read_bytes: None,
+            block_write_bytes: None,
             restart_count: None,
             started_at: None,
             timestamp: chrono::Utc::now(),

@@ -70,6 +70,8 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     memory: true,
                     pids: true,
                     disk: false,
+                    disk_io: false,
+                    network: false,
                 },
             },
             SandboxCapabilities {
@@ -117,6 +119,8 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     memory: true,
                     pids: false,
                     disk: true,
+                    disk_io: false,
+                    network: false,
                 },
             },
             SandboxCapabilities {
@@ -163,6 +167,8 @@ pub fn capabilities_for(backend: SandboxBackend) -> (DriverCapabilities, Sandbox
                     memory: true,
                     pids: true,
                     disk: true,
+                    disk_io: false,
+                    network: false,
                 },
             },
             SandboxCapabilities {
@@ -569,6 +575,7 @@ impl RuntimeDriver for SandboxBackendDriver {
     async fn inspect(&self, handle: &InstanceHandle) -> Result<InstanceStatus, DriverError> {
         let alive = self.is_alive(handle).await?;
         Ok(InstanceStatus {
+            restart_at: None,
             state: if alive {
                 InstanceState::Running
             } else {
@@ -612,6 +619,7 @@ impl RuntimeDriver for SandboxBackendDriver {
                     .send(Ok(LogLine {
                         stderr: line.stderr,
                         line: Bytes::from(bytes),
+                        timestamp: None,
                     }))
                     .await;
             })

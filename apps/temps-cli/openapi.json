@@ -13516,6 +13516,11 @@
               "null"
             ]
           },
+          "runtime": {
+            "description": "What runs this container: `docker` for a Docker container,\n`firecracker` for a microVM replica (`micro_vm` isolation).",
+            "example": "docker",
+            "type": "string"
+          },
           "service_name": {
             "description": "Compose service name (e.g. \"web\", \"redis\"). None for single-container deployments.",
             "type": [
@@ -13747,6 +13752,24 @@
       "ContainerMetricsResponse": {
         "description": "Container resource metrics (CPU, memory usage)",
         "properties": {
+          "block_read_bytes": {
+            "description": "Cumulative bytes read from block devices. Null when the runtime does\nnot report it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "block_write_bytes": {
+            "description": "Cumulative bytes written to block devices. Null when the runtime does\nnot report it.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "container_id": {
             "type": "string"
           },
@@ -30561,6 +30584,13 @@
               "null"
             ]
           },
+          "next_setup_attempt_at": {
+            "description": "ISO 8601 time Temps tries again on its own, when it has scheduled it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "present": {
             "description": "Whether the container exists at all.",
             "type": "boolean"
@@ -30576,6 +30606,20 @@
           "running": {
             "description": "Whether the container is currently running.",
             "type": "boolean"
+          },
+          "setup_error": {
+            "description": "Why Temps could not set the gateway up the last time it tried, until\nan attempt succeeds. Names the failed step and Docker's answer, with\ncredentials redacted. Usually why `health` is \"missing\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_failed_at": {
+            "description": "ISO 8601 time of that failure.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "started_at": {
             "description": "ISO 8601 timestamp the container was started at, if running.",

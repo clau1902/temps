@@ -57,6 +57,8 @@ pub(crate) struct GuestSpawn {
     pub log_max_bytes: Option<u64>,
     /// Log files kept (current + rotated); `None` takes the guest's default.
     pub log_max_files: Option<u32>,
+    /// Resource ceilings the guest applies to the process.
+    pub limits: temps_vm_agent::SpawnLimits,
 }
 
 /// What the guest agent reports about a spawned process.
@@ -68,6 +70,15 @@ pub(crate) struct GuestProcessStatus {
     pub restart_count: u32,
     /// Exited, with a restart pending once the backoff has passed.
     pub restarting: bool,
+}
+
+/// What one incremental read of the workload log returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkloadLogChunk {
+    pub data: String,
+    pub cursor: Option<temps_vm_agent::LogCursor>,
+    pub skipped: bool,
+    pub more: bool,
 }
 
 /// Whether an agent `Err` says it does not know the request (an agent built
@@ -123,6 +134,24 @@ enum SnapshotExtractorError {
     TimedOut { timeout_seconds: u64 },
 }
 
+/// What a bubblewrap start failure usually means on a host that passed
+/// `temps firecracker setup`, from the tool's stderr; empty for anything else.
+fn bubblewrap_hint(stderr: &str) -> &'static str {
+    if stderr.contains("Unexpected capabilities but not setuid") {
+        "; bubblewrap refuses to start while the server holds capabilities (a systemd unit \
+         with AmbientCapabilities=). Upgrade Temps, which clears them for this helper"
+    } else if stderr.contains("No permissions to create new namespace") {
+        "; the host forbids bubblewrap an unprivileged user namespace (Ubuntu 24.04+ \
+         sets kernel.apparmor_restrict_unprivileged_userns=1). Allow it for bwrap with an \
+         AppArmor profile, or set that sysctl to 0"
+    } else {
+        ""
+    }
+}
+
+/// Longest a filesystem check or resize of one guest image may take.
+const EXT4_TOOL_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Failure text for a non-zero extractor exit: the status, what the tool said
 /// (it is the only evidence of *why*), and the cause that status most often
 /// means on a host that passed `temps firecracker setup`.
@@ -132,16 +161,7 @@ fn snapshot_export_failure_message(status: std::process::ExitStatus, stderr: &st
     } else {
         format!("it said: {stderr}")
     };
-    let hint = if stderr.contains("Unexpected capabilities but not setuid") {
-        "; bubblewrap refuses to start while the server holds capabilities (a systemd unit \
-         with AmbientCapabilities=). Upgrade Temps, which clears them for this helper"
-    } else if stderr.contains("No permissions to create new namespace") {
-        "; the host forbids bubblewrap an unprivileged user namespace (Ubuntu 24.04+ \
-         sets kernel.apparmor_restrict_unprivileged_userns=1). Allow it for bwrap with an \
-         AppArmor profile, or set that sysctl to 0"
-    } else {
-        ""
-    };
+    let hint = bubblewrap_hint(stderr);
     format!("sandboxed debugfs snapshot export failed with status {status}; {said}{hint}")
 }
 
@@ -250,6 +270,12 @@ pub struct FirecrackerSandboxConfig {
     pub default_memory_mib: u64,
     /// Root disk size (MiB) for sandboxes that don't request one.
     pub default_disk_mb: u64,
+    /// Start VMs as this process's user when no jailer launcher is
+    /// installed. Off everywhere but tests: a VMM escape from an unjailed
+    /// VM lands as the server user, who holds the database credentials and
+    /// the encryption key, so a host without the launcher has no Firecracker
+    /// backend at all. See [`FirecrackerSandboxConfig::allowing_unjailed`].
+    pub allow_unjailed: bool,
 }
 
 impl FirecrackerSandboxConfig {
@@ -259,7 +285,16 @@ impl FirecrackerSandboxConfig {
             default_vcpus: 1,
             default_memory_mib: 512,
             default_disk_mb: DEFAULT_DISK_MB,
+            allow_unjailed: false,
         }
+    }
+
+    /// Let VMs start without the jailer launcher, as this process's user.
+    /// For tests that boot real VMs on a host where installing the root
+    /// launcher is not an option; the server never sets it.
+    pub fn allowing_unjailed(mut self) -> Self {
+        self.allow_unjailed = true;
+        self
     }
 
     pub(crate) fn fc_root(&self) -> PathBuf {
@@ -314,6 +349,59 @@ pub struct FirecrackerSandboxProvider {
     cache_lock: tokio::sync::Mutex<()>,
     /// Serializes TAP-pool allocation (backed by `taps.json`).
     tap_lock: tokio::sync::Mutex<()>,
+    /// I/O limits for a VM about to be created, by VM name, taken when its
+    /// `vm.json` is written. Kept off [`SandboxCreateConfig`], which agent
+    /// sandboxes build in many places and never limit this way.
+    pending_io_limits: std::sync::Mutex<HashMap<String, VmIoLimits>>,
+}
+
+/// Bandwidth caps for one VM, in bytes per second. `None` is unlimited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct VmIoLimits {
+    /// Block device bandwidth (reads plus writes share one bucket).
+    pub disk_bytes_per_sec: Option<u64>,
+    /// Network bandwidth, applied separately to each direction.
+    pub network_bytes_per_sec: Option<u64>,
+}
+
+/// How often Firecracker refills a rate limiter's bucket. A short interval
+/// keeps the cap smooth instead of letting a second's worth through at once.
+const RATE_LIMITER_REFILL_MS: u64 = 100;
+
+/// Smallest bucket Firecracker accepts that still passes a normal request.
+const RATE_LIMITER_MIN_BUCKET_BYTES: u64 = 4096;
+
+/// Firecracker's `rate_limiter` object for a bandwidth cap of
+/// `bytes_per_sec`: a token bucket refilled every [`RATE_LIMITER_REFILL_MS`]
+/// with that interval's share of the cap.
+fn rate_limiter_json(bytes_per_sec: u64) -> serde_json::Value {
+    let per_refill = (bytes_per_sec.saturating_mul(RATE_LIMITER_REFILL_MS) / 1000)
+        .max(RATE_LIMITER_MIN_BUCKET_BYTES);
+    serde_json::json!({
+        "bandwidth": { "size": per_refill, "refill_time": RATE_LIMITER_REFILL_MS },
+    })
+}
+
+/// Add the caps in `limits` to a `vm.json` document: the root drive's
+/// `rate_limiter`, and each network interface's `rx_rate_limiter` and
+/// `tx_rate_limiter`. A cap for something the VM lacks (a network limit on a
+/// VM with no network) has nothing to attach to and is left out.
+fn apply_io_limits(vm_config: &mut serde_json::Value, limits: &VmIoLimits) {
+    if let Some(bytes) = limits.disk_bytes_per_sec {
+        if let Some(drives) = vm_config["drives"].as_array_mut() {
+            for drive in drives {
+                drive["rate_limiter"] = rate_limiter_json(bytes);
+            }
+        }
+    }
+    if let Some(bytes) = limits.network_bytes_per_sec {
+        if let Some(interfaces) = vm_config["network-interfaces"].as_array_mut() {
+            for interface in interfaces {
+                interface["rx_rate_limiter"] = rate_limiter_json(bytes);
+                interface["tx_rate_limiter"] = rate_limiter_json(bytes);
+            }
+        }
+    }
 }
 
 /// Host networking facts recorded by `temps firecracker setup` in
@@ -323,6 +411,12 @@ struct NetState {
     gateway: std::net::Ipv4Addr,
     prefix: u32,
     tap_count: u32,
+}
+
+/// The launcher a host was set up with (see [`super::fc_launcher`]).
+struct JailedLaunch {
+    client: super::fc_launcher::LauncherClient,
+    jail_base: PathBuf,
 }
 
 impl NetState {
@@ -346,6 +440,64 @@ impl FirecrackerSandboxProvider {
             docker,
             cache_lock: tokio::sync::Mutex::new(()),
             tap_lock: tokio::sync::Mutex::new(()),
+            pending_io_limits: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Cap the bandwidth of the VM `name`, which the next `create` of that
+    /// name builds. The entry is consumed by that create.
+    pub(crate) fn set_io_limits(&self, name: &str, limits: VmIoLimits) {
+        if limits == VmIoLimits::default() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_io_limits.lock() {
+            pending.insert(name.to_string(), limits);
+        }
+    }
+
+    fn take_io_limits(&self, name: &str) -> Option<VmIoLimits> {
+        self.pending_io_limits.lock().ok()?.remove(name)
+    }
+
+    // ── Jailed launch (`temps firecracker setup`) ──
+
+    /// The launcher this host was set up with, if any. Every VM goes through
+    /// it: a launcher that is down, or was never installed, is an error,
+    /// never a fall back to an unjailed VMM (unless the config allows one,
+    /// which only tests do).
+    fn jailed_launch(&self) -> Option<JailedLaunch> {
+        read_jailed_launch(&self.config.fc_root())
+    }
+
+    /// Where the VM's vsock socket is: in its directory, or inside its jail.
+    fn vsock_path(&self, name: &str) -> PathBuf {
+        match self.jailed_launch() {
+            Some(jailed) => super::fc_launcher::jail_root(&jailed.jail_base, name).join("v.sock"),
+            None => self.config.vm_dir(name).join("v.sock"),
+        }
+    }
+
+    /// SIGKILL the VMM. Under the jailer it runs as another uid, so the
+    /// launcher, which knows which process it started, does it.
+    async fn kill_vmm(&self, name: &str, pid: u32) {
+        if let Some(jailed) = self.jailed_launch() {
+            if let Err(e) = jailed.client.kill(name).await {
+                tracing::error!(vm = name, pid, "launcher could not kill the VMM: {e}");
+            }
+            return;
+        }
+        // SAFETY: `kill` does not dereference memory. The PID comes from
+        // this VM's pidfile and was checked against /proc by `vm_pid`.
+        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+    }
+
+    /// Tear down what the launcher holds for a VM that is being deleted: its
+    /// jail, its identity, its TAP device's ownership.
+    async fn remove_jail(&self, name: &str) {
+        if let Some(jailed) = self.jailed_launch() {
+            if let Err(e) = jailed.client.remove(name).await {
+                tracing::error!(vm = name, "launcher could not remove the VM's jail: {e}");
+            }
         }
     }
 
@@ -433,7 +585,7 @@ impl FirecrackerSandboxProvider {
         handshake_timeout: Duration,
     ) -> Result<PtyAttachment, AgentError> {
         let name = handle.sandbox_name.as_str();
-        let sock = self.config.vm_dir(name).join("v.sock");
+        let sock = self.vsock_path(name);
 
         if !sock.exists() {
             return Err(self.err(
@@ -747,20 +899,19 @@ impl FirecrackerSandboxProvider {
         let content_bytes = tokio::task::spawn_blocking(move || -> Result<u64, String> {
             std::fs::create_dir_all(&rootfs_for_task).map_err(|e| e.to_string())?;
             let tar_file = std::fs::File::open(&tar_path).map_err(|e| e.to_string())?;
-            let mut archive = tar::Archive::new(std::io::BufReader::new(tar_file));
-            for entry in archive.entries().map_err(|e| e.to_string())? {
-                let mut entry = entry.map_err(|e| e.to_string())?;
-                if matches!(
-                    entry.header().entry_type(),
-                    tar::EntryType::Regular
-                        | tar::EntryType::Directory
-                        | tar::EntryType::Symlink
-                        | tar::EntryType::Link
-                ) {
-                    let _ = entry
-                        .unpack_in(&rootfs_for_task)
-                        .map_err(|e| e.to_string())?;
-                }
+            let report = super::image_archive::extract_image_archive(
+                std::io::BufReader::new(tar_file),
+                &tar_path,
+                &rootfs_for_task,
+                super::image_archive::IMAGE_ARCHIVE_LIMITS,
+            )
+            .map_err(|e| e.to_string())?;
+            if report.skipped > 0 {
+                tracing::debug!(
+                    entries = report.entries,
+                    skipped = report.skipped,
+                    "image archive entries left out (device nodes, FIFOs, parent paths)"
+                );
             }
             let _ = std::fs::remove_file(&tar_path);
             // Everything below touches paths *the image controls*: a custom
@@ -854,8 +1005,7 @@ impl FirecrackerSandboxProvider {
 
     // ── VM process lifecycle ────────────────────────────────────────
 
-    async fn spawn_vm(&self, name: &str) -> Result<(), AgentError> {
-        let vm_dir = self.config.vm_dir(name);
+    fn spawn_vm_unjailed(&self, name: &str, vm_dir: &Path) -> Result<(), AgentError> {
         // Stale hybrid-vsock socket blocks Firecracker from binding.
         let _ = std::fs::remove_file(vm_dir.join("v.sock"));
 
@@ -864,7 +1014,7 @@ impl FirecrackerSandboxProvider {
             .arg("--no-api")
             .arg("--config-file")
             .arg("vm.json")
-            .current_dir(&vm_dir)
+            .current_dir(vm_dir)
             .stdin(std::process::Stdio::null())
             .stdout(console.try_clone()?)
             .stderr(console)
@@ -880,6 +1030,24 @@ impl FirecrackerSandboxProvider {
         tokio::spawn(async move {
             let _ = child.wait_with_output().await;
         });
+        Ok(())
+    }
+
+    async fn spawn_vm(&self, name: &str) -> Result<(), AgentError> {
+        let vm_dir = self.config.vm_dir(name);
+        if let Some(jailed) = self.jailed_launch() {
+            // The launcher clears the stale socket by rebuilding the jail,
+            // runs the VMM under the jailer, and writes `fc.pid`.
+            jailed
+                .client
+                .launch(name)
+                .await
+                .map_err(|e| self.err(name, format!("start through the launcher: {e}")))?;
+        } else if self.config.allow_unjailed {
+            self.spawn_vm_unjailed(name, &vm_dir)?;
+        } else {
+            return Err(self.err(name, no_launcher_reason(&self.config)));
+        }
 
         // Gate readiness on the agent, not the VMM process: boot is fast
         // but "process running" says nothing about PID 1 being up.
@@ -989,6 +1157,7 @@ impl FirecrackerSandboxProvider {
                     restart: spawn.restart,
                     log_max_bytes: spawn.log_max_bytes,
                     log_max_files: spawn.log_max_files,
+                    limits: spawn.limits,
                 },
                 Duration::from_secs(30),
             )
@@ -1056,6 +1225,63 @@ impl FirecrackerSandboxProvider {
         }
     }
 
+    /// The complete log lines the guest wrote after `cursor` (from the start
+    /// of what it still retains when `None`). `None` when the guest's agent
+    /// predates the `read_log_since` request.
+    pub(crate) async fn read_workload_log_since(
+        &self,
+        name: &str,
+        cursor: Option<temps_vm_agent::LogCursor>,
+    ) -> Result<Option<WorkloadLogChunk>, AgentError> {
+        match self
+            .rpc(
+                name,
+                &Request::ReadLogSince {
+                    path: None,
+                    cursor,
+                    max_bytes: None,
+                    include_partial: false,
+                },
+                Duration::from_secs(30),
+            )
+            .await?
+        {
+            Response::LogChunk {
+                data,
+                cursor,
+                skipped,
+                more,
+            } => Ok(Some(WorkloadLogChunk {
+                data,
+                cursor,
+                skipped,
+                more,
+            })),
+            Response::Err { message } if is_unknown_request(&message) => Ok(None),
+            Response::Err { message } => Err(self.err(name, message)),
+            other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
+        }
+    }
+
+    /// One sample of the guest's counters, with CPU and memory taken from
+    /// the tree of the spawned process `pid` (every process when `None`).
+    /// `None` when the guest's agent predates the `read_stats` request.
+    pub(crate) async fn read_workload_stats(
+        &self,
+        name: &str,
+        pid: Option<u32>,
+    ) -> Result<Option<temps_vm_agent::stats::GuestStats>, AgentError> {
+        match self
+            .rpc(name, &Request::ReadStats { pid }, Duration::from_secs(10))
+            .await?
+        {
+            Response::Stats(stats) => Ok(Some(stats)),
+            Response::Err { message } if is_unknown_request(&message) => Ok(None),
+            Response::Err { message } => Err(self.err(name, message)),
+            other => Err(self.err(name, format!("unexpected agent response: {other:?}"))),
+        }
+    }
+
     // ── Vsock RPC client (hybrid Unix socket, one RPC per connection) ──
 
     async fn rpc(
@@ -1064,7 +1290,7 @@ impl FirecrackerSandboxProvider {
         request: &Request,
         timeout: Duration,
     ) -> Result<Response, AgentError> {
-        let sock = self.config.vm_dir(name).join("v.sock");
+        let sock = self.vsock_path(name);
         let fut = async {
             let mut stream = vsock_connect(&sock, AGENT_PORT).await?;
             let payload = serde_json::to_vec(request).map_err(std::io::Error::other)?;
@@ -1123,26 +1349,19 @@ impl FirecrackerSandboxProvider {
         let f = std::fs::OpenOptions::new().write(true).open(img)?;
         f.set_len(target_bytes)?;
         drop(f);
-        // e2fsck return codes 0/1 (clean / errors-fixed) are both fine.
-        let fsck = tokio::process::Command::new("e2fsck")
-            .args(["-fy"])
-            .arg(img)
-            .output()
-            .await?;
+        // e2fsck return codes 0/1 (clean / errors-fixed) are both fine. Both
+        // tools read a filesystem the guest wrote, so they run confined.
+        let fsck = self.run_ext4_tool(name, img, "e2fsck", &["-fy"]).await?;
         if fsck.status.code().unwrap_or(8) > 1 {
-            return Err(self.err(
-                name,
-                format!("e2fsck: {}", String::from_utf8_lossy(&fsck.stderr)),
-            ));
+            let said = String::from_utf8_lossy(&fsck.stderr);
+            return Err(self.err(name, format!("e2fsck: {}{}", said, bubblewrap_hint(&said))));
         }
-        let out = tokio::process::Command::new("resize2fs")
-            .arg(img)
-            .output()
-            .await?;
+        let out = self.run_ext4_tool(name, img, "resize2fs", &[]).await?;
         if !out.status.success() {
+            let said = String::from_utf8_lossy(&out.stderr);
             return Err(self.err(
                 name,
-                format!("resize2fs: {}", String::from_utf8_lossy(&out.stderr)),
+                format!("resize2fs: {}{}", said, bubblewrap_hint(&said)),
             ));
         }
         Ok(())
@@ -1161,14 +1380,14 @@ impl FirecrackerSandboxProvider {
             .await;
         if result.is_err() {
             if let Some(pid) = self.vm_pid(&cleanup_name) {
-                // SAFETY: `kill` does not dereference memory. The PID comes
-                // from this VM's pidfile and SIGKILL is used only while
-                // rolling back a failed create, before its directory is removed.
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                self.kill_vmm(&cleanup_name, pid).await;
             }
+            self.remove_jail(&cleanup_name).await;
             self.release_tap(&cleanup_name).await;
             let _ = std::fs::remove_dir_all(self.config.vm_dir(&cleanup_name));
         }
+        // A create that failed before `vm.json` was written never took them.
+        let _ = self.take_io_limits(&cleanup_name);
         result
     }
 
@@ -1256,7 +1475,7 @@ impl FirecrackerSandboxProvider {
             }
         }
 
-        let vm_config = serde_json::json!({
+        let mut vm_config = serde_json::json!({
             "boot-source": {
                 "kernel_image_path": self.kernel_path()?,
                 "boot_args": boot_args,
@@ -1271,6 +1490,9 @@ impl FirecrackerSandboxProvider {
             "vsock": { "guest_cid": 3, "uds_path": "v.sock" },
             "network-interfaces": network_interfaces,
         });
+        if let Some(limits) = self.take_io_limits(&name) {
+            apply_io_limits(&mut vm_config, &limits);
+        }
         let vm_dir = self.config.vm_dir(&name);
         std::fs::write(
             vm_dir.join("vm.json"),
@@ -1712,51 +1934,69 @@ impl FirecrackerSandboxProvider {
     #[cfg(not(target_os = "linux"))]
     fn without_ambient_capabilities(_command: &mut tokio::process::Command) {}
 
-    fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
+    /// A `bwrap` with an empty, read-only root and no network, no `/proc`, no
+    /// host `/dev`, no environment and no capabilities, to which a caller adds
+    /// the one or two paths a tool needs. For parsing a filesystem image a
+    /// guest wrote: that is hostile input to a host-side C parser, and the
+    /// tool must not be able to reach anything else on the host.
+    fn bwrap_isolated_base() -> tokio::process::Command {
         let mut command = tokio::process::Command::new("bwrap");
         Self::without_ambient_capabilities(&mut command);
+        command.args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--new-session",
+            "--cap-drop",
+            "ALL",
+            "--clearenv",
+            "--setenv",
+            "PATH",
+            "/usr/sbin:/usr/bin:/sbin:/bin",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind-try",
+            "/bin",
+            "/bin",
+            "--ro-bind-try",
+            "/sbin",
+            "/sbin",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--dir",
+            "/etc",
+            "--dir",
+            "/home",
+            "--dir",
+            "/root",
+            "--dir",
+            "/dev",
+            "--dir",
+            "/run",
+            "--dir",
+            "/tmp",
+        ]);
         command
-            .args([
-                "--unshare-all",
-                "--die-with-parent",
-                "--new-session",
-                "--cap-drop",
-                "ALL",
-                "--clearenv",
-                "--setenv",
-                "PATH",
-                "/usr/sbin:/usr/bin:/sbin:/bin",
-                "--ro-bind",
-                "/usr",
-                "/usr",
-                "--ro-bind-try",
-                "/bin",
-                "/bin",
-                "--ro-bind-try",
-                "/sbin",
-                "/sbin",
-                "--ro-bind-try",
-                "/lib",
-                "/lib",
-                "--ro-bind-try",
-                "/lib64",
-                "/lib64",
-                "--dir",
-                "/etc",
-                "--dir",
-                "/home",
-                "--dir",
-                "/root",
-                "--dir",
-                "/dev",
-                "--dir",
-                "/run",
-                "--dir",
-                "/tmp",
-                "--remount-ro",
-                "/",
-                "--bind",
-            ])
+    }
+
+    /// Make the sandbox's root read-only. `bwrap` applies its arguments in
+    /// order and creating a bind target in a read-only root fails, so this
+    /// comes after every `--bind`, immediately before the program.
+    fn seal_root(command: &mut tokio::process::Command) {
+        command.args(["--remount-ro", "/"]);
+    }
+
+    fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
+        let mut command = Self::bwrap_isolated_base();
+        // Both targets already exist (`/tmp`, and a path inside the writable
+        // staging mount), so the root can be sealed before they are bound.
+        Self::seal_root(&mut command);
+        command
+            .arg("--bind")
             .arg(staging)
             .arg("/tmp")
             .arg("--ro-bind")
@@ -1771,6 +2011,61 @@ impl FirecrackerSandboxProvider {
                 "/tmp/source.ext4",
             ]);
         command
+    }
+
+    /// `program args... <image>` inside the same confinement, with only
+    /// `image` visible (writable) and nothing else of the host's data.
+    fn sandboxed_ext4_tool_command(
+        image: &Path,
+        program: &str,
+        args: &[&str],
+    ) -> tokio::process::Command {
+        let mut command = Self::bwrap_isolated_base();
+        // resize2fs and e2fsck ask whether the image is mounted and fail when
+        // they cannot (there is no /proc here). An empty mtab answers "no",
+        // which is true, and exposes nothing but /dev/null. `--dev-bind`, not
+        // `--ro-bind`: bwrap mounts the latter `nodev`, and opening a device
+        // node through a nodev mount is refused.
+        command.args(["--dev-bind", "/dev/null", "/etc/mtab"]);
+        command.arg("--bind").arg(image).arg("/tmp/rootfs.ext4");
+        Self::seal_root(&mut command);
+        command
+            .args(["--chdir", "/tmp", program])
+            .args(args)
+            .arg("/tmp/rootfs.ext4");
+        command
+    }
+
+    /// Run a filesystem tool on a guest image to completion, bounded in time,
+    /// killing it if the caller goes away.
+    async fn run_ext4_tool(
+        &self,
+        name: &str,
+        image: &Path,
+        program: &'static str,
+        args: &[&str],
+    ) -> Result<std::process::Output, AgentError> {
+        let mut command = Self::sandboxed_ext4_tool_command(image, program, args);
+        command.kill_on_drop(true);
+        match tokio::time::timeout(EXT4_TOOL_TIMEOUT, command.output()).await {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(error)) => Err(self.err(
+                name,
+                format!(
+                    "start {program} for '{}' inside bubblewrap (is bubblewrap installed? \
+                     `temps firecracker setup` installs it): {error}",
+                    image.display()
+                ),
+            )),
+            Err(_) => Err(self.err(
+                name,
+                format!(
+                    "{program} on '{}' exceeded its {} second timeout",
+                    image.display(),
+                    EXT4_TOOL_TIMEOUT.as_secs()
+                ),
+            )),
+        }
     }
 
     async fn export_sanitized_rootfs(
@@ -2250,8 +2545,9 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         let name = &handle.sandbox_name;
         let _ = self.stop(handle).await;
         if let Some(pid) = self.vm_pid(name) {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            self.kill_vmm(name, pid).await;
         }
+        self.remove_jail(name).await;
         self.release_tap(name).await;
         let _ = std::fs::remove_dir_all(self.config.vm_dir(name));
         tracing::info!("firecracker sandbox {} destroyed", name);
@@ -2273,7 +2569,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
         while self.vm_pid(name).is_some() {
             if tokio::time::Instant::now() > deadline {
-                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                self.kill_vmm(name, pid).await;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2596,7 +2892,21 @@ impl SandboxProvider for FirecrackerSandboxProvider {
 
     async fn is_available(&self) -> bool {
         // Provisioned (setup ran, smoke passed) + still-true host facts.
-        firecracker_unavailable_reason(&self.config).is_none()
+        if firecracker_unavailable_reason(&self.config).is_some() {
+            return false;
+        }
+        // With a launcher the VMM is the launcher's to start: a launcher that
+        // does not answer makes the backend unavailable, never unjailed.
+        match self.jailed_launch() {
+            Some(jailed) => match jailed.client.ping().await {
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::warn!("firecracker launcher is not reachable: {e}");
+                    false
+                }
+            },
+            None => self.config.allow_unjailed,
+        }
     }
 
     async fn image_status(&self) -> Result<(bool, String), AgentError> {
@@ -2915,6 +3225,24 @@ pub async fn is_firecracker_available(data_dir: &Path) -> bool {
     firecracker_unavailable_reason(&config).is_none()
 }
 
+/// The launcher `state.json` names, if `temps firecracker install-launcher` ran.
+fn read_jailed_launch(fc_root: &Path) -> Option<JailedLaunch> {
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(fc_root.join("state.json")).ok()?).ok()?;
+    let socket = state["launcher_socket"]
+        .as_str()
+        .filter(|s| !s.is_empty())?;
+    let jail_base = state["jail_base"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| super::fc_launcher::default_jail_base(fc_root));
+    Some(JailedLaunch {
+        client: super::fc_launcher::LauncherClient::new(PathBuf::from(socket)),
+        jail_base,
+    })
+}
+
 /// Why the Firecracker backend cannot run on this host, or `None` when it can.
 ///
 /// The single source of truth behind [`FirecrackerSandboxProvider::is_available`]
@@ -2924,7 +3252,7 @@ pub async fn is_firecracker_available(data_dir: &Path) -> bool {
 /// line instead of by re-deriving the probe by hand. The checks run inside the
 /// server process, so `/dev/kvm`, `/dev/fuse` and `PATH` are the server's, not
 /// those of the shell (and `sudo`) that ran setup.
-pub(crate) fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) -> Option<String> {
+pub fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) -> Option<String> {
     let state_path = config.fc_root().join("state.json");
     let state = match std::fs::read(&state_path) {
         Ok(data) => data,
@@ -2965,7 +3293,28 @@ pub(crate) fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) 
             kernel_dir.display()
         ));
     }
-    for device in ["/dev/kvm", "/dev/fuse"] {
+    // The VMM is started by the launcher, which opens /dev/kvm; the server
+    // needs the launcher's socket instead.
+    let jailed = read_jailed_launch(&config.fc_root());
+    match &jailed {
+        Some(jailed) if !jailed.client.socket().exists() => {
+            return Some(format!(
+                "state names the jailer launcher at {} but that socket does not exist; \
+                 start it with `sudo systemctl start temps-fc-launcher`, or re-run \
+                 `sudo temps firecracker setup` to reinstall it",
+                jailed.client.socket().display()
+            ));
+        }
+        Some(_) => {}
+        None if config.allow_unjailed => {}
+        None => return Some(no_launcher_reason(config)),
+    }
+    let devices: &[&str] = if jailed.is_some() {
+        &["/dev/fuse"]
+    } else {
+        &["/dev/kvm", "/dev/fuse"]
+    };
+    for device in devices.iter().copied() {
         if let Err(e) = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -2990,6 +3339,17 @@ pub(crate) fn firecracker_unavailable_reason(config: &FirecrackerSandboxConfig) 
         ));
     }
     None
+}
+
+/// Why a host without the jailer launcher has no Firecracker backend.
+fn no_launcher_reason(config: &FirecrackerSandboxConfig) -> String {
+    format!(
+        "the jailer launcher is not installed: microVMs only run under the jailer, so a \
+         VMM escape lands as an unprivileged per-VM user rather than as the server user. \
+         Run `sudo temps firecracker setup --data-dir {}` to install it, then restart \
+         `temps serve`",
+        config.data_dir.display()
+    )
 }
 
 /// Whether `dir` holds the guest kernel `temps firecracker setup` installs.
@@ -3316,6 +3676,89 @@ mod tests {
         String::from_utf8(line).unwrap()
     }
 
+    /// Serve one RPC the way the guest agent does: the vsock handshake,
+    /// then one length-prefixed JSON request answered by `respond`.
+    async fn serve_agent_rpc(
+        mut stream: UnixStream,
+        respond: impl FnOnce(serde_json::Value) -> String,
+    ) {
+        assert_eq!(
+            read_connect_line(&mut stream).await,
+            format!("CONNECT {}", AGENT_PORT)
+        );
+        stream.write_all(b"OK 1073741824\n").await.unwrap();
+        let len = stream.read_u32().await.unwrap();
+        let mut request = vec![0u8; len as usize];
+        stream.read_exact(&mut request).await.unwrap();
+        let answer = respond(serde_json::from_slice(&request).unwrap());
+        stream
+            .write_all(&(answer.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(answer.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn workload_stats_ask_for_the_process_tree_and_decode_the_sample() {
+        let (provider, _handle, _dir) = provider_with_vsock("wl-stats", |stream| {
+            serve_agent_rpc(stream, |request| {
+                assert_eq!(request["op"], "read_stats");
+                assert_eq!(request["pid"], 42);
+                r#"{"result":"stats","cpu_nanos":7,"memory_bytes":8,"memory_total_bytes":9,
+                    "memory_available_bytes":1,"pids":2,"disk_read_bytes":3,
+                    "disk_write_bytes":4,"net_rx_bytes":5,"net_tx_bytes":6}"#
+                    .to_string()
+            })
+        });
+
+        let stats = provider
+            .read_workload_stats("wl-stats", Some(42))
+            .await
+            .expect("rpc")
+            .expect("a guest that knows read_stats");
+        assert_eq!(stats.cpu_nanos, 7);
+        assert_eq!(stats.memory_bytes, 8);
+        assert_eq!(stats.memory_total_bytes, 9);
+        assert_eq!(stats.pids, 2);
+        assert_eq!((stats.disk_read_bytes, stats.disk_write_bytes), (3, 4));
+        assert_eq!((stats.net_rx_bytes, stats.net_tx_bytes), (5, 6));
+    }
+
+    #[tokio::test]
+    async fn workload_stats_from_an_old_guest_agent_are_unknown_not_an_error() {
+        // An agent built before `read_stats` fails to parse the request.
+        let (provider, _handle, _dir) = provider_with_vsock("wl-old", |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"err","message":"bad request: unknown variant `read_stats`"}"#
+                    .to_string()
+            })
+        });
+        assert_eq!(
+            provider
+                .read_workload_stats("wl-old", None)
+                .await
+                .expect("an old agent is not a failure"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn workload_stats_report_a_guest_error_with_the_vm_named() {
+        let (provider, _handle, _dir) = provider_with_vsock("wl-err", |stream| {
+            serve_agent_rpc(stream, |_| {
+                r#"{"result":"err","message":"read stats: pid 9 was not started by spawn"}"#
+                    .to_string()
+            })
+        });
+        let error = provider
+            .read_workload_stats("wl-err", Some(9))
+            .await
+            .expect_err("a guest error");
+        let message = error.to_string();
+        assert!(message.contains("wl-err"), "{message}");
+        assert!(message.contains("was not started by spawn"), "{message}");
+    }
+
     #[tokio::test]
     async fn attach_pty_handshake_that_never_answers_is_a_timeout_not_an_exec_failure() {
         // The VMM accepts the connection but the guest never acknowledges.
@@ -3589,6 +4032,242 @@ mod tests {
         let measured = dir_size(root.path());
 
         assert!(measured < 64 * 1024);
+    }
+
+    fn args_of(command: &tokio::process::Command) -> Vec<String> {
+        command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_bandwidth_cap_becomes_a_token_bucket_refilled_every_100ms() {
+        // 10 MiB/s = 1 MiB every 100 ms.
+        let limiter = rate_limiter_json(10 * 1024 * 1024);
+        assert_eq!(limiter["bandwidth"]["size"], 1024 * 1024);
+        assert_eq!(limiter["bandwidth"]["refill_time"], 100);
+        // A tiny cap still gets a bucket that passes a normal request.
+        assert_eq!(rate_limiter_json(1)["bandwidth"]["size"], 4096);
+    }
+
+    fn vm_json_with_network() -> serde_json::Value {
+        serde_json::json!({
+            "drives": [{ "drive_id": "rootfs", "path_on_host": "rootfs.ext4",
+                         "is_root_device": true, "is_read_only": false }],
+            "network-interfaces": [{ "iface_id": "eth0", "host_dev_name": "temps-fc-tap0" }],
+        })
+    }
+
+    #[test]
+    fn disk_and_network_caps_land_on_the_drive_and_both_directions() {
+        let mut config = vm_json_with_network();
+        apply_io_limits(
+            &mut config,
+            &VmIoLimits {
+                disk_bytes_per_sec: Some(20 * 1024 * 1024),
+                network_bytes_per_sec: Some(5 * 1024 * 1024),
+            },
+        );
+        assert_eq!(
+            config["drives"][0]["rate_limiter"]["bandwidth"]["size"],
+            2 * 1024 * 1024
+        );
+        let interface = &config["network-interfaces"][0];
+        assert_eq!(
+            interface["rx_rate_limiter"]["bandwidth"]["size"],
+            512 * 1024
+        );
+        assert_eq!(interface["rx_rate_limiter"], interface["tx_rate_limiter"]);
+    }
+
+    #[test]
+    fn no_caps_leave_the_vm_config_untouched() {
+        let mut config = vm_json_with_network();
+        let before = config.clone();
+        apply_io_limits(&mut config, &VmIoLimits::default());
+        assert_eq!(config, before);
+    }
+
+    #[test]
+    fn a_network_cap_on_a_vm_without_a_network_has_nothing_to_attach_to() {
+        let mut config = serde_json::json!({
+            "drives": [{ "drive_id": "rootfs" }],
+            "network-interfaces": [],
+        });
+        apply_io_limits(
+            &mut config,
+            &VmIoLimits {
+                disk_bytes_per_sec: None,
+                network_bytes_per_sec: Some(1024 * 1024),
+            },
+        );
+        assert!(config["drives"][0].get("rate_limiter").is_none());
+        assert_eq!(config["network-interfaces"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn pending_limits_are_consumed_by_one_create_and_empty_ones_are_not_kept() {
+        let provider = provider();
+        provider.set_io_limits("vm-a", VmIoLimits::default());
+        assert_eq!(provider.take_io_limits("vm-a"), None);
+        let caps = VmIoLimits {
+            disk_bytes_per_sec: Some(1),
+            network_bytes_per_sec: None,
+        };
+        provider.set_io_limits("vm-a", caps);
+        assert_eq!(provider.take_io_limits("vm-a"), Some(caps));
+        assert_eq!(provider.take_io_limits("vm-a"), None, "consumed once");
+    }
+
+    #[test]
+    fn a_guest_image_is_checked_and_resized_with_only_that_image_visible() {
+        let image = PathBuf::from("/data/vms/app/rootfs.ext4");
+        let command =
+            FirecrackerSandboxProvider::sandboxed_ext4_tool_command(&image, "e2fsck", &["-fy"]);
+        assert_eq!(command.as_std().get_program(), "bwrap");
+        let args = args_of(&command);
+        let position = |needle: &[&str]| {
+            args.windows(needle.len())
+                .position(|window| window.iter().map(String::as_str).eq(needle.iter().copied()))
+        };
+        // No network, no host procfs or devices, no capabilities, read-only root.
+        assert!(position(&["--unshare-all", "--die-with-parent"]).is_some());
+        assert!(position(&["--cap-drop", "ALL"]).is_some());
+        assert!(position(&["--remount-ro", "/"]).is_some());
+        assert!(!args
+            .iter()
+            .any(|a| a == "--proc" || a == "--dev" || a == "--share-net"));
+        // The image is the only thing bound writable. Its mount point does not
+        // exist yet, so bwrap must create it *before* the root goes read-only
+        // (`Can't create file at /tmp/rootfs.ext4: Read-only file system`).
+        let image_bind = position(&["--bind", "/data/vms/app/rootfs.ext4", "/tmp/rootfs.ext4"])
+            .expect("the image is bound");
+        let seal = position(&["--remount-ro", "/"]).unwrap();
+        assert!(image_bind < seal, "bind first, then seal the root");
+        assert!(
+            seal < position(&["--chdir", "/tmp"]).unwrap(),
+            "sealed before the tool starts"
+        );
+        assert!(
+            position(&["--dev-bind", "/dev/null", "/etc/mtab"]).is_some(),
+            "an empty mtab, or resize2fs cannot tell the image is unmounted"
+        );
+        assert_eq!(args.iter().filter(|a| *a == "--bind").count(), 1);
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.contains("/data/vms") && a != "/data/vms/app/rootfs.ext4"),
+            "nothing else of the data directory is exposed"
+        );
+        // The tool names the in-sandbox path, never the host's.
+        let tail: Vec<&str> = args.iter().rev().take(3).map(String::as_str).collect();
+        assert_eq!(tail, vec!["/tmp/rootfs.ext4", "-fy", "e2fsck"]);
+    }
+
+    #[test]
+    fn bubblewrap_start_failures_say_what_to_change() {
+        assert!(
+            bubblewrap_hint("bwrap: No permissions to create new namespace")
+                .contains("apparmor_restrict_unprivileged_userns")
+        );
+        assert!(bubblewrap_hint("Unexpected capabilities but not setuid")
+            .contains("AmbientCapabilities"));
+        assert_eq!(bubblewrap_hint("e2fsck: bad magic"), "");
+    }
+
+    #[tokio::test]
+    async fn growing_an_image_runs_fsck_and_resize_in_the_sandbox_and_keeps_data() {
+        for tool in ["mkfs.ext4", "e2fsck", "resize2fs", "bwrap"] {
+            if tokio::process::Command::new(tool)
+                .arg("--help")
+                .output()
+                .await
+                .is_err()
+            {
+                eprintln!("skipping the sandboxed grow test: '{tool}' is unavailable");
+                return;
+            }
+        }
+        // bwrap can be installed yet forbidden user namespaces.
+        let probe = tokio::process::Command::new("bwrap")
+            .args(["--unshare-all", "--ro-bind", "/", "/", "true"])
+            .output()
+            .await;
+        if !probe.map(|o| o.status.success()).unwrap_or(false) {
+            eprintln!("skipping the sandboxed grow test: bubblewrap cannot start here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("kept.txt"), b"survives the resize").unwrap();
+        let image = dir.path().join("rootfs.ext4");
+        let mkfs = tokio::process::Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-d"])
+            .arg(&tree)
+            .arg(&image)
+            .arg("16384")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            mkfs.status.success(),
+            "{}",
+            String::from_utf8_lossy(&mkfs.stderr)
+        );
+
+        provider
+            .grow_rootfs(&image, 32 * 1024 * 1024)
+            .await
+            .expect("grown inside the sandbox");
+        assert_eq!(std::fs::metadata(&image).unwrap().len(), 32 * 1024 * 1024);
+        // The filesystem is consistent and larger.
+        let check = tokio::process::Command::new("e2fsck")
+            .args(["-fn"])
+            .arg(&image)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            check.status.success(),
+            "{}",
+            String::from_utf8_lossy(&check.stdout)
+        );
+    }
+
+    #[tokio::test]
+    async fn growing_a_corrupt_image_fails_naming_the_tool() {
+        for tool in ["e2fsck", "bwrap"] {
+            if tokio::process::Command::new(tool)
+                .arg("--help")
+                .output()
+                .await
+                .is_err()
+            {
+                eprintln!("skipping: '{tool}' is unavailable");
+                return;
+            }
+        }
+        let probe = tokio::process::Command::new("bwrap")
+            .args(["--unshare-all", "--ro-bind", "/", "/", "true"])
+            .output()
+            .await;
+        if !probe.map(|o| o.status.success()).unwrap_or(false) {
+            eprintln!("skipping: bubblewrap cannot start here");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(dir.path().to_path_buf());
+        let image = dir.path().join("garbage.ext4");
+        std::fs::write(&image, vec![0xA5u8; 1024 * 1024]).unwrap();
+        let error = provider
+            .grow_rootfs(&image, 4 * 1024 * 1024)
+            .await
+            .expect_err("garbage is not a filesystem");
+        assert!(error.to_string().contains("e2fsck"), "{error}");
     }
 
     #[test]
@@ -3963,6 +4642,215 @@ mod tests {
                 .windows(injected_secret.len())
                 .any(|window| window == injected_secret),
             "sanitized snapshot must not retain injected token bytes, including in free blocks"
+        );
+    }
+
+    // ── Jailed launch ──
+
+    use crate::sandbox::fc_launcher::{read_frame, write_frame, LauncherRequest, LauncherResponse};
+
+    /// A launcher answering every request with `answer`, recording them.
+    fn fake_launcher(
+        socket: &Path,
+        answer: LauncherResponse,
+    ) -> Arc<std::sync::Mutex<Vec<LauncherRequest>>> {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                if let Ok(request) = read_frame::<LauncherRequest>(&mut stream).await {
+                    record.lock().unwrap().push(request);
+                    let _ = write_frame(&mut stream, &answer).await;
+                }
+            }
+        });
+        seen
+    }
+
+    fn jailed_provider(dir: &Path, socket: &Path) -> FirecrackerSandboxProvider {
+        let fc_root = dir.join("firecracker");
+        std::fs::create_dir_all(fc_root.join("vms")).unwrap();
+        std::fs::write(
+            fc_root.join("state.json"),
+            serde_json::json!({
+                "launcher_socket": socket,
+                "jail_base": dir.join("jail"),
+                "smoke_ok": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        provider_at(dir.to_path_buf())
+    }
+
+    #[test]
+    fn the_vsock_socket_is_in_the_jail_once_a_launcher_is_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = provider_at(dir.path().to_path_buf());
+        assert_eq!(
+            plain.vsock_path("vm1"),
+            plain.config.vm_dir("vm1").join("v.sock"),
+            "no launcher: the VM directory, as before"
+        );
+
+        let jailed = jailed_provider(dir.path(), &dir.path().join("launcher.sock"));
+        assert_eq!(
+            jailed.vsock_path("vm1"),
+            crate::sandbox::fc_launcher::jail_root(&dir.path().join("jail"), "vm1").join("v.sock")
+        );
+    }
+
+    #[tokio::test]
+    async fn killing_and_removing_a_jailed_vm_goes_through_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("launcher.sock");
+        let seen = fake_launcher(&socket, LauncherResponse::Killed { was_running: true });
+        let provider = jailed_provider(dir.path(), &socket);
+
+        provider.kill_vmm("vm1", 4242).await;
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [LauncherRequest::Kill { vm: "vm1".into() }],
+            "the server never signals a VMM running as another uid itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_jailed_vm_asks_the_launcher_to_remove_its_jail() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("launcher.sock");
+        let seen = fake_launcher(&socket, LauncherResponse::Removed);
+        let provider = jailed_provider(dir.path(), &socket);
+
+        provider.remove_jail("vm1").await;
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [LauncherRequest::Remove { vm: "vm1".into() }]
+        );
+        // Without a launcher there is nothing to remove, and nothing breaks.
+        provider_at(dir.path().join("elsewhere"))
+            .remove_jail("vm1")
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_launch_is_reported_not_retried_unjailed() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("launcher.sock");
+        let seen = fake_launcher(
+            &socket,
+            LauncherResponse::Err {
+                message: "all 1000 jail identities are in use".into(),
+            },
+        );
+        let provider = jailed_provider(dir.path(), &socket);
+
+        let error = provider.spawn_vm("vm1").await.unwrap_err().to_string();
+        assert!(error.contains("start through the launcher"), "{error}");
+        assert!(error.contains("jail identities"), "{error}");
+        assert_eq!(seen.lock().unwrap().len(), 1, "asked once, no fallback");
+    }
+
+    #[tokio::test]
+    async fn a_down_launcher_makes_the_backend_unavailable_not_unjailed() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = jailed_provider(dir.path(), &dir.path().join("nobody-listens.sock"));
+        assert!(!provider.is_available().await);
+        let error = provider.spawn_vm("vm1").await.unwrap_err().to_string();
+        assert!(error.contains("nobody-listens.sock"), "{error}");
+    }
+
+    #[test]
+    fn a_launcher_that_state_names_must_have_its_socket_before_kvm_is_asked() {
+        let dir = tempfile::tempdir().unwrap();
+        let fc_root = dir.path().join("firecracker");
+        std::fs::create_dir_all(fc_root.join("bin")).unwrap();
+        std::fs::create_dir_all(fc_root.join("kernel")).unwrap();
+        std::fs::write(fc_root.join("bin/firecracker"), b"").unwrap();
+        std::fs::write(fc_root.join("bin/temps-vm-agent"), b"").unwrap();
+        std::fs::write(fc_root.join("kernel/vmlinux-6.1.141"), b"").unwrap();
+        let socket = dir.path().join("launcher.sock");
+        std::fs::write(
+            fc_root.join("state.json"),
+            serde_json::json!({ "smoke_ok": true, "launcher_socket": socket }).to_string(),
+        )
+        .unwrap();
+
+        let reason = firecracker_unavailable_reason(&config_in(dir.path()))
+            .expect("the launcher is not running");
+        assert!(reason.contains("launcher.sock"), "{reason}");
+        assert!(reason.contains("temps firecracker setup"), "{reason}");
+        assert!(
+            !reason.contains("/dev/kvm"),
+            "the server does not need /dev/kvm when a launcher starts the VMM: {reason}"
+        );
+    }
+
+    /// A data directory `temps firecracker setup` provisioned, minus the
+    /// launcher.
+    fn provisioned_without_launcher(dir: &Path) {
+        let fc_root = dir.join("firecracker");
+        std::fs::create_dir_all(fc_root.join("bin")).unwrap();
+        std::fs::create_dir_all(fc_root.join("kernel")).unwrap();
+        std::fs::create_dir_all(fc_root.join("vms/vm1")).unwrap();
+        std::fs::write(fc_root.join("bin/firecracker"), b"").unwrap();
+        std::fs::write(fc_root.join("bin/temps-vm-agent"), b"").unwrap();
+        std::fs::write(fc_root.join("kernel/vmlinux-6.1.141"), b"").unwrap();
+        std::fs::write(
+            fc_root.join("state.json"),
+            serde_json::json!({ "smoke_ok": true }).to_string(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_the_jailer_launcher_there_is_no_firecracker_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        provisioned_without_launcher(dir.path());
+
+        let reason = firecracker_unavailable_reason(&config_in(dir.path()))
+            .expect("no launcher, no backend");
+        assert!(
+            reason.contains("jailer launcher is not installed"),
+            "{reason}"
+        );
+        assert!(
+            reason.contains(&format!(
+                "sudo temps firecracker setup --data-dir {}",
+                dir.path().display()
+            )),
+            "names the command that fixes it: {reason}"
+        );
+
+        let provider = provider_at(dir.path().to_path_buf());
+        assert!(!provider.is_available().await);
+        let error = provider.spawn_vm("vm1").await.unwrap_err().to_string();
+        assert!(
+            error.contains("jailer launcher is not installed"),
+            "{error}"
+        );
+        assert!(
+            !dir.path().join("firecracker/vms/vm1/fc.pid").exists(),
+            "no VMM was started as the server user"
+        );
+    }
+
+    #[test]
+    fn only_a_config_that_allows_it_runs_without_the_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        provisioned_without_launcher(dir.path());
+        let allowed = config_in(dir.path()).allowing_unjailed();
+        // Whatever else this test host lacks (/dev/kvm, tools), the
+        // launcher is not what stops it.
+        let reason = firecracker_unavailable_reason(&allowed);
+        assert!(
+            !reason.as_deref().unwrap_or("").contains("jailer launcher"),
+            "{reason:?}"
+        );
+        assert!(
+            !config_in(dir.path()).allow_unjailed,
+            "the default is jailed"
         );
     }
 }

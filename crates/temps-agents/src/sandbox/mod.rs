@@ -4,9 +4,12 @@
 pub mod docker;
 pub mod driver;
 pub mod facade;
+pub mod fc_launcher;
 pub mod firecracker;
 pub mod git_credential_bundle;
 pub mod guest_agent_build;
+pub mod image_archive;
+pub mod image_user;
 pub mod local;
 pub mod managed;
 pub mod microsandbox;

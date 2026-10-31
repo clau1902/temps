@@ -548,6 +548,7 @@ impl RuntimeDriver for FakeDriver {
             None => (InstanceState::Missing, None, None, Vec::new()),
         };
         Ok(InstanceStatus {
+            restart_at: None,
             state,
             exit_code,
             started_at: None,
@@ -576,6 +577,7 @@ impl RuntimeDriver for FakeDriver {
                 Ok(LogLine {
                     stderr: false,
                     line: bytes::Bytes::from(line.to_string()),
+                    timestamp: None,
                 })
             })
             .collect();
