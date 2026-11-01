@@ -64,6 +64,9 @@ import Fuse from 'fuse.js'
 import { NAV_FUSE_OPTIONS } from './nav-search'
 import {
   Activity,
+  CalendarCheck,
+  Clock,
+  HeartPulse,
   BadgeCheck,
   BarChart3,
   Bell,
@@ -981,7 +984,7 @@ export const projectNavItems: NavigationItem[] = [
   {
     title: 'Uptime',
     url: 'monitors',
-    icon: Activity,
+    icon: HeartPulse,
     keywords: ['monitoring', 'uptime', 'health', 'monitors'],
   },
   {
@@ -1104,7 +1107,7 @@ export const projectNavItems: NavigationItem[] = [
   {
     title: 'Cron jobs',
     url: 'cron-jobs',
-    icon: Activity,
+    icon: Clock,
     keywords: [
       'cron',
       'jobs',
@@ -1117,7 +1120,7 @@ export const projectNavItems: NavigationItem[] = [
   {
     title: 'Check-ins',
     url: 'check-ins',
-    icon: Activity,
+    icon: CalendarCheck,
     keywords: [
       'check-in',
       'cron monitor',
