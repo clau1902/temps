@@ -210,6 +210,10 @@ export function collectHeaderFlag(value: string, previous: string[] = []): strin
   return [...previous, value]
 }
 
+function trimOptionalWhitespace(text: string): string {
+  return text.replace(/^[ \t]+|[ \t]+$/g, '')
+}
+
 /** Parses repeated --header "Name: value" flags into a headers map; names must be unique (case-insensitive). */
 export function parseHeaderFlags(
   values: string[] | undefined,
@@ -224,8 +228,9 @@ export function parseHeaderFlags(
     if (colon === -1) {
       return { error: `Invalid ${position}. Use the form "Name: value"` }
     }
-    const name = raw.slice(0, colon).trim()
-    const value = raw.slice(colon + 1).trim()
+    // Only spaces and tabs around a field are optional whitespace in HTTP; a stray CR/LF must reach the check below.
+    const name = trimOptionalWhitespace(raw.slice(0, colon))
+    const value = trimOptionalWhitespace(raw.slice(colon + 1))
     if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) {
       return { error: `Invalid header name in ${position}. Use the form "Name: value"` }
     }
@@ -238,7 +243,7 @@ export function parseHeaderFlags(
     // reqwest (http::HeaderValue) rejects control characters other than tab, and DEL. The server stores such a
     // value anyway and every delivery then fails.
     if (/[\x00-\x08\x0a-\x1f\x7f]/.test(value)) {
-      return { error: `${position} has a value with control characters, which HTTP headers do not allow` }
+      return { error: `${position} has a value with control characters (such as a newline), which HTTP headers do not allow` }
     }
     const key = name.toLowerCase()
     if (seen.has(key)) {

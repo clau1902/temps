@@ -174,6 +174,10 @@ describe('collectHeaderFlag / parseHeaderFlags', () => {
     expect(parseHeaderFlags(undefined)).toEqual({ headers: undefined })
   })
 
+  test('trims spaces and tabs around the name and value', () => {
+    expect(parseHeaderFlags(['  X-Foo \t:  \tbar baz \t '])).toEqual({ headers: { 'X-Foo': 'bar baz' } })
+  })
+
   test('parses "Name: value", keeping colons inside the value', () => {
     expect(parseHeaderFlags(['Authorization: Bearer abc', 'X-Url:https://x.example/a:b'])).toEqual({
       headers: { Authorization: 'Bearer abc', 'X-Url': 'https://x.example/a:b' },
@@ -191,6 +195,10 @@ describe('collectHeaderFlag / parseHeaderFlags', () => {
     expect(parseHeaderFlags(['X-Foo: a\nb'])).toHaveProperty('error')
     expect(parseHeaderFlags(['X-Foo: a\u0000b'])).toHaveProperty('error')
     expect(parseHeaderFlags(['X-Foo: a\u007fb'])).toHaveProperty('error')
+    // A CR/LF at the edge is rejected, not silently trimmed away.
+    expect(parseHeaderFlags(['X-Foo: value\n'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: \rvalue'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['\nX-Foo: value'])).toHaveProperty('error')
     expect(parseHeaderFlags(['X-Foo: a\tb c'])).toEqual({ headers: { 'X-Foo': 'a\tb c' } })
     expect(parseHeaderFlags(['X-Foo: caf\u00e9'])).toEqual({ headers: { 'X-Foo': 'caf\u00e9' } })
   })
