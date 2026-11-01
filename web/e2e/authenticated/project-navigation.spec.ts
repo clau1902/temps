@@ -62,7 +62,7 @@ const SECTION_TABS = [
     'Variables & secrets',
     ['Environment variables', 'Secrets', 'Deployment tokens'],
   ],
-  ['Security & access', ['Protection', 'Access', 'Scans']],
+  ['Security & access', ['Protection', 'Edge rules', 'Access', 'Scans']],
   ['Automation & integrations', ['Automation', 'Integrations', 'Telemetry']],
 ] as const
 
