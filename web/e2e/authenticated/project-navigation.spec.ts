@@ -54,7 +54,10 @@ const SECTION_TABS = [
       'Traffic filters',
     ],
   ],
-  ['Monitoring', ['Metrics', 'Dashboards', 'Alerts', 'Uptime', 'Cron jobs']],
+  [
+    'Monitoring',
+    ['Metrics', 'Dashboards', 'Alerts', 'Uptime', 'Cron jobs', 'Check-ins'],
+  ],
   [
     'Variables & secrets',
     ['Environment variables', 'Secrets', 'Deployment tokens'],
@@ -138,6 +141,13 @@ test('the project menu groups its sections and each section lists its pages as t
   ).toHaveAttribute('aria-current', 'page')
   await expect(
     sidebar.getByRole('link', { name: 'Monitoring', exact: true })
+  ).toHaveAttribute('aria-current', 'page')
+  // Check-ins (jobs scheduled elsewhere) is a page of its own, not part of
+  // Cron jobs (jobs Temps runs).
+  await monitoring.getByRole('link', { name: 'Check-ins', exact: true }).click()
+  await expect(page).toHaveURL(/\/check-ins$/)
+  await expect(
+    monitoring.getByRole('link', { name: 'Check-ins', exact: true })
   ).toHaveAttribute('aria-current', 'page')
 
   await sidebar
