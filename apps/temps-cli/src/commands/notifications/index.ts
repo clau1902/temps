@@ -215,17 +215,19 @@ export function parseHeaderFlags(
   values: string[] | undefined,
 ): { headers: Record<string, string> | undefined } | { error: string } {
   if (values === undefined) return { headers: undefined }
-  const headers: Record<string, string> = {}
+  // Errors never repeat the raw flag: it may hold a credential, and CLI output often ends up in CI logs.
+  const entries: [string, string][] = []
   const seen = new Set<string>()
-  for (const raw of values) {
+  for (const [index, raw] of values.entries()) {
+    const position = `--header #${index + 1}`
     const colon = raw.indexOf(':')
     if (colon === -1) {
-      return { error: `Invalid --header "${raw}". Use the form "Name: value"` }
+      return { error: `Invalid ${position}. Use the form "Name: value"` }
     }
     const name = raw.slice(0, colon).trim()
     const value = raw.slice(colon + 1).trim()
     if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) {
-      return { error: `Invalid header name "${name}" in --header "${raw}"` }
+      return { error: `Invalid header name in ${position}. Use the form "Name: value"` }
     }
     if (value === '') {
       return { error: `Header "${name}" has no value` }
@@ -238,9 +240,10 @@ export function parseHeaderFlags(
       return { error: `Header "${name}" was given more than once` }
     }
     seen.add(key)
-    headers[name] = value
+    entries.push([name, value])
   }
-  return { headers }
+  // fromEntries defines own properties, so a header named "__proto__" is kept instead of being dropped.
+  return { headers: Object.fromEntries(entries) }
 }
 
 /**

@@ -187,6 +187,20 @@ describe('collectHeaderFlag / parseHeaderFlags', () => {
     expect(parseHeaderFlags(['X-Foo: 1', 'x-foo: 2'])).toHaveProperty('error')
   })
 
+  test('errors never repeat the raw flag, which may contain a credential', () => {
+    for (const bad of ['Bad Name: secret-token', 'Authorization Bearer secret-token']) {
+      const result = parseHeaderFlags([bad])
+      expect(result).toHaveProperty('error')
+      expect(JSON.stringify(result)).not.toContain('secret-token')
+    }
+  })
+
+  test('keeps a header named __proto__ as an own property', () => {
+    const result = parseHeaderFlags(['__proto__: x'])
+    expect('headers' in result && Object.keys(result.headers ?? {})).toEqual(['__proto__'])
+    expect('headers' in result && JSON.stringify(result.headers)).toBe('{"__proto__":"x"}')
+  })
+
   test('rejects the hidden placeholder as a real value', () => {
     expect(parseHeaderFlags(['Authorization: ***'])).toHaveProperty('error')
   })
