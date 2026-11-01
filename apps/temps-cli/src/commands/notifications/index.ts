@@ -230,14 +230,19 @@ export function parseHeaderFlags(
       return { error: `Invalid header name in ${position}. Use the form "Name: value"` }
     }
     if (value === '') {
-      return { error: `Header "${name}" has no value` }
+      return { error: `${position} has no value` }
     }
     if (value === MASKED_VALUE) {
-      return { error: `Header "${name}" is the hidden placeholder ${MASKED_VALUE}; enter the real value` }
+      return { error: `${position} is the hidden placeholder ${MASKED_VALUE}; enter the real value` }
+    }
+    // reqwest (http::HeaderValue) rejects control characters other than tab, and DEL. The server stores such a
+    // value anyway and every delivery then fails.
+    if (/[\x00-\x08\x0a-\x1f\x7f]/.test(value)) {
+      return { error: `${position} has a value with control characters, which HTTP headers do not allow` }
     }
     const key = name.toLowerCase()
     if (seen.has(key)) {
-      return { error: `Header "${name}" was given more than once` }
+      return { error: `${position} repeats the name of an earlier --header` }
     }
     seen.add(key)
     entries.push([name, value])

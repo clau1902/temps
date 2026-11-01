@@ -187,12 +187,29 @@ describe('collectHeaderFlag / parseHeaderFlags', () => {
     expect(parseHeaderFlags(['X-Foo: 1', 'x-foo: 2'])).toHaveProperty('error')
   })
 
+  test('rejects control characters in a value, but allows tabs, spaces and non-ASCII text', () => {
+    expect(parseHeaderFlags(['X-Foo: a\nb'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\u0000b'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\u007fb'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\tb c'])).toEqual({ headers: { 'X-Foo': 'a\tb c' } })
+    expect(parseHeaderFlags(['X-Foo: caf\u00e9'])).toEqual({ headers: { 'X-Foo': 'caf\u00e9' } })
+  })
+
   test('errors never repeat the raw flag, which may contain a credential', () => {
-    for (const bad of ['Bad Name: secret-token', 'Authorization Bearer secret-token']) {
+    for (const bad of [
+      'Bad Name: secret-token',
+      'Authorization Bearer secret-token',
+      'secret-token:',
+      'secret-token: ***',
+      'secret-token: a\nb',
+    ]) {
       const result = parseHeaderFlags([bad])
       expect(result).toHaveProperty('error')
       expect(JSON.stringify(result)).not.toContain('secret-token')
     }
+    const duplicate = parseHeaderFlags(['secret-token: 1', 'Secret-Token: 2'])
+    expect(duplicate).toHaveProperty('error')
+    expect(JSON.stringify(duplicate)).not.toContain('ecret-')
   })
 
   test('keeps a header named __proto__ as an own property', () => {
