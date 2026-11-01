@@ -87,6 +87,7 @@ interface AddOptions {
   // Webhook options
   url?: string
   method?: string
+  header?: string[]
   yes?: boolean
 }
 
@@ -108,6 +109,7 @@ interface UpdateOptions {
   // Webhook options
   url?: string
   method?: string
+  header?: string[]
   json?: boolean
   yes?: boolean
 }
@@ -196,8 +198,58 @@ export function hasEmailConfigChanges(options: {
     || options.toAddresses !== undefined
 }
 
-export function hasWebhookConfigChanges(options: { url?: string; method?: string }): boolean {
-  return options.url !== undefined || options.method !== undefined
+export function hasWebhookConfigChanges(options: { url?: string; method?: string; header?: string[] }): boolean {
+  return options.url !== undefined || options.method !== undefined || options.header !== undefined
+}
+
+/** The placeholder the server returns in place of stored secret values (MASKED_CONFIG_VALUE in temps-notifications). */
+const MASKED_VALUE = '***'
+
+/** Collects repeated --header flags into a list (commander passes the previous value as the second argument). */
+export function collectHeaderFlag(value: string, previous: string[] = []): string[] {
+  return [...previous, value]
+}
+
+/** Parses repeated --header "Name: value" flags into a headers map; names must be unique (case-insensitive). */
+export function parseHeaderFlags(
+  values: string[] | undefined,
+): { headers: Record<string, string> | undefined } | { error: string } {
+  if (values === undefined) return { headers: undefined }
+  const headers: Record<string, string> = {}
+  const seen = new Set<string>()
+  for (const raw of values) {
+    const colon = raw.indexOf(':')
+    if (colon === -1) {
+      return { error: `Invalid --header "${raw}". Use the form "Name: value"` }
+    }
+    const name = raw.slice(0, colon).trim()
+    const value = raw.slice(colon + 1).trim()
+    if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) {
+      return { error: `Invalid header name "${name}" in --header "${raw}"` }
+    }
+    if (value === '') {
+      return { error: `Header "${name}" has no value` }
+    }
+    if (value === MASKED_VALUE) {
+      return { error: `Header "${name}" is the hidden placeholder ${MASKED_VALUE}; enter the real value` }
+    }
+    const key = name.toLowerCase()
+    if (seen.has(key)) {
+      return { error: `Header "${name}" was given more than once` }
+    }
+    seen.add(key)
+    headers[name] = value
+  }
+  return { headers }
+}
+
+/**
+ * Adds a --header hint to the server's refusal to restore hidden values after a destination change.
+ * The CLI cannot tell up front whether the URL really changed: the server masks the stored URL in its responses.
+ */
+export function withHeaderHint(message: string, options: { header?: string[] }): string {
+  if (options.header !== undefined || !message.includes('must be entered again')) return message
+  return `${message}. Pass each header again with --header "Name: value".`
 }
 
 /** Merges --webhook-url/--channel over the provider's existing config so unspecified fields survive a partial update. */
@@ -237,15 +289,18 @@ export function buildEmailConfigUpdate(
   }
 }
 
-/** Merges --url/--method over the provider's existing config so unspecified fields survive a partial update. */
+/**
+ * Merges --url/--method/--header over the provider's existing config so unspecified fields survive a partial update.
+ * Supplied headers replace the stored set; without them the stored (hidden) values are sent back unchanged.
+ */
 export function buildWebhookConfigUpdate(
-  options: { url?: string; method?: string },
+  options: { url?: string; method?: string; headers?: Record<string, string> },
   current: WebhookProviderConfig | null,
 ): WebhookProviderConfig {
   return {
     url: options.url ?? current?.url ?? '',
     method: options.method ?? current?.method ?? 'POST',
-    headers: current?.headers ?? {},
+    headers: options.headers ?? current?.headers ?? {},
     timeout_secs: current?.timeout_secs ?? 30,
   }
 }
@@ -279,6 +334,7 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--to-addresses <addresses>', 'Comma-separated recipient addresses (for email)')
     .option('--url <url>', 'Webhook URL (for webhook)')
     .option('--method <method>', 'HTTP method: POST, PUT, PATCH (for webhook, default: POST)')
+    .option('--header <header>', 'Request header "Name: value" (for webhook, repeatable)', collectHeaderFlag)
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(addProvider)
 
@@ -299,6 +355,7 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--to-addresses <addresses>', 'Comma-separated recipient addresses (for email)')
     .option('--url <url>', 'Webhook URL (for webhook)')
     .option('--method <method>', 'HTTP method: POST, PUT, PATCH (for webhook)')
+    .option('--header <header>', 'Request header "Name: value" (for webhook, repeatable; replaces the stored headers)', collectHeaderFlag)
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip confirmation prompts')
     .action(updateProvider)
@@ -603,6 +660,11 @@ async function addEmailProvider(options: AddOptions): Promise<void> {
 }
 
 async function addWebhookProvider(options: AddOptions): Promise<void> {
+  const parsedHeaders = parseHeaderFlags(options.header)
+  if ('error' in parsedHeaders) {
+    throw new Error(parsedHeaders.error)
+  }
+
   let name: string
   let url: string
   let method: string
@@ -644,7 +706,7 @@ async function addWebhookProvider(options: AddOptions): Promise<void> {
         config: {
           url,
           method,
-          headers: {},
+          headers: parsedHeaders.headers ?? {},
           timeout_secs: 30,
         },
         enabled: true,
@@ -814,6 +876,11 @@ async function updateWebhookProviderAction(
     timeout_secs?: number
   } | null
 
+  const parsedHeaders = parseHeaderFlags(options.header)
+  if ('error' in parsedHeaders) {
+    throw new Error(parsedHeaders.error)
+  }
+
   const updated = await withSpinner('Updating Webhook provider...', async () => {
     const { data, error } = await updateProvider2({
       client,
@@ -821,11 +888,11 @@ async function updateWebhookProviderAction(
       body: {
         name: options.name ?? undefined,
         enabled: enabled ?? undefined,
-        config: buildWebhookConfigUpdate(options, currentConfig),
+        config: buildWebhookConfigUpdate({ ...options, headers: parsedHeaders.headers }, currentConfig),
       },
     })
     if (error) {
-      throw new Error(getErrorMessage(error))
+      throw new Error(withHeaderHint(getErrorMessage(error), options))
     }
     return data
   })
